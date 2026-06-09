@@ -171,7 +171,7 @@ endforeach
 
 
 libvulkan_powervr_mesa = shared_library(
-  'vulkan_powervr_mesa',
+  'vulkan_imagination',
   [pvr_files, pvr_entrypoints, pvr_drirc, u_format_pack_h],
   include_directories : [
     pvr_includes,
