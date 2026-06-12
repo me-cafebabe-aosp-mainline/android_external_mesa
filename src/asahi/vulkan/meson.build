@@ -26,6 +26,7 @@ hk_files = files(
   'hk_event.c',
   'hk_event.h',
   'hk_format.c',
+  'hk_android.h',
   'hk_image.c',
   'hk_image.h',
   'hk_image_view.c',
@@ -47,6 +48,10 @@ hk_files = files(
   'hk_wsi.c',
   'hk_wsi.h'
 )
+
+if with_platform_android
+  hk_files += files('hk_android.c')
+endif
 
 hk_drirc = custom_target(
   'hk_drirc',
