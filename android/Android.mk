@@ -26,7 +26,15 @@ ifneq ($(filter true, $(BOARD_MESA3D_USES_MESON_BUILD)),)
 LOCAL_PATH := $(call my-dir)
 MESA3D_TOP := $(dir $(LOCAL_PATH))
 
-LIBDRM_VERSION = $(shell cat external/libdrm/meson.build | grep -o "\<version\>\s*:\s*'\w*\.\w*\.\w*'" | grep -o "\w*\.\w*\.\w*" | head -1)
+ifneq ($(wildcard external/libdrm-upstream/Android.bp),)
+LIBDRM_DIR_NAME := libdrm-upstream
+LIBDRM_LIB_NAME := libdrm_upstream
+else
+LIBDRM_DIR_NAME := libdrm
+LIBDRM_LIB_NAME := libdrm
+endif
+
+LIBDRM_VERSION = $(shell cat external/$(LIBDRM_DIR_NAME)/meson.build | grep -o "\<version\>\s*:\s*'\w*\.\w*\.\w*'" | grep -o "\w*\.\w*\.\w*" | head -1)
 
 USE_LLVM_SWIFTSHADER := $(if $(wildcard external/llvm-project), false, \
     $(if $(wildcard external/swiftshader/third_party/llvm-[0-9]*), true, false))
@@ -57,7 +65,7 @@ MESA_VK_LIB_SUFFIX_nouveau := nouveau
 
 include $(CLEAR_VARS)
 
-LOCAL_SHARED_LIBRARIES := libc libdl libdrm libm liblog libcutils libz libc++ libnativewindow libsync libhardware libxml2
+LOCAL_SHARED_LIBRARIES := libc libdl $(LIBDRM_LIB_NAME) libm liblog libcutils libz libc++ libnativewindow libsync libhardware libxml2
 LOCAL_STATIC_LIBRARIES := libexpat libarect libelf libzstd
 LOCAL_HEADER_LIBRARIES := libnativebase_headers hwvulkan_headers
 MESON_GEN_PKGCONFIGS := log cutils expat hardware libdrm:$(LIBDRM_VERSION) nativewindow sync zlib:1.2.11 libelf libxml2
@@ -84,7 +92,7 @@ MESON_GEN_PKGCONFIGS += vulkan
 endif
 
 ifneq ($(filter i915 iris,$(BOARD_MESA3D_GALLIUM_DRIVERS)),)
-LOCAL_SHARED_LIBRARIES += libdrm_intel
+LOCAL_SHARED_LIBRARIES += $(LIBDRM_LIB_NAME)_intel
 MESON_GEN_PKGCONFIGS += libdrm_intel:$(LIBDRM_VERSION)
 endif
 
@@ -97,12 +105,15 @@ endif
 endif
 
 ifneq ($(filter radeonsi amd,$(BOARD_MESA3D_GALLIUM_DRIVERS) $(BOARD_MESA3D_VULKAN_DRIVERS)),)
-LOCAL_SHARED_LIBRARIES += libdrm_amdgpu
+ifneq ($(LIBDRM_DIR_NAME),libdrm-upstream)
+$(warning Upstream version of libdrm is recommended or necessary for AMD driver)
+endif
+LOCAL_SHARED_LIBRARIES += $(LIBDRM_LIB_NAME)_amdgpu
 MESON_GEN_PKGCONFIGS += libdrm_amdgpu:$(LIBDRM_VERSION)
 endif
 
 ifneq ($(filter radeonsi r300 r600,$(BOARD_MESA3D_GALLIUM_DRIVERS)),)
-LOCAL_SHARED_LIBRARIES += libdrm_radeon
+LOCAL_SHARED_LIBRARIES += $(LIBDRM_LIB_NAME)_radeon
 MESON_GEN_PKGCONFIGS += libdrm_radeon:$(LIBDRM_VERSION)
 endif
 
