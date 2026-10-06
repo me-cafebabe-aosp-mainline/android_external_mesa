@@ -125,9 +125,13 @@ _libcompiler_bindings = static_library(
     pre_args,
     cc.get_supported_arguments('-Wno-missing-prototypes'),
   ],
+  # Only headers are needed here; mesautil gets linked by the final
+  # consumers.  Linking it here would make the Rust targets inherit its C++
+  # link language, forcing meson to look up the C++ stdlib (-lc++), which
+  # fails on Android where libc++ isn't in the linker search path.
   dependencies : [
     idep_nir_headers,
-    idep_mesautil,
+    idep_mesautil.partial_dependency(compile_args : true, includes : true, sources : true),
   ],
 )
 
