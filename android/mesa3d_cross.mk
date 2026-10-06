@@ -255,6 +255,8 @@ $(MESON_GEN_FILES_TARGET): $(sort $(shell find -L $(MESA3D_TOP) -not -path '*/\.
                              $(foreach inc,$(nospace-includes),'$(call abs-include,$(inc))', )'']\n" \
 		"c_link_args = [$(foreach flag, $(m-lld-flags-cleaned),'$(flag)',)'']\n"                                          \
 		"cpp_link_args = [$(foreach flag, $(m-lld-flags-cleaned),'$(flag)',)'']\n"                                        \
+		"bindgen_clang_arguments = ['-nostdlibinc' \
+                             $(foreach inc,$(nospace-includes),, '$(call abs-include,$(inc))')]\n" \
 		"needs_exe_wrapper = true\n"                                                                                      \
 		"skip_sanity_check = true\n"                                                                                      \
 		"[binaries]\n"                                                                                                    \
