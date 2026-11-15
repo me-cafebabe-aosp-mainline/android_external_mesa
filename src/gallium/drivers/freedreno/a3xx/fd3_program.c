@@ -79,6 +79,7 @@ fd3_program_emit(struct fd_ringbuffer *ring, struct fd3_emit *emit, int nr,
    const struct ir3_shader_variant *vp, *fp;
    const struct ir3_info *vsi, *fsi;
    enum a3xx_instrbuffermode fpbuffer, vpbuffer;
+   enum a3xx_threadsize fssz;
    uint32_t fpbuffersz, vpbuffersz, fsoff;
    uint32_t pos_regid, posz_regid, psize_regid;
    uint32_t ij_regid[4], face_regid, coord_regid, zwcoord_regid;
@@ -93,6 +94,11 @@ fd3_program_emit(struct fd_ringbuffer *ring, struct fd3_emit *emit, int nr,
 
    vsi = &vp->info;
    fsi = &fp->info;
+
+   /* ir3 sized the register footprint for this thread size, the doubled
+    * one only fits the register file with small enough footprints:
+    */
+   fssz = fsi->double_threadsize ? FOUR_QUADS : TWO_QUADS;
 
    fpbuffer = BUFFER;
    vpbuffer = BUFFER;
@@ -175,7 +181,7 @@ fd3_program_emit(struct fd_ringbuffer *ring, struct fd3_emit *emit, int nr,
     */
 
    OUT_PKT0(ring, REG_A3XX_HLSQ_CONTROL_0_REG, 6);
-   OUT_RING(ring, A3XX_HLSQ_CONTROL_0_REG_FSTHREADSIZE(FOUR_QUADS) |
+   OUT_RING(ring, A3XX_HLSQ_CONTROL_0_REG_FSTHREADSIZE(fssz) |
                      A3XX_HLSQ_CONTROL_0_REG_FSSUPERTHREADENABLE |
                      A3XX_HLSQ_CONTROL_0_REG_CONSTMODE(constmode) |
                      /* NOTE:  I guess SHADERRESTART and CONSTFULLUPDATE maybe
@@ -290,7 +296,7 @@ fd3_program_emit(struct fd_ringbuffer *ring, struct fd3_emit *emit, int nr,
                   A3XX_SP_FS_CTRL_REG0_HALFREGFOOTPRINT(fsi->max_half_reg + 1) |
                   A3XX_SP_FS_CTRL_REG0_FULLREGFOOTPRINT(fsi->max_reg + 1) |
                   A3XX_SP_FS_CTRL_REG0_INOUTREGOVERLAP |
-                  A3XX_SP_FS_CTRL_REG0_THREADSIZE(FOUR_QUADS) |
+                  A3XX_SP_FS_CTRL_REG0_THREADSIZE(fssz) |
                   A3XX_SP_FS_CTRL_REG0_SUPERTHREADMODE |
                   COND(fp->need_pixlod, A3XX_SP_FS_CTRL_REG0_PIXLODENABLE) |
                   A3XX_SP_FS_CTRL_REG0_LENGTH(fpbuffersz));
