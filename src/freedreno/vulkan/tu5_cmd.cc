@@ -969,12 +969,38 @@ tu5_image_view_descriptor(uint32_t *descriptor, const struct tu_image *image,
 
    memset(descriptor, 0, A6XX_TEX_CONST_DWORDS * sizeof(uint32_t));
 
+   uint32_t tex_swiz;
+
+   if (util_format_is_depth_or_stencil(format)) {
+      /* Depth and stencil read as (value, 0, 0, 1) */
+      unsigned char zs_swiz[4];
+
+      for (unsigned c = 0; c < 4; c++) {
+         switch (swiz[c]) {
+         case PIPE_SWIZZLE_X:
+            zs_swiz[c] = PIPE_SWIZZLE_X;
+            break;
+         case PIPE_SWIZZLE_W:
+         case PIPE_SWIZZLE_1:
+            zs_swiz[c] = PIPE_SWIZZLE_1;
+            break;
+         default:
+            zs_swiz[c] = PIPE_SWIZZLE_0;
+            break;
+         }
+      }
+      tex_swiz = fd5_tex_swiz(PIPE_FORMAT_R8G8B8A8_UNORM, zs_swiz[0],
+                              zs_swiz[1], zs_swiz[2], zs_swiz[3]);
+   } else {
+      tex_swiz = fd5_tex_swiz(format, swiz[0], swiz[1], swiz[2], swiz[3]);
+   }
+
    descriptor[0] =
       A5XX_TEX_CONST_0_TILE_MODE((enum a5xx_tile_mode)fdl_tile_mode(layout, level)) |
       A5XX_TEX_CONST_0_FMT(fd5_pipe2tex(format)) |
       A5XX_TEX_CONST_0_SAMPLES(tu_msaa_samples(layout->nr_samples)) |
       A5XX_TEX_CONST_0_MIPLVLS(levels - 1) |
-      fd5_tex_swiz(format, swiz[0], swiz[1], swiz[2], swiz[3]) |
+      tex_swiz |
       COND(format == PIPE_FORMAT_X24S8_UINT, A5XX_TEX_CONST_0_SWAP(XYZW)) |
       COND(util_format_is_srgb(format), A5XX_TEX_CONST_0_SRGB);
    uint32_t width = u_minify(layout->width0, level);
