@@ -255,8 +255,20 @@ tu5_ubo_address(struct tu_cmd_buffer *cmd, const struct tu_shader *shader,
 {
    const uint32_t *desc = tu5_descriptor(cmd, shader, ref);
 
+   if (!desc)
+      return 0;
+
+   if (ref->storage) {
+      /* see write_buffer_descriptor_addr() */
+      uint64_t base = desc[4] | ((uint64_t)(desc[5] & 0x1ffff) << 32);
+      uint32_t offset = ((desc[2] & A6XX_TEX_CONST_2_STARTOFFSETTEXELS__MASK) >>
+                         A6XX_TEX_CONST_2_STARTOFFSETTEXELS__SHIFT) * 4;
+
+      return base ? base + offset : 0;
+   }
+
    /* see write_ubo_descriptor_addr() */
-   return desc ? desc[0] | ((uint64_t)(desc[1] & 0x1ffff) << 32) : 0;
+   return desc[0] | ((uint64_t)(desc[1] & 0x1ffff) << 32);
 }
 
 /* The textures and the samplers of a shader */

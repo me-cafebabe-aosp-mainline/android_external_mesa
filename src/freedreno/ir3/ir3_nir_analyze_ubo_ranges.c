@@ -17,6 +17,13 @@ get_ubo_load_range(nir_shader *nir, nir_intrinsic_instr *instr,
       nir_intrinsic_has_range_base(instr) ? nir_intrinsic_range_base(instr) : 0;
    uint32_t size = nir_intrinsic_range(instr);
 
+   /* What may be written between the time the constants are loaded and the
+    * time the shader runs is to be read by the shader itself.
+    */
+   if (instr->intrinsic == nir_intrinsic_load_ubo &&
+       (nir_intrinsic_access(instr) & ACCESS_VOLATILE))
+      return false;
+
    /* If the offset is constant, the range is trivial (and NIR may not have
     * figured it out).
     */

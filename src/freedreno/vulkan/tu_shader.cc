@@ -331,6 +331,11 @@ tu5_desc_base(struct tu_shader *shader,
               const struct tu_pipeline_layout *layout, unsigned set,
               unsigned binding, enum tu5_desc_kind kind)
 {
+   const VkDescriptorType type = layout->set[set].layout->binding[binding].type;
+   const bool storage = kind == TU5_DESC_UBO &&
+                        (type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+                         type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC);
+
    struct tu5_desc_map *map = &shader->const_state.a5xx;
    const struct tu_descriptor_set_binding_layout *binding_layout =
       &layout->set[set].layout->binding[binding];
@@ -385,6 +390,7 @@ tu5_desc_base(struct tu_shader *shader,
       refs[base + i] = (struct tu5_desc_ref) {
          .set = (uint8_t)set,
          .dynamic = dynamic,
+         .storage = storage,
          .offset = (offset + i * binding_layout->size) / 4,
       };
    }
@@ -427,14 +433,16 @@ lower_vulkan_resource_index(struct tu_device *dev, nir_builder *b,
       bool ubo =
          binding_layout->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
          binding_layout->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+
+      /* There is no state for the storage buffers of the vertex shaders:
+       * these read theirs through pointers, as uniform buffers. See
+       * lower_ssbo_ubo_intrinsic().
+       */
+      if (b->shader->info.stage == MESA_SHADER_VERTEX)
+         ubo = true;
+
       unsigned first = tu5_desc_base(shader, layout, set, binding,
                                      ubo ? TU5_DESC_UBO : TU5_DESC_SSBO);
-
-      /* TODO: the storage buffers of the vertex shaders, for which there is
-       * no state: these are to be read through pointers.
-       */
-      if (!ubo && b->shader->info.stage == MESA_SHADER_VERTEX)
-         mesa_loge("a5xx: storage buffers in vertex shaders not implemented");
 
       nir_def *def = nir_vec3(b, nir_imm_int(b, 0),
                               nir_iadd_imm(b, vulkan_idx, first),
@@ -552,6 +560,40 @@ lower_ssbo_ubo_intrinsic(struct tu_device *dev,
 
    if (tu_is_a5xx(dev)) {
       /* The buffers are numbered, see lower_vulkan_resource_index() */
+      if (b->shader->info.stage == MESA_SHADER_VERTEX &&
+          intrin->intrinsic == nir_intrinsic_load_ssbo) {
+         /* Read through the pointer, and never ahead of the draw as the
+          * constants are: what was written before the draw is to be seen.
+          */
+         nir_def *load =
+            nir_load_ubo(b, intrin->def.num_components, intrin->def.bit_size,
+                         descriptor_idx, intrin->src[1].ssa,
+                         .access = ACCESS_VOLATILE,
+                         .align_mul = nir_intrinsic_align_mul(intrin),
+                         .align_offset = nir_intrinsic_align_offset(intrin),
+                         .range_base = 0, .range = ~0);
+
+         nir_def_replace(&intrin->def, load);
+         return true;
+      }
+
+      if (b->shader->info.stage == MESA_SHADER_VERTEX &&
+          intrin->intrinsic != nir_intrinsic_load_ubo) {
+         /* TODO: the sizes of the storage buffers. The stores and the
+          * atomics are not a feature of the vertex shaders.
+          */
+         mesa_loge("a5xx: %s in a vertex shader not implemented",
+                   nir_intrinsic_infos[intrin->intrinsic].name);
+         if (info->has_dest) {
+            nir_def_replace(&intrin->def,
+                            nir_imm_zero(b, intrin->def.num_components,
+                                         intrin->def.bit_size));
+         } else {
+            nir_instr_remove(&intrin->instr);
+         }
+         return true;
+      }
+
       nir_src_rewrite(&intrin->src[buffer_src], descriptor_idx);
       return true;
    }

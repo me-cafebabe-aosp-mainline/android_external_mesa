@@ -68,6 +68,8 @@ struct tu5_desc_ref
    uint8_t set;
    /* in the dynamic descriptors of the command buffer, not in the set */
    bool dynamic;
+   /* a storage buffer read as a uniform buffer */
+   bool storage;
    /* of the descriptor, in dwords */
    uint32_t offset;
 };
