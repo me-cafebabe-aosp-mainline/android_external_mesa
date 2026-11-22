@@ -315,6 +315,77 @@ tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    OUT_RING(cs, num_tex);
 }
 
+/* The storage buffers of a fragment or of a compute shader */
+static void
+tu5_emit_ssbos(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+               const struct tu_shader *shader)
+{
+   const struct tu5_desc_map *map = &shader->const_state.a5xx;
+   unsigned count = map->count[TU5_DESC_SSBO];
+   enum a4xx_state_block sb;
+
+   if (!count)
+      return;
+
+   switch (shader->variant->type) {
+   case MESA_SHADER_FRAGMENT:
+      sb = SB4_SSBO;
+      break;
+   case MESA_SHADER_COMPUTE:
+      sb = SB4_CS_SSBO;
+      break;
+   default:
+      return;
+   }
+
+   uint64_t va[TU5_MAX_SSBOS];
+   uint32_t size[TU5_MAX_SSBOS];
+
+   for (unsigned i = 0; i < count; i++) {
+      const uint32_t *desc = tu5_descriptor(cmd, &map->ssbo[i]);
+
+      va[i] = 0;
+      size[i] = 0;
+      if (!desc)
+         continue;
+
+      /* see write_buffer_descriptor_addr() */
+      uint64_t base = desc[4] | ((uint64_t)(desc[5] & 0x1ffff) << 32);
+      uint32_t offset = ((desc[2] & A6XX_TEX_CONST_2_STARTOFFSETTEXELS__MASK) >>
+                         A6XX_TEX_CONST_2_STARTOFFSETTEXELS__SHIFT) * 4;
+
+      if (!base)
+         continue;
+      va[i] = base + offset;
+      size[i] = desc[1] * 4;
+   }
+
+   /* in bytes */
+   OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 2 * count);
+   OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(0) |
+                   CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                   CP_LOAD_STATE4_0_STATE_BLOCK(sb) |
+                   CP_LOAD_STATE4_0_NUM_UNIT(count));
+   OUT_RING(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
+                   CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
+   OUT_RING(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+   for (unsigned i = 0; i < count; i++) {
+      OUT_RING(cs, A5XX_SSBO_1_0_WIDTH(size[i] & 0xffff));
+      OUT_RING(cs, A5XX_SSBO_1_1_HEIGHT(size[i] >> 16));
+   }
+
+   OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 2 * count);
+   OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(0) |
+                   CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                   CP_LOAD_STATE4_0_STATE_BLOCK(sb) |
+                   CP_LOAD_STATE4_0_NUM_UNIT(count));
+   OUT_RING(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_UBO) |
+                   CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
+   OUT_RING(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+   for (unsigned i = 0; i < count; i++)
+      tu_cs_emit_qw(cs, va[i]);
+}
+
 /* The constants of a shader that come from the descriptors and from the
  * push constants.
  */
@@ -2804,6 +2875,7 @@ tu5_draw_state(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool indexed)
    tu5_emit_user_consts(cmd, cs, fs_shader);
    tu5_emit_textures(cmd, cs, vs_shader);
    tu5_emit_textures(cmd, cs, fs_shader);
+   tu5_emit_ssbos(cmd, cs, fs_shader);
 
    OUT_PKT4(cs, REG_A5XX_VFD_INDEX_OFFSET, 2);
    OUT_RING(cs, cmd->state.last_vs_params.vertex_offset);

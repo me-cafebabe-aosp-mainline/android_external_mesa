@@ -51,11 +51,13 @@ struct tu_push_constant_range
 #define TU5_MAX_TEXTURES 16
 #define TU5_MAX_SAMPLERS 16
 #define TU5_MAX_UBOS     32
+#define TU5_MAX_SSBOS    16
 
 enum tu5_desc_kind {
    TU5_DESC_TEXTURE,
    TU5_DESC_SAMPLER,
    TU5_DESC_UBO,
+   TU5_DESC_SSBO,
    TU5_DESC_KINDS,
 };
 
@@ -74,13 +76,15 @@ struct tu5_desc_map
    struct tu5_desc_ref tex[TU5_MAX_TEXTURES];
    struct tu5_desc_ref samp[TU5_MAX_SAMPLERS];
    struct tu5_desc_ref ubo[TU5_MAX_UBOS];
+   struct tu5_desc_ref ssbo[TU5_MAX_SSBOS];
 
    /* The numbers the bindings were given */
    uint8_t num_bindings;
    struct {
       uint8_t set, kind, base;
       uint32_t binding;
-   } bindings[TU5_MAX_TEXTURES + TU5_MAX_SAMPLERS + TU5_MAX_UBOS];
+   } bindings[TU5_MAX_TEXTURES + TU5_MAX_SAMPLERS + TU5_MAX_UBOS +
+              TU5_MAX_SSBOS];
 };
 
 struct tu_const_state

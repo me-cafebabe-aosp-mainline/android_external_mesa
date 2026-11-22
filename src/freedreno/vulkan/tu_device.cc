@@ -967,6 +967,7 @@ tu_get_features(struct tu_physical_device *pdevice,
       features->textureCompressionASTC_LDR = true;
       features->textureCompressionBC = true;
       features->samplerMirrorClampToEdge = true;
+      features->fragmentStoresAndAtomics = true;
    }
 }
 
@@ -1352,7 +1353,7 @@ tu_get_properties(struct tu_physical_device *pdevice,
       props->maxPerStageDescriptorSamplers = TU5_MAX_SAMPLERS;
       props->maxPerStageDescriptorSampledImages = TU5_MAX_TEXTURES;
       props->maxPerStageDescriptorUniformBuffers = TU5_MAX_UBOS - 2;
-      props->maxPerStageDescriptorStorageBuffers = 0;
+      props->maxPerStageDescriptorStorageBuffers = TU5_MAX_SSBOS;
       props->maxPerStageDescriptorStorageImages = 0;
       props->maxPerStageResources =
          TU5_MAX_SAMPLERS + TU5_MAX_TEXTURES + TU5_MAX_UBOS - 2 + MAX_RTS;
@@ -1361,8 +1362,9 @@ tu_get_properties(struct tu_physical_device *pdevice,
       props->maxDescriptorSetUniformBuffers = 2 * (TU5_MAX_UBOS - 2);
       props->maxDescriptorSetUniformBuffersDynamic =
          MIN2(MAX_DYNAMIC_UNIFORM_BUFFERS, TU5_MAX_UBOS - 2);
-      props->maxDescriptorSetStorageBuffers = 0;
-      props->maxDescriptorSetStorageBuffersDynamic = 0;
+      props->maxDescriptorSetStorageBuffers = 2 * TU5_MAX_SSBOS;
+      props->maxDescriptorSetStorageBuffersDynamic =
+         MIN2(MAX_DYNAMIC_STORAGE_BUFFERS, TU5_MAX_SSBOS);
       props->maxDescriptorSetStorageImages = 0;
       props->maxVertexInputAttributes = 16;
       props->maxVertexInputBindings = 16;

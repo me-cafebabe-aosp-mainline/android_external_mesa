@@ -342,9 +342,11 @@ tu5_desc_base(struct tu_shader *shader,
    }
 
    struct tu5_desc_ref *refs = kind == TU5_DESC_TEXTURE ? map->tex :
-                               kind == TU5_DESC_SAMPLER ? map->samp : map->ubo;
+                               kind == TU5_DESC_SAMPLER ? map->samp :
+                               kind == TU5_DESC_UBO ? map->ubo : map->ssbo;
    unsigned max = kind == TU5_DESC_TEXTURE ? TU5_MAX_TEXTURES :
-                  kind == TU5_DESC_SAMPLER ? TU5_MAX_SAMPLERS : TU5_MAX_UBOS;
+                  kind == TU5_DESC_SAMPLER ? TU5_MAX_SAMPLERS :
+                  kind == TU5_DESC_UBO ? TU5_MAX_UBOS : TU5_MAX_SSBOS;
    unsigned base = map->count[kind];
    unsigned count = binding_layout->array_size;
 
@@ -354,7 +356,8 @@ tu5_desc_base(struct tu_shader *shader,
    }
 
    bool dynamic =
-      binding_layout->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+      binding_layout->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+      binding_layout->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
    uint32_t offset = binding_layout->offset;
 
    if (dynamic) {
@@ -418,16 +421,18 @@ lower_vulkan_resource_index(struct tu_device *dev, nir_builder *b,
    if (tu_is_a5xx(dev)) {
       /* The number of the buffer in the shader, in the place of the index
        * of the descriptor.
-       *
-       * TODO: storage buffers
        */
-      unsigned first = 0;
+      bool ubo =
+         binding_layout->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+         binding_layout->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+      unsigned first = tu5_desc_base(shader, layout, set, binding,
+                                     ubo ? TU5_DESC_UBO : TU5_DESC_SSBO);
 
-      if (binding_layout->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
-          binding_layout->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
-         first = tu5_desc_base(shader, layout, set, binding, TU5_DESC_UBO);
-      else
-         mesa_loge("a5xx: storage buffers not implemented");
+      /* TODO: the storage buffers of the vertex shaders, for which there is
+       * no state: these are to be read through pointers.
+       */
+      if (!ubo && b->shader->info.stage == MESA_SHADER_VERTEX)
+         mesa_loge("a5xx: storage buffers in vertex shaders not implemented");
 
       nir_def *def = nir_vec3(b, nir_imm_int(b, 0),
                               nir_iadd_imm(b, vulkan_idx, first),
@@ -1517,8 +1522,10 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
                                             &params);
 
    /* The pointers to the uniform buffers are constants of the shader */
-   if (tu_is_a5xx(dev))
+   if (tu_is_a5xx(dev)) {
       shader->info.num_ubos = const_state->a5xx.count[TU5_DESC_UBO];
+      shader->info.num_ssbos = const_state->a5xx.count[TU5_DESC_SSBO];
+   }
 
    /* Remove now-unused variables so that when we gather the shader info later
     * they won't be counted.
