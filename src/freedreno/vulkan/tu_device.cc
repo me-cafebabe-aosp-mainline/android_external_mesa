@@ -460,6 +460,11 @@ get_device_extensions(const struct tu_physical_device *device,
          .EXT_index_type_uint8 = true,
          .EXT_pipeline_creation_cache_control = true,
          .EXT_pipeline_creation_feedback = true,
+         .KHR_push_descriptor = true,
+         .KHR_variable_pointers = true,
+         .EXT_global_priority = all.EXT_global_priority,
+         .KHR_global_priority = all.KHR_global_priority,
+         .EXT_global_priority_query = all.EXT_global_priority_query,
       } };
    }
 }
@@ -1017,6 +1022,11 @@ tu_get_features(struct tu_physical_device *pdevice,
       features->shaderStorageBufferArrayDynamicIndexing = true;
       features->shaderStorageImageArrayDynamicIndexing = true;
       features->shaderInt16 = true;
+      features->shaderImageGatherExtended = true;
+      features->shaderStorageImageWriteWithoutFormat = true;
+      features->variablePointersStorageBuffer = true;
+      features->variablePointers = true;
+      features->globalPriorityQuery = true;
    }
 }
 
@@ -1439,13 +1449,12 @@ tu_get_properties(struct tu_physical_device *pdevice,
       props->maxDescriptorSetStorageBuffersDynamic =
          MIN2(MAX_DYNAMIC_STORAGE_BUFFERS, TU5_MAX_SSBOS);
       props->maxDescriptorSetStorageImages = 24;
-      props->maxComputeSharedMemorySize = 16384;
       props->maxComputeWorkGroupInvocations = 1024;
       props->maxComputeWorkGroupSize[0] = 1024;
       props->maxComputeWorkGroupSize[1] = 1024;
       props->maxComputeWorkGroupSize[2] = 64;
-      props->maxVertexInputAttributes = 16;
-      props->maxVertexInputBindings = 16;
+      props->maxVertexInputAttributes = 32;
+      props->maxVertexInputBindings = 32;
       props->maxViewports = 1;
       props->maxFragmentDualSrcAttachments = 1;
       props->lineWidthRange[0] = props->lineWidthRange[1] = 1.0;
