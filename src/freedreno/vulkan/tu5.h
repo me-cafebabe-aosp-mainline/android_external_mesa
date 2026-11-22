@@ -62,6 +62,9 @@ uint32_t tu5_views(const struct tu_cmd_buffer *cmd);
 void tu5_bind_view(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t view);
 void tu5_write_view_bases(struct tu_cmd_buffer *cmd, struct tu_cs *cs);
 
+/* The primitive restart index of the index type bound */
+void tu5_emit_restart_index(struct tu_cs *cs, uint32_t restart_index);
+
 /* Queries */
 void tu5_emit_sample_count_addr(struct tu_cs *cs, uint64_t iova);
 uint32_t tu5_always_on_counter_reg(void);

@@ -855,6 +855,13 @@ tu5_draw_indirect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    }
 }
 
+void
+tu5_emit_restart_index(struct tu_cs *cs, uint32_t restart_index)
+{
+   OUT_PKT4(cs, REG_A5XX_PC_RESTART_INDEX, 1);
+   OUT_RING(cs, restart_index);
+}
+
 /* vkCmdDispatch(): the compute shader and all its state, then the grid */
 void
 tu5_dispatch(struct tu_cmd_buffer *cmd, const uint32_t *blocks,
@@ -4351,6 +4358,12 @@ tu5_emit_rasterizer(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                A5XX_PC_PRIMITIVE_CNTL_STRIDE_IN_VPC(max_loc) |
                COND(dyn->ia.primitive_restart_enable && indexed,
                     A5XX_PC_PRIMITIVE_CNTL_PRIMITIVE_RESTART));
+
+   /* the restart index of the type of the index buffer bound, or the one
+    * VK_EXT_primitive_restart_index set
+    */
+   if (indexed)
+      tu5_emit_restart_index(cs, dyn->ia.primitive_restart_index);
 }
 
 static uint32_t
