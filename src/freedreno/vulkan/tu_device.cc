@@ -422,7 +422,9 @@ get_device_extensions(const struct tu_physical_device *device,
 
       *ext = (struct vk_device_extension_table) { .table = {
          .KHR_bind_memory2 = true,
+         .KHR_create_renderpass2 = true,
          .KHR_dedicated_allocation = true,
+         .KHR_depth_stencil_resolve = true,
          .KHR_descriptor_update_template = true,
          .KHR_driver_properties = true,
          .KHR_external_fence = true,
@@ -433,6 +435,7 @@ get_device_extensions(const struct tu_physical_device *device,
          .KHR_external_semaphore_fd = true,
          .KHR_get_memory_requirements2 = true,
          .KHR_image_format_list = true,
+         .KHR_imageless_framebuffer = true,
          .KHR_incremental_present = all.KHR_incremental_present,
          .KHR_maintenance1 = true,
          .KHR_maintenance2 = true,
@@ -440,8 +443,16 @@ get_device_extensions(const struct tu_physical_device *device,
          .KHR_multiview = true,
          .KHR_relaxed_block_layout = true,
          .KHR_sampler_mirror_clamp_to_edge = true,
+         .KHR_separate_depth_stencil_layouts = true,
          .KHR_shader_draw_parameters = true,
+         .KHR_shader_float_controls = true,
+         .KHR_shader_subgroup_extended_types = true,
+         .KHR_spirv_1_4 = true,
          .KHR_storage_buffer_storage_class = true,
+         .KHR_timeline_semaphore = true,
+         .KHR_uniform_buffer_standard_layout = true,
+         .EXT_host_query_reset = true,
+         .EXT_separate_stencil_usage = true,
          .KHR_swapchain = all.KHR_swapchain,
          .EXT_queue_family_foreign = true,
       } };
@@ -976,6 +987,15 @@ tu_get_features(struct tu_physical_device *pdevice,
       features->occlusionQueryPrecise = true;
       features->multiview = true;
       features->shaderDrawParameters = true;
+
+      /* what Vulkan 1.2 requires */
+      features->imagelessFramebuffer = true;
+      features->uniformBufferStandardLayout = true;
+      features->shaderSubgroupExtendedTypes = true;
+      features->separateDepthStencilLayouts = true;
+      features->hostQueryReset = true;
+      features->timelineSemaphore = true;
+      features->subgroupBroadcastDynamicId = true;
    }
 }
 
@@ -1375,7 +1395,7 @@ tu_get_properties(struct tu_physical_device *pdevice,
          : VK_MAKE_VERSION(1, 0, VK_HEADER_VERSION);
    /* Adreno 5xx: what was made to work, see tu_get_features() */
    if (pdevice->info->chip == 5)
-      props->apiVersion = VK_MAKE_VERSION(1, 1, VK_HEADER_VERSION);
+      props->apiVersion = VK_MAKE_VERSION(1, 2, VK_HEADER_VERSION);
    /* Adreno 5xx: a shader numbers what it uses, see struct tu5_desc_map.
     * TODO: storage buffers and storage images
     */

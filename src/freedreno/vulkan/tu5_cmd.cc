@@ -1102,6 +1102,8 @@ tu5_image_view_descriptor(uint32_t *descriptor, const struct tu_image *image,
    } else {
       descriptor[3] = A5XX_TEX_CONST_3_ARRAY_PITCH(layout->layer_size);
    }
+   if (layout->tile_all)
+      descriptor[3] |= A5XX_TEX_CONST_3_TILE_ALL;
    descriptor[4] = (uint32_t)iova;
    descriptor[5] = (uint32_t)(iova >> 32) | A5XX_TEX_CONST_5_DEPTH(depth);
 }
@@ -2220,9 +2222,14 @@ tu5_emit_blit_src(struct tu_cs *cs, const struct tu5_surf *surf, bool linear)
                    A5XX_TEX_CONST_2_PITCH(surf->pitch) |
                    A5XX_TEX_CONST_2_TYPE(surf->depth ? A5XX_TEX_3D
                                                      : A5XX_TEX_2D));
+   /* a level that is tiled although small is so for being of an image that
+    * is tiled at every level
+    */
    OUT_RING(cs, A5XX_TEX_CONST_3_ARRAY_PITCH(surf->layer_size) |
                    COND(surf->depth,
-                        A5XX_TEX_CONST_3_MIN_LAYERSZ(surf->min_layer_size)));
+                        A5XX_TEX_CONST_3_MIN_LAYERSZ(surf->min_layer_size)) |
+                   COND(surf->tile_mode != TILE5_LINEAR,
+                        A5XX_TEX_CONST_3_TILE_ALL));
    OUT_RING(cs, (uint32_t)surf->iova);
    OUT_RING(cs, (uint32_t)(surf->iova >> 32) |
                    A5XX_TEX_CONST_5_DEPTH(surf->depth ? surf->depth : 1));
@@ -2828,6 +2835,17 @@ tu5_clear_image(struct tu_cmd_buffer *cmd, struct tu_image *image,
          tu5_sysmem_end(cmd, cs);
       }
    }
+
+   /* The depth and stencil are written through the depth cache, which the
+    * barriers of the transfers, being those of Adreno 6xx where the clears
+    * are blits, do not clean.
+    */
+   if (zs) {
+      tu5_emit_flushes(cmd, cs,
+                       TU_CMD_FLAG_CCU_CLEAN_DEPTH |
+                       TU_CMD_FLAG_CACHE_INVALIDATE |
+                       TU_CMD_FLAG_WAIT_FOR_IDLE);
+   }
 }
 
 /* Copies and blits, outside of render passes: a rectangle sampling the source
@@ -3274,7 +3292,46 @@ tu5_resolve_sysmem(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    enum pipe_format dst_format = vk_format_to_pipe_format(dst_view->vk.format);
 
    if (util_format_is_depth_or_stencil(dst_format)) {
-      mesa_logw("a5xx: resolve of depth and stencil not implemented");
+      /* The first sample, the one resolve mode there is of depth and
+       * stencil: copied as the integers of their size, aspect by aspect, as
+       * the copies have them.
+       */
+      VkImageAspectFlags aspects = 0;
+
+      if (util_format_has_depth(util_format_description(dst_format)))
+         aspects |= VK_IMAGE_ASPECT_DEPTH_BIT;
+      if (util_format_has_stencil(util_format_description(dst_format)))
+         aspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
+
+      u_foreach_bit (aspect_bit, aspects) {
+         VkImageAspectFlags aspect = (VkImageAspectFlags)BITFIELD_BIT(aspect_bit);
+         unsigned src_plane, dst_plane;
+         uint32_t src_keep, dst_keep;
+         enum pipe_format sf = tu5_aspect_copy_format(src_view->image, aspect,
+                                                      &src_plane, &src_keep);
+         enum pipe_format df = tu5_aspect_copy_format(dst_view->image, aspect,
+                                                      &dst_plane, &dst_keep);
+
+         if (sf == PIPE_FORMAT_NONE || sf != df)
+            continue;
+
+         u_foreach_bit (i, layer_mask) {
+            struct tu5_surf src =
+               tu5_image_surf(src_view->image, src_plane, sf,
+                              src_view->vk.base_mip_level,
+                              src_view->vk.base_array_layer + i);
+            struct tu5_surf dst =
+               tu5_image_surf(dst_view->image, dst_plane, df,
+                              dst_view->vk.base_mip_level,
+                              dst_view->vk.base_array_layer + i);
+
+            tu5_blit_rect(cmd, cs, &dst, *rect, &src, rect->offset.x,
+                          rect->offset.y, rect->offset.x + rect->extent.width,
+                          rect->offset.y + rect->extent.height, false, dst_keep,
+                          GLOBAL_SH_FS_RESOLVE5_1);
+         }
+      }
+
       return;
    }
 
@@ -3483,6 +3540,13 @@ tu5_cmd_render(struct tu_cmd_buffer *cmd)
    const struct tu_subpass *subpass = cmd->state.subpass;
 
    if (subpass->resolve_attachments) {
+      /* what was drawn is to be read as textures */
+      tu5_emit_flushes(cmd, cs,
+                       TU_CMD_FLAG_CCU_CLEAN_COLOR |
+                       TU_CMD_FLAG_CCU_CLEAN_DEPTH |
+                       TU_CMD_FLAG_CACHE_INVALIDATE |
+                       TU_CMD_FLAG_WAIT_FOR_IDLE);
+
       for (unsigned i = 0; i < subpass->resolve_count; i++) {
          uint32_t a = subpass->resolve_attachments[i].attachment;
 

@@ -792,6 +792,12 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
          if (plane_layouts)
             return vk_error(device, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
 
+         /* The depth buffers have no tile mode: these are tiled at every
+          * level, which the textures are to be told.
+          */
+         layout->tile_all = layout->tile_mode &&
+                            util_format_is_depth_or_stencil(format);
+
          fdl5_layout(layout, format, image->vk.samples, width0, height0,
                      image->vk.extent.depth, image->vk.mip_levels,
                      image->vk.array_layers,

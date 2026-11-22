@@ -1887,14 +1887,22 @@ tu6_emit_sysmem_resolves(struct tu_cmd_buffer *cmd,
        * resolve case. However, a flush afterwards isn't needed because of the
        * last sentence and the fact that we're in sysmem mode.
        */
-      tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_CLEAN_COLOR);
-      if (subpass->resolve_depth_stencil)
-         tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_CLEAN_DEPTH);
+      if (tu_is_a5xx(cmd->device)) {
+         tu5_emit_flushes(cmd, cs,
+                          TU_CMD_FLAG_CCU_CLEAN_COLOR |
+                          TU_CMD_FLAG_CCU_CLEAN_DEPTH |
+                          TU_CMD_FLAG_CACHE_INVALIDATE |
+                          TU_CMD_FLAG_WAIT_FOR_IDLE);
+      } else {
+         tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_CLEAN_COLOR);
+         if (subpass->resolve_depth_stencil)
+            tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_CLEAN_DEPTH);
 
-      tu_emit_event_write<CHIP>(cmd, cs, FD_CACHE_INVALIDATE);
+         tu_emit_event_write<CHIP>(cmd, cs, FD_CACHE_INVALIDATE);
 
-      /* Wait for the flushes to land before using the 2D engine */
-      tu_cs_emit_wfi(cs);
+         /* Wait for the flushes to land before using the 2D engine */
+         tu_cs_emit_wfi(cs);
+      }
 
       for (unsigned i = 0; i < subpass->resolve_count; i++) {
          uint32_t a = subpass->resolve_attachments[i].attachment;
