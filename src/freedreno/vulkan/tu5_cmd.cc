@@ -233,10 +233,13 @@ tu5_emit_vs_params(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 
 /* Where a descriptor a shader uses is, or NULL with no set bound */
 static const uint32_t *
-tu5_descriptor(struct tu_cmd_buffer *cmd, const struct tu5_desc_ref *ref)
+tu5_descriptor(struct tu_cmd_buffer *cmd, const struct tu_shader *shader,
+               const struct tu5_desc_ref *ref)
 {
-   struct tu_descriptor_state *descriptors =
-      tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   struct tu_descriptor_state *descriptors = tu_get_descriptors_state(
+      cmd, shader->variant->type == MESA_SHADER_COMPUTE
+              ? VK_PIPELINE_BIND_POINT_COMPUTE
+              : VK_PIPELINE_BIND_POINT_GRAPHICS);
 
    if (ref->dynamic)
       return &descriptors->dynamic_descriptors[ref->offset];
@@ -247,9 +250,10 @@ tu5_descriptor(struct tu_cmd_buffer *cmd, const struct tu5_desc_ref *ref)
 }
 
 static uint64_t
-tu5_ubo_address(struct tu_cmd_buffer *cmd, const struct tu5_desc_ref *ref)
+tu5_ubo_address(struct tu_cmd_buffer *cmd, const struct tu_shader *shader,
+                const struct tu5_desc_ref *ref)
 {
-   const uint32_t *desc = tu5_descriptor(cmd, ref);
+   const uint32_t *desc = tu5_descriptor(cmd, shader, ref);
 
    /* see write_ubo_descriptor_addr() */
    return desc ? desc[0] | ((uint64_t)(desc[1] & 0x1ffff) << 32) : 0;
@@ -261,8 +265,10 @@ tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                   const struct tu_shader *shader)
 {
    const struct tu5_desc_map *map = &shader->const_state.a5xx;
-   bool vs = shader->variant->type == MESA_SHADER_VERTEX;
-   enum a4xx_state_block sb = vs ? SB4_VS_TEX : SB4_FS_TEX;
+   gl_shader_stage stage = shader->variant->type;
+   enum a4xx_state_block sb = stage == MESA_SHADER_VERTEX ? SB4_VS_TEX :
+                              stage == MESA_SHADER_FRAGMENT ? SB4_FS_TEX :
+                                                              SB4_CS_TEX;
    unsigned num_tex = map->count[TU5_DESC_TEXTURE];
    unsigned num_samp = map->count[TU5_DESC_SAMPLER];
 
@@ -281,7 +287,7 @@ tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       OUT_RING(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
       for (unsigned i = 0; i < num_samp; i++) {
          const uint32_t *desc = i < map->count[TU5_DESC_SAMPLER]
-                                   ? tu5_descriptor(cmd, &map->samp[i]) : NULL;
+                                   ? tu5_descriptor(cmd, shader, &map->samp[i]) : NULL;
 
          /* The same as those of Adreno 6xx but for the border colour.
           * TODO: border colours
@@ -303,7 +309,7 @@ tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                       CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
       OUT_RING(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
       for (unsigned i = 0; i < num_tex; i++) {
-         const uint32_t *desc = tu5_descriptor(cmd, &map->tex[i]);
+         const uint32_t *desc = tu5_descriptor(cmd, shader, &map->tex[i]);
 
          /* see tu5_image_view_descriptor() */
          for (unsigned j = 0; j < 12; j++)
@@ -311,7 +317,9 @@ tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       }
    }
 
-   OUT_PKT4(cs, vs ? REG_A5XX_TPL1_VS_TEX_COUNT : REG_A5XX_TPL1_FS_TEX_COUNT, 1);
+   OUT_PKT4(cs, stage == MESA_SHADER_VERTEX ? REG_A5XX_TPL1_VS_TEX_COUNT :
+                stage == MESA_SHADER_FRAGMENT ? REG_A5XX_TPL1_FS_TEX_COUNT :
+                                                REG_A5XX_TPL1_CS_TEX_COUNT, 1);
    OUT_RING(cs, num_tex);
 }
 
@@ -342,7 +350,7 @@ tu5_emit_ssbos(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    uint32_t size[TU5_MAX_SSBOS];
 
    for (unsigned i = 0; i < count; i++) {
-      const uint32_t *desc = tu5_descriptor(cmd, &map->ssbo[i]);
+      const uint32_t *desc = tu5_descriptor(cmd, shader, &map->ssbo[i]);
 
       va[i] = 0;
       size[i] = 0;
@@ -420,7 +428,7 @@ tu5_emit_user_consts(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       if (range->ubo.bindless || range->ubo.block >= map->count[TU5_DESC_UBO])
          continue;
 
-      uint64_t va = tu5_ubo_address(cmd, &map->ubo[range->ubo.block]);
+      uint64_t va = tu5_ubo_address(cmd, shader, &map->ubo[range->ubo.block]);
 
       if (!va)
          continue;
@@ -458,11 +466,179 @@ tu5_emit_user_consts(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
          if (i < num && (int)i == const_state->consts_ubo.idx)
             va = shader->binary_iova + v->info.constant_data_offset;
          else if (i < map->count[TU5_DESC_UBO])
-            va = tu5_ubo_address(cmd, &map->ubo[i]);
+            va = tu5_ubo_address(cmd, shader, &map->ubo[i]);
 
          tu_cs_emit_qw(cs, va);
       }
    }
+}
+
+/* vkCmdDispatch(): the compute shader and all its state, then the grid */
+void
+tu5_dispatch(struct tu_cmd_buffer *cmd, const uint32_t *blocks,
+             const uint32_t *offsets, uint64_t indirect_iova)
+{
+   struct tu_cs *cs = &cmd->cs;
+   const struct tu_shader *shader = cmd->state.shaders[MESA_SHADER_COMPUTE];
+   const struct ir3_shader_variant *v = shader->variant;
+   const struct ir3_const_state *const_state = ir3_const_state(v);
+   const struct ir3_info *i = &v->info;
+   struct tu5_shader so = tu5_shader_from(shader);
+   enum a3xx_threadsize thrsz = i->double_threadsize ? FOUR_QUADS : TWO_QUADS;
+   unsigned instrlen = v->instrlen;
+
+   /* A shader of more than 32 * 16 instructions is not loaded ahead */
+   if (instrlen > 32)
+      instrlen = 0;
+
+   OUT_PKT4(cs, REG_A5XX_SP_SP_CNTL, 1);
+   OUT_RING(cs, 0x00000000);
+
+   OUT_PKT4(cs, REG_A5XX_HLSQ_CONTROL_0_REG, 1);
+   OUT_RING(cs, A5XX_HLSQ_CONTROL_0_REG_FSTHREADSIZE(TWO_QUADS) |
+                   A5XX_HLSQ_CONTROL_0_REG_CSTHREADSIZE(thrsz) |
+                   0x00000880 /* XXX */);
+
+   OUT_PKT4(cs, REG_A5XX_SP_CS_CTRL_REG0, 1);
+   OUT_RING(cs, A5XX_SP_CS_CTRL_REG0_THREADSIZE(thrsz) |
+                   A5XX_SP_CS_CTRL_REG0_HALFREGFOOTPRINT(i->max_half_reg + 1) |
+                   A5XX_SP_CS_CTRL_REG0_FULLREGFOOTPRINT(i->max_reg + 1) |
+                   A5XX_SP_CS_CTRL_REG0_BRANCHSTACK(
+                      ir3_shader_branchstack_hw(v)) |
+                   COND(instrlen != 0, A5XX_SP_CS_CTRL_REG0_BUFFER) |
+                   0x2 /* XXX */);
+
+   OUT_PKT4(cs, REG_A5XX_HLSQ_CS_CONFIG, 1);
+   OUT_RING(cs, A5XX_HLSQ_CS_CONFIG_CONSTOBJECTOFFSET(0) |
+                   A5XX_HLSQ_CS_CONFIG_SHADEROBJOFFSET(0) |
+                   A5XX_HLSQ_CS_CONFIG_ENABLED);
+
+   OUT_PKT4(cs, REG_A5XX_HLSQ_CS_CNTL, 1);
+   OUT_RING(cs, A5XX_HLSQ_CS_CNTL_INSTRLEN(instrlen) |
+                   COND(v->has_ssbo, A5XX_HLSQ_CS_CNTL_SSBO_ENABLE));
+
+   OUT_PKT4(cs, REG_A5XX_SP_CS_CONFIG, 1);
+   OUT_RING(cs, A5XX_SP_CS_CONFIG_CONSTOBJECTOFFSET(0) |
+                   A5XX_SP_CS_CONFIG_SHADEROBJOFFSET(0) |
+                   A5XX_SP_CS_CONFIG_ENABLED);
+
+   assert(v->constlen % 4 == 0);
+   OUT_PKT4(cs, REG_A5XX_HLSQ_CS_CONSTLEN, 2);
+   OUT_RING(cs, v->constlen / 4); /* HLSQ_CS_CONSTLEN */
+   OUT_RING(cs, instrlen);        /* HLSQ_CS_INSTRLEN */
+
+   tu5_emit_shader_obj(cs, &so, REG_A5XX_SP_CS_OBJ_START_LO);
+
+   OUT_PKT4(cs, REG_A5XX_HLSQ_UPDATE_CNTL, 1);
+   OUT_RING(cs, 0x1f00000);
+
+   OUT_PKT4(cs, REG_A5XX_HLSQ_CS_CNTL_0, 2);
+   OUT_RING(cs, A5XX_HLSQ_CS_CNTL_0_WGIDCONSTID(ir3_find_sysval_regid(
+                   v, SYSTEM_VALUE_WORKGROUP_ID)) |
+                   A5XX_HLSQ_CS_CNTL_0_UNK0(regid(63, 0)) |
+                   A5XX_HLSQ_CS_CNTL_0_UNK1(regid(63, 0)) |
+                   A5XX_HLSQ_CS_CNTL_0_LOCALIDREGID(ir3_find_sysval_regid(
+                      v, SYSTEM_VALUE_LOCAL_INVOCATION_ID)));
+   OUT_RING(cs, 0x1); /* HLSQ_CS_CNTL_1 */
+
+   if (instrlen > 0)
+      tu5_emit_shader(cs, v, so.iova);
+
+   tu5_emit_immediates(cs, v);
+   tu5_emit_user_consts(cmd, cs, shader);
+   tu5_emit_textures(cmd, cs, shader);
+   tu5_emit_ssbos(cmd, cs, shader);
+
+   /* The parameters of the dispatch the shader reads as constants */
+   uint32_t offset = const_state->offsets.driver_param;
+
+   if (offset < v->constlen) {
+      uint32_t params[dword_sizeof(struct ir3_driver_params_cs)] = {};
+      uint32_t dwords = MIN2(align(const_state->num_driver_params, 4),
+                             (v->constlen - offset) * 4);
+
+      params[IR3_DP_CS(num_work_groups_x)] = blocks[0];
+      params[IR3_DP_CS(num_work_groups_y)] = blocks[1];
+      params[IR3_DP_CS(num_work_groups_z)] = blocks[2];
+      params[IR3_DP_CS(work_dim)] = 3;
+      params[IR3_DP_CS(base_group_x)] = offsets[0];
+      params[IR3_DP_CS(base_group_y)] = offsets[1];
+      params[IR3_DP_CS(base_group_z)] = offsets[2];
+      params[IR3_DP_CS(subgroup_size)] = i->subgroup_size;
+      params[IR3_DP_CS(local_group_size_x)] = v->local_size[0];
+      params[IR3_DP_CS(local_group_size_y)] = v->local_size[1];
+      params[IR3_DP_CS(local_group_size_z)] = v->local_size[2];
+      params[IR3_DP_CS(subgroup_id_shift)] = util_logbase2(i->subgroup_size);
+
+      dwords = MIN2(dwords, (uint32_t)ARRAY_SIZE(params));
+      if (dwords)
+         tu5_emit_const(cs, v, offset * 4, dwords, params);
+
+      if (indirect_iova && dwords) {
+         /* The numbers of the groups are in the buffer, at an address that
+          * need not be a multiple of 16: copy them to where it is.
+          */
+         uint64_t tmp = global_iova_arr(cmd, cs_indirect_xyz, 0);
+
+         tu_cs_emit_wfi(cs);
+         for (uint32_t c = 0; c < 3; c++) {
+            OUT_PKT7(cs, CP_MEM_TO_MEM, 5);
+            OUT_RING(cs, 0x00000000);
+            tu_cs_emit_qw(cs, tmp + c * sizeof(uint32_t));
+            tu_cs_emit_qw(cs, indirect_iova + c * sizeof(uint32_t));
+         }
+         OUT_PKT7(cs, CP_MEM_WRITE, 3);
+         tu_cs_emit_qw(cs, tmp + 3 * sizeof(uint32_t));
+         OUT_RING(cs, 3); /* work_dim */
+         tu_cs_emit_wfi(cs);
+
+         OUT_PKT7(cs, CP_LOAD_STATE4, 3);
+         OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(offset) |
+                         CP_LOAD_STATE4_0_STATE_SRC(SS4_INDIRECT) |
+                         CP_LOAD_STATE4_0_STATE_BLOCK(SB4_CS_SHADER) |
+                         CP_LOAD_STATE4_0_NUM_UNIT(1));
+         OUT_RING(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
+                         (uint32_t)tmp);
+         OUT_RING(cs, (uint32_t)(tmp >> 32));
+      }
+   }
+
+   const uint16_t *local_size = v->local_size;
+
+   OUT_PKT4(cs, REG_A5XX_HLSQ_CS_NDRANGE_0, 7);
+   OUT_RING(cs, A5XX_HLSQ_CS_NDRANGE_0_KERNELDIM(3) |
+                   A5XX_HLSQ_CS_NDRANGE_0_LOCALSIZEX(local_size[0] - 1) |
+                   A5XX_HLSQ_CS_NDRANGE_0_LOCALSIZEY(local_size[1] - 1) |
+                   A5XX_HLSQ_CS_NDRANGE_0_LOCALSIZEZ(local_size[2] - 1));
+   OUT_RING(cs, A5XX_HLSQ_CS_NDRANGE_1_GLOBALSIZE_X(local_size[0] * blocks[0]));
+   OUT_RING(cs, 0); /* HLSQ_CS_NDRANGE_2_GLOBALOFF_X */
+   OUT_RING(cs, A5XX_HLSQ_CS_NDRANGE_3_GLOBALSIZE_Y(local_size[1] * blocks[1]));
+   OUT_RING(cs, 0); /* HLSQ_CS_NDRANGE_4_GLOBALOFF_Y */
+   OUT_RING(cs, A5XX_HLSQ_CS_NDRANGE_5_GLOBALSIZE_Z(local_size[2] * blocks[2]));
+   OUT_RING(cs, 0); /* HLSQ_CS_NDRANGE_6_GLOBALOFF_Z */
+
+   OUT_PKT4(cs, REG_A5XX_HLSQ_CS_KERNEL_GROUP_X, 3);
+   OUT_RING(cs, 1); /* HLSQ_CS_KERNEL_GROUP_X */
+   OUT_RING(cs, 1); /* HLSQ_CS_KERNEL_GROUP_Y */
+   OUT_RING(cs, 1); /* HLSQ_CS_KERNEL_GROUP_Z */
+
+   if (indirect_iova) {
+      OUT_PKT7(cs, CP_EXEC_CS_INDIRECT, 4);
+      OUT_RING(cs, 0x00000000);
+      tu_cs_emit_qw(cs, indirect_iova);
+      OUT_RING(cs, A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEX(local_size[0] - 1) |
+                      A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEY(local_size[1] - 1) |
+                      A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEZ(local_size[2] - 1));
+   } else {
+      OUT_PKT7(cs, CP_EXEC_CS, 4);
+      OUT_RING(cs, 0x00000000);
+      OUT_RING(cs, CP_EXEC_CS_1_NGROUPS_X(blocks[0]));
+      OUT_RING(cs, CP_EXEC_CS_2_NGROUPS_Y(blocks[1]));
+      OUT_RING(cs, CP_EXEC_CS_3_NGROUPS_Z(blocks[2]));
+   }
+
+   /* What was written is to be seen by what comes after */
+   tu5_cache_flush(cs);
 }
 
 /* The descriptor of an image view, for write_image_descriptor() */

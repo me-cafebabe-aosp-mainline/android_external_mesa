@@ -5511,8 +5511,11 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
    if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
       cmd->state.shaders[MESA_SHADER_COMPUTE] =
          pipeline->shaders[MESA_SHADER_COMPUTE];
-      tu_cs_emit_state_ib(&cmd->cs,
-                          pipeline->shaders[MESA_SHADER_COMPUTE]->state);
+      /* Adreno 5xx: written out with the dispatch, see tu5_dispatch() */
+      if (!tu_is_a5xx(cmd->device)) {
+         tu_cs_emit_state_ib(&cmd->cs,
+                             pipeline->shaders[MESA_SHADER_COMPUTE]->state);
+      }
       cmd->state.compute_load_state = pipeline->load_state;
       return;
    }
@@ -9513,6 +9516,15 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
    bool emit_instrlen_workaround =
       shader->variant->instrlen >
       cmd->device->physical_device->info->props.instr_cache_size;
+
+   if (tu_is_a5xx(cmd->device)) {
+      tu_emit_cache_flush<CHIP>(cmd);
+      tu5_dispatch(cmd, info->blocks, info->offsets,
+                   info->indirect
+                      ? info->indirect->iova + info->indirect_offset : 0);
+      cmd->state.dirty &= ~TU_CMD_DIRTY_COMPUTE_DESC_SETS;
+      return;
+   }
 
    /* We don't use draw states for dispatches, so the bound pipeline
     * could be overwritten by reg stomping in a renderpass or blit.

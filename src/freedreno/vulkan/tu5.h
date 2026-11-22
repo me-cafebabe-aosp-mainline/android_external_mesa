@@ -43,6 +43,10 @@ bool tu5_format_depth_supported(enum pipe_format format);
 }
 #endif
 
+/* vkCmdDispatch(), vkCmdDispatchIndirect(): indirect_iova is 0 for the first */
+void tu5_dispatch(struct tu_cmd_buffer *cmd, const uint32_t *blocks,
+                  const uint32_t *offsets, uint64_t indirect_iova);
+
 /* The descriptor of an image view */
 void tu5_image_view_descriptor(uint32_t *descriptor,
                                const struct tu_image *image, unsigned plane,
