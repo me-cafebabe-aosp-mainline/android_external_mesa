@@ -4401,7 +4401,6 @@ tu5_emit_rasterizer(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 {
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
-   bool msaa = cmd->state.subpass->samples > VK_SAMPLE_COUNT_1_BIT;
    enum adreno_pa_su_sc_draw polymode =
       dyn->rs.polygon_mode == VK_POLYGON_MODE_POINT  ? PC_DRAW_POINTS :
       dyn->rs.polygon_mode == VK_POLYGON_MODE_LINE   ? PC_DRAW_LINES :
@@ -4423,7 +4422,12 @@ tu5_emit_rasterizer(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                COND(dyn->rs.front_face == VK_FRONT_FACE_CLOCKWISE,
                     A5XX_GRAS_SU_CNTL_FRONT_CW) |
                COND(dyn->rs.depth_bias.enable, A5XX_GRAS_SU_CNTL_POLY_OFFSET) |
-               A5XX_GRAS_SU_CNTL_LINE_MODE(msaa ? RECTANGULAR : BRESENHAM));
+               /* strictLines: the default lines are rectangles, as in the
+                * stock driver
+                */
+               A5XX_GRAS_SU_CNTL_LINE_MODE(
+                  dyn->rs.line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM_KHR
+                     ? BRESENHAM : RECTANGULAR));
 
    OUT_PKT4(cs, REG_A5XX_GRAS_SU_POINT_MINMAX, 2);
    OUT_RING(cs, A5XX_GRAS_SU_POINT_MINMAX_MIN(psize_min) |
