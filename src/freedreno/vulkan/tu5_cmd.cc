@@ -2648,6 +2648,8 @@ tu5_sysmem_end(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
    tu5_event_write(cmd, cs, PC_CCU_FLUSH_DEPTH_TS, true);
 }
 
+static enum pipe_format tu5_copy_format(enum pipe_format format);
+
 void
 tu5_clear_image(struct tu_cmd_buffer *cmd, struct tu_image *image,
                 const VkClearValue *value, uint32_t range_count,
@@ -2656,6 +2658,38 @@ tu5_clear_image(struct tu_cmd_buffer *cmd, struct tu_image *image,
    struct tu_cs *cs = &cmd->cs;
    enum pipe_format format = vk_format_to_pipe_format(image->vk.format);
    bool zs = util_format_is_depth_or_stencil(format);
+   VkClearValue packed = {};
+
+   /* What cannot be drawn to is cleared as the unsigned integers of its
+    * size, to the bits of the colour.
+    */
+   if (!zs && !tu5_format_color_supported(format) &&
+       !util_format_is_compressed(format) &&
+       tu5_copy_format(format) != PIPE_FORMAT_NONE) {
+      enum pipe_format as = tu5_copy_format(format);
+      union {
+         uint8_t u8[16];
+         uint16_t u16[8];
+         uint32_t u32[4];
+      } bits = {};
+
+      util_format_pack_rgba(format, bits.u8, value->color.uint32, 1);
+
+      switch (util_format_get_blocksize(format)) {
+      case 1:
+         packed.color.uint32[0] = bits.u8[0];
+         break;
+      case 2:
+         packed.color.uint32[0] = bits.u16[0];
+         break;
+      default:
+         memcpy(packed.color.uint32, bits.u32, sizeof(bits.u32));
+         break;
+      }
+
+      format = as;
+      value = &packed;
+   }
 
    for (uint32_t i = 0; i < range_count; i++) {
       const VkImageSubresourceRange *range = &ranges[i];
