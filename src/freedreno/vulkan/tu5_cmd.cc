@@ -2488,6 +2488,9 @@ tu5_emit_msaa(struct tu_cs *cs, VkSampleCountFlagBits vk_samples)
  * a5xx gets these as a triangle strip of four vertices through the usual
  * viewport transform: see build_rect5_vs_shader().
  */
+/* Binning: the fragment shader of the binning pass, none, as Gallium */
+static const struct ir3_shader_variant tu5_binning_fs = {};
+
 struct tu5_rect_draw {
    enum global_shader fs;
 
@@ -2514,6 +2517,7 @@ struct tu5_rect_draw {
 
    /* The components not to write, of the colour target */
    uint32_t keep_mask;
+
 
    /* The samples to write, all of them if none */
    uint32_t sample_mask;
@@ -3665,6 +3669,51 @@ tu5_emit_gmem_clears(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
  */
 #define TU5_GMEM_MAX_TILES 4
 
+/* Binning: the tiles of the framebuffer, and how many of them across and
+ * down each pipe groups, as the Gallium driver has them (fd_gmem.c)
+ */
+struct tu5_vsc {
+   uint32_t nx, ny;   /* tiles */
+   uint32_t tpx, tpy; /* tiles a pipe */
+};
+
+static struct tu5_vsc
+tu5_vsc_layout(const struct tu_cmd_buffer *cmd)
+{
+   const struct tu_framebuffer *fb = cmd->state.framebuffer;
+   const VkExtent2D tile0 = cmd->state.tiling->tile0;
+   struct tu5_vsc v = {
+      .nx = DIV_ROUND_UP(fb->width, tile0.width),
+      .ny = DIV_ROUND_UP(fb->height, tile0.height),
+      .tpx = 1,
+      .tpy = 1,
+   };
+
+   while (DIV_ROUND_UP(v.ny, v.tpy) > TU5_VSC_PIPES)
+      v.tpy += 2;
+   while (DIV_ROUND_UP(v.ny, v.tpy) * DIV_ROUND_UP(v.nx, v.tpx) >
+          TU5_VSC_PIPES)
+      v.tpx += 1;
+
+   return v;
+}
+
+/* Whether the render pass in GMEM that begins has a binning pass first,
+ * after which each tile draws only what is to be seen in it: for more than
+ * two tiles (as Gallium), in pipes the hardware takes.
+ */
+bool
+tu5_use_binning(struct tu_cmd_buffer *cmd)
+{
+   if (!cmd->device->a5xx_vsc_bo || TU_DEBUG(NOBIN))
+      return false;
+
+   struct tu5_vsc v = tu5_vsc_layout(cmd);
+
+   return v.nx * v.ny > 2 && v.tpx * v.tpy <= 32 && v.tpx <= 15 &&
+          v.tpy <= 15;
+}
+
 bool
 tu5_use_gmem(struct tu_cmd_buffer *cmd)
 {
@@ -3851,6 +3900,97 @@ tu5_cmd_render_gmem(struct tu_cmd_buffer *cmd)
    OUT_PKT4(cs, REG_A5XX_VPC_SO_OVERRIDE, 1);
    OUT_RING(cs, 0);
 
+   const bool binning = cmd->state.a5xx_binning;
+   const struct tu5_vsc vsc = tu5_vsc_layout(cmd);
+   const uint64_t vsc_iova = binning ? cmd->device->a5xx_vsc_bo->iova : 0;
+   const uint64_t vsc_sizes = vsc_iova + TU5_VSC_PIPES * TU5_VSC_PIPE_SIZE;
+
+   if (binning) {
+      /* The binning pass: the draws of the whole framebuffer, the vertex
+       * shaders alone, which make the visibility stream of each pipe: what
+       * of each draw each of its tiles sees. As fd5_gmem.c.
+       */
+      tu5_set_render_mode(cs, BINNING);
+
+      OUT_PKT4(cs, REG_A5XX_RB_CNTL, 1);
+      OUT_RING(cs, A5XX_RB_CNTL_WIDTH(tile0.width) |
+                      A5XX_RB_CNTL_HEIGHT(tile0.height));
+
+      OUT_PKT4(cs, REG_A5XX_GRAS_SC_WINDOW_SCISSOR_TL, 2);
+      OUT_RING(cs, A5XX_GRAS_SC_WINDOW_SCISSOR_TL_X(0) |
+                      A5XX_GRAS_SC_WINDOW_SCISSOR_TL_Y(0));
+      OUT_RING(cs, A5XX_GRAS_SC_WINDOW_SCISSOR_BR_X(fb->width - 1) |
+                      A5XX_GRAS_SC_WINDOW_SCISSOR_BR_Y(fb->height - 1));
+
+      OUT_PKT4(cs, REG_A5XX_RB_RESOLVE_CNTL_1, 2);
+      OUT_RING(cs, A5XX_RB_RESOLVE_CNTL_1_X(0) | A5XX_RB_RESOLVE_CNTL_1_Y(0));
+      OUT_RING(cs, A5XX_RB_RESOLVE_CNTL_2_X(fb->width - 1) |
+                      A5XX_RB_RESOLVE_CNTL_2_Y(fb->height - 1));
+
+      OUT_PKT4(cs, REG_A5XX_VSC_BIN_SIZE, 3);
+      OUT_RING(cs, A5XX_VSC_BIN_SIZE_WIDTH(tile0.width) |
+                      A5XX_VSC_BIN_SIZE_HEIGHT(tile0.height));
+      tu_cs_emit_qw(cs, vsc_sizes); /* VSC_SIZE_ADDRESS_LO/HI */
+
+      OUT_PKT4(cs, REG_A5XX_UNKNOWN_0BC5, 2);
+      OUT_RING(cs, 0x00000000);
+      OUT_RING(cs, 0x00000000);
+
+      OUT_PKT4(cs, REG_A5XX_VSC_PIPE_CONFIG_REG(0), TU5_VSC_PIPES);
+      for (uint32_t i = 0; i < TU5_VSC_PIPES; i++) {
+         uint32_t px = DIV_ROUND_UP(vsc.nx, vsc.tpx);
+         uint32_t x = (i % px) * vsc.tpx, y = (i / px) * vsc.tpy;
+
+         if (y >= vsc.ny) {
+            OUT_RING(cs, 0);
+            continue;
+         }
+         OUT_RING(cs, A5XX_VSC_PIPE_CONFIG_REG_X(x) |
+                         A5XX_VSC_PIPE_CONFIG_REG_Y(y) |
+                         A5XX_VSC_PIPE_CONFIG_REG_W(MIN2(vsc.tpx, vsc.nx - x)) |
+                         A5XX_VSC_PIPE_CONFIG_REG_H(MIN2(vsc.tpy, vsc.ny - y)));
+      }
+
+      OUT_PKT4(cs, REG_A5XX_VSC_PIPE_DATA_ADDRESS_LO(0), 2 * TU5_VSC_PIPES);
+      for (uint32_t i = 0; i < TU5_VSC_PIPES; i++)
+         tu_cs_emit_qw(cs, vsc_iova + i * TU5_VSC_PIPE_SIZE);
+
+      OUT_PKT4(cs, REG_A5XX_VSC_PIPE_DATA_LENGTH_REG(0), TU5_VSC_PIPES);
+      for (uint32_t i = 0; i < TU5_VSC_PIPES; i++)
+         OUT_RING(cs, TU5_VSC_PIPE_SIZE - 32);
+
+      OUT_PKT4(cs, REG_A5XX_VPC_MODE_CNTL, 1);
+      OUT_RING(cs, A5XX_VPC_MODE_CNTL_BINNING_PASS);
+
+      tu5_event_write(cmd, cs, UNK_2C, false);
+
+      OUT_PKT4(cs, REG_A5XX_RB_WINDOW_OFFSET, 1);
+      OUT_RING(cs, A5XX_RB_WINDOW_OFFSET_X(0) | A5XX_RB_WINDOW_OFFSET_Y(0));
+
+      tu_cs_emit_call(cs, &cmd->a5xx_binning_cs);
+
+      tu5_event_write(cmd, cs, UNK_2D, false);
+      tu5_event_write(cmd, cs, CACHE_FLUSH_TS, true);
+      tu_cs_emit_wfi(cs);
+
+      OUT_PKT4(cs, REG_A5XX_VPC_MODE_CNTL, 1);
+      OUT_RING(cs, 0x0);
+
+      /* out of the binning pass, for the loads of the tiles before the
+       * draw stream sets these again: they hang in it otherwise
+       */
+      OUT_PKT4(cs, REG_A5XX_RB_RENDER_CNTL, 1);
+      OUT_RING(cs, 0x00000008);
+      OUT_PKT4(cs, REG_A5XX_GRAS_SC_CNTL, 1);
+      OUT_RING(cs, 0x00000008);
+
+      /* each vertex streamed out once: in the binning pass */
+      OUT_PKT4(cs, REG_A5XX_VPC_SO_OVERRIDE, 1);
+      OUT_RING(cs, A5XX_VPC_SO_OVERRIDE_SO_DISABLE);
+
+      tu5_emit_lrz_flush(cmd, cs);
+   }
+
    tu5_set_render_mode(cs, GMEM);
 
    /* the tiles the render area covers */
@@ -3881,8 +4021,26 @@ tu5_cmd_render_gmem(struct tu_cmd_buffer *cmd)
          OUT_RING(cs, A5XX_RB_RESOLVE_CNTL_1_X(x1) | A5XX_RB_RESOLVE_CNTL_1_Y(y1));
          OUT_RING(cs, A5XX_RB_RESOLVE_CNTL_2_X(x2) | A5XX_RB_RESOLVE_CNTL_2_Y(y2));
 
-         OUT_PKT7(cs, CP_SET_VISIBILITY_OVERRIDE, 1);
-         OUT_RING(cs, 0x1);
+         if (binning) {
+            /* the pipe of the tile, and which of its tiles it is */
+            uint32_t px = DIV_ROUND_UP(vsc.nx, vsc.tpx);
+            uint32_t p = (ty / vsc.tpy) * px + tx / vsc.tpx;
+            uint32_t pw = MIN2(vsc.tpx, vsc.nx - (tx / vsc.tpx) * vsc.tpx);
+            uint32_t ph = MIN2(vsc.tpy, vsc.ny - (ty / vsc.tpy) * vsc.tpy);
+            uint32_t n = (ty % vsc.tpy) * pw + tx % vsc.tpx;
+
+            OUT_PKT7(cs, CP_WAIT_FOR_ME, 0);
+            OUT_PKT7(cs, CP_SET_VISIBILITY_OVERRIDE, 1);
+            OUT_RING(cs, 0x0);
+            OUT_PKT7(cs, CP_SET_BIN_DATA5, 5);
+            OUT_RING(cs, CP_SET_BIN_DATA5_0_VSC_SIZE(pw * ph) |
+                            CP_SET_BIN_DATA5_0_VSC_N(n));
+            tu_cs_emit_qw(cs, vsc_iova + p * TU5_VSC_PIPE_SIZE);
+            tu_cs_emit_qw(cs, vsc_sizes + p * 4);
+         } else {
+            OUT_PKT7(cs, CP_SET_VISIBILITY_OVERRIDE, 1);
+            OUT_RING(cs, 0x1);
+         }
 
          OUT_PKT4(cs, REG_A5XX_RB_WINDOW_OFFSET, 1);
          OUT_RING(cs, A5XX_RB_WINDOW_OFFSET_X(x1) | A5XX_RB_WINDOW_OFFSET_Y(y1));
@@ -4403,6 +4561,74 @@ tu5_emit_blend(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                       ir3_find_output_regid(fp, FRAG_RESULT_SAMPLE_MASK)));
 }
 
+/* Binning: the state of a draw for the binning pass, which runs its vertex
+ * shader alone, all of it written out each time.
+ */
+static void
+tu5_binning_state(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool indexed)
+{
+   const struct tu_shader *vs_shader = cmd->state.shaders[MESA_SHADER_VERTEX];
+   const struct tu_shader *fs_shader = cmd->state.shaders[MESA_SHADER_FRAGMENT];
+   struct tu5_program prog = {
+      .vs = vs_shader->variant,
+      .fs = &tu5_binning_fs,
+      .vs_shader = tu5_shader_from(vs_shader),
+      .binning_pass = true,
+   };
+   /* the vertex shader of the binning pass, which writes the position and
+    * the point size alone
+    */
+   if (vs_shader->variant->binning && vs_shader->binning_iova) {
+      prog.vs = vs_shader->variant->binning;
+      prog.vs_shader.v = prog.vs;
+      prog.vs_shader.iova = vs_shader->binning_iova;
+   }
+   (void)fs_shader;
+
+   OUT_PKT4(cs, REG_A5XX_RB_RENDER_CNTL, 1);
+   OUT_RING(cs, A5XX_RB_RENDER_CNTL_BINNING_PASS |
+                   A5XX_RB_RENDER_CNTL_DISABLE_COLOR_PIPE | 0x8);
+   OUT_PKT4(cs, REG_A5XX_GRAS_SC_CNTL, 1);
+   OUT_RING(cs, A5XX_GRAS_SC_CNTL_BINNING_PASS | 0x8);
+
+   /* No depth or stencil test: what is in GMEM is not what the draw would
+    * be tested against (the binning pass runs before the clears and the
+    * loads of the tiles), and a draw would be seen nowhere.
+    */
+   OUT_PKT4(cs, REG_A5XX_RB_DEPTH_CNTL, 1);
+   OUT_RING(cs, 0x00000000);
+   OUT_PKT4(cs, REG_A5XX_RB_STENCIL_CONTROL, 1);
+   OUT_RING(cs, 0x00000000);
+   OUT_PKT4(cs, REG_A5XX_RB_ALPHA_CONTROL, 1);
+   OUT_RING(cs, 0x00000000);
+   OUT_PKT4(cs, REG_A5XX_GRAS_LRZ_CNTL, 1);
+   OUT_RING(cs, 0x00000000);
+   OUT_PKT4(cs, REG_A5XX_RB_DEPTH_PLANE_CNTL, 1);
+   OUT_RING(cs, 0x00000000);
+   OUT_PKT4(cs, REG_A5XX_GRAS_SU_DEPTH_PLANE_CNTL, 1);
+   OUT_RING(cs, 0x00000000);
+
+   tu5_emit_viewport_scissor(cmd, cs);
+   tu5_program_emit(cs, &prog);
+   tu5_emit_rasterizer(cmd, cs, prog.vs, prog.max_loc, indexed);
+   tu5_emit_vertex_bufs(cmd, cs, prog.vs);
+   tu5_emit_immediates(cs, prog.vs);
+   tu5_emit_vs_params(cmd, cs, prog.vs);
+   tu5_emit_user_consts(cmd, cs, vs_shader);
+   tu5_emit_textures(cmd, cs, vs_shader);
+
+   OUT_PKT4(cs, REG_A5XX_RB_FS_OUTPUT_CNTL, 1);
+   OUT_RING(cs, A5XX_RB_FS_OUTPUT_CNTL_MRT(0));
+   OUT_PKT4(cs, REG_A5XX_SP_FS_OUTPUT_CNTL, 1);
+   OUT_RING(cs, A5XX_SP_FS_OUTPUT_CNTL_MRT(0) |
+                   A5XX_SP_FS_OUTPUT_CNTL_DEPTH_REGID(regid(63, 0)) |
+                   A5XX_SP_FS_OUTPUT_CNTL_SAMPLEMASK_REGID(regid(63, 0)));
+
+   OUT_PKT4(cs, REG_A5XX_VFD_INDEX_OFFSET, 2);
+   OUT_RING(cs, cmd->state.last_vs_params.vertex_offset);
+   OUT_RING(cs, cmd->state.last_vs_params.first_instance);
+}
+
 /* TODO: only what changed. Everything is written out for each draw for now,
  * as the draw stream is not built from draw state groups here.
  */
@@ -4472,6 +4698,10 @@ tu5_draw_state(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool indexed)
 
    OUT_PKT4(cs, REG_A5XX_TPL1_CS_TEX_COUNT, 1);
    OUT_RING(cs, 0);
+
+   /* and the state of the draw for the binning pass */
+   if (cmd->state.a5xx_binning)
+      tu5_binning_state(cmd, &cmd->a5xx_binning_cs, indexed);
 
    cmd->state.dirty = (enum tu_cmd_dirty_bits)0;
    vk_dynamic_graphics_state_clear_dirty(&cmd->vk.dynamic_graphics_state);

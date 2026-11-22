@@ -52,6 +52,11 @@ void tu5_pack_border_color(void *entry, const VkClearColorValue *val,
 /* GMEM */
 bool tu5_use_gmem(struct tu_cmd_buffer *cmd);
 
+/* Binning: the visibility streams of the pipes the tiles are grouped in */
+#define TU5_VSC_PIPES 16
+#define TU5_VSC_PIPE_SIZE 0x20000
+bool tu5_use_binning(struct tu_cmd_buffer *cmd);
+
 /* Multiview */
 uint32_t tu5_views(const struct tu_cmd_buffer *cmd);
 void tu5_bind_view(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t view);

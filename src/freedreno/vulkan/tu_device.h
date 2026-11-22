@@ -350,6 +350,12 @@ struct tu_device
    struct tu_pvtmem_bo fiber_pvtmem_bo, wave_pvtmem_bo;
 
    struct tu_bo *global_bo;
+
+   /* Adreno 5xx: the visibility streams of the binning pass, see
+    * tu5_cmd_render_gmem(): TU5_VSC_PIPES of TU5_VSC_PIPE_SIZE, then their
+    * sizes.
+    */
+   struct tu_bo *a5xx_vsc_bo;
    struct tu6_global *global_bo_map;
 
    struct tu_bo *null_accel_struct_bo;

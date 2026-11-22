@@ -3220,6 +3220,13 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       goto fail_global_bo;
    }
 
+   /* Adreno 5xx: without it, no binning (tu5_use_binning()) */
+   if (tu_is_a5xx(device) &&
+       tu_bo_init_new(device, NULL, &device->a5xx_vsc_bo,
+                      TU5_VSC_PIPES * TU5_VSC_PIPE_SIZE + 4096,
+                      TU_BO_ALLOC_INTERNAL_RESOURCE, "a5xx vsc") != VK_SUCCESS)
+      device->a5xx_vsc_bo = NULL;
+
    result = tu_bo_map(device, device->global_bo, NULL);
    if (result != VK_SUCCESS) {
       vk_startup_errorf(device->instance, result, "BO map");
@@ -3439,6 +3446,8 @@ fail_empty_shaders:
 fail_null_accel_struct:
    tu_destroy_clear_blit_shaders(device);
 fail_global_bo_map:
+   if (device->a5xx_vsc_bo)
+      tu_bo_finish(device, device->a5xx_vsc_bo);
    TU_RMV(resource_destroy, device, device->global_bo);
    tu_bo_finish(device, device->global_bo);
    vk_free(&device->vk.alloc, device->submit_bo_list);
@@ -3535,6 +3544,8 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    tu_bo_suballocator_finish(&device->event_suballoc);
    tu_bo_suballocator_finish(&device->vis_stream_suballocator);
 
+   if (device->a5xx_vsc_bo)
+      tu_bo_finish(device, device->a5xx_vsc_bo);
    tu_bo_finish(device, device->global_bo);
 
    if (device->vm_bind_fence_fd != -1)

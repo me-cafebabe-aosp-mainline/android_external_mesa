@@ -633,6 +633,8 @@ struct tu_cmd_state
     * tu5_use_gmem()
     */
    bool a5xx_gmem;
+   /* and with a binning pass first, the draws also in a5xx_binning_cs */
+   bool a5xx_binning;
 
    /* Adreno 5xx: the graphics pipeline vkCmdBindPipeline() bound last, to
     * bind it again for nothing (Skia binds it before each draw)
@@ -727,6 +729,11 @@ struct tu_cmd_buffer
    struct tu_cs tile_store_cs;
    struct tu_cs draw_epilogue_cs;
    struct tu_cs sub_cs;
+
+   /* Adreno 5xx: the draws of the render pass for the binning pass, see
+    * tu5_cmd_render_gmem()
+    */
+   struct tu_cs a5xx_binning_cs;
 
    /* If the first render pass in the command buffer is resuming, then it is
     * part of a suspend/resume chain that starts before the current command

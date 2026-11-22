@@ -4102,6 +4102,8 @@ static void tu_reset_render_pass(struct tu_cmd_buffer *cmd_buffer)
    tu_cs_begin(&cmd_buffer->draw_cs);
    tu_cs_discard_entries(&cmd_buffer->draw_epilogue_cs);
    tu_cs_begin(&cmd_buffer->draw_epilogue_cs);
+   tu_cs_discard_entries(&cmd_buffer->a5xx_binning_cs);
+   tu_cs_begin(&cmd_buffer->a5xx_binning_cs);
 
    cmd_buffer->state.pass = NULL;
    cmd_buffer->state.subpass = NULL;
@@ -4173,6 +4175,7 @@ tu_create_cmd_buffer(struct vk_command_pool *pool,
    tu_cs_init(&cmd_buffer->draw_cs, device, TU_CS_MODE_GROW, 4096, "draw cs");
    tu_cs_init(&cmd_buffer->tile_store_cs, device, TU_CS_MODE_GROW, 2048, "tile store cs");
    tu_cs_init(&cmd_buffer->draw_epilogue_cs, device, TU_CS_MODE_GROW, 4096, "draw epilogue cs");
+   tu_cs_init(&cmd_buffer->a5xx_binning_cs, device, TU_CS_MODE_GROW, 4096, "a5xx binning cs");
    tu_cs_init(&cmd_buffer->sub_cs, device, TU_CS_MODE_SUB_STREAM, 2048, "draw sub cs");
    tu_cs_init(&cmd_buffer->pre_chain.draw_cs, device, TU_CS_MODE_GROW, 4096, "prechain draw cs");
    tu_cs_init(&cmd_buffer->pre_chain.draw_epilogue_cs, device, TU_CS_MODE_GROW, 4096, "prechain draw epiligoue cs");
@@ -4195,6 +4198,7 @@ tu_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
    tu_cs_finish(&cmd_buffer->draw_cs);
    tu_cs_finish(&cmd_buffer->tile_store_cs);
    tu_cs_finish(&cmd_buffer->draw_epilogue_cs);
+   tu_cs_finish(&cmd_buffer->a5xx_binning_cs);
    tu_cs_finish(&cmd_buffer->sub_cs);
    tu_cs_finish(&cmd_buffer->pre_chain.draw_cs);
    tu_cs_finish(&cmd_buffer->pre_chain.draw_epilogue_cs);
@@ -4282,6 +4286,7 @@ tu_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
    tu_cs_reset(&cmd_buffer->draw_cs);
    tu_cs_reset(&cmd_buffer->tile_store_cs);
    tu_cs_reset(&cmd_buffer->draw_epilogue_cs);
+   tu_cs_reset(&cmd_buffer->a5xx_binning_cs);
    tu_cs_reset(&cmd_buffer->sub_cs);
    tu_cs_reset(&cmd_buffer->pre_chain.draw_cs);
    tu_cs_reset(&cmd_buffer->pre_chain.draw_epilogue_cs);
@@ -4396,6 +4401,7 @@ tu_cmd_buffer_begin(struct tu_cmd_buffer *cmd_buffer,
    tu_cs_begin(&cmd_buffer->cs);
    tu_cs_begin(&cmd_buffer->draw_cs);
    tu_cs_begin(&cmd_buffer->draw_epilogue_cs);
+   tu_cs_begin(&cmd_buffer->a5xx_binning_cs);
 
    if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
       if (u_trace_enabled(&cmd_buffer->device->trace_context)) {
@@ -5426,6 +5432,7 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
    tu_cs_end(&cmd_buffer->cs);
    tu_cs_end(&cmd_buffer->draw_cs);
    tu_cs_end(&cmd_buffer->draw_epilogue_cs);
+   tu_cs_end(&cmd_buffer->a5xx_binning_cs);
 
    for (struct tu_cs *cs : { &cmd_buffer->cs, &cmd_buffer->draw_cs, &cmd_buffer->draw_epilogue_cs,
                              &cmd_buffer->tile_store_cs, &cmd_buffer->sub_cs }) {
@@ -6431,6 +6438,8 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
             tu5_write_view_bases(cmd, &cmd->draw_cs);
             /* what the secondary command buffer leaves is not known */
             cmd->state.a5xx_vs = cmd->state.a5xx_fs = NULL;
+            /* nor are its draws in the binning pass: every tile draws all */
+            cmd->state.a5xx_binning = false;
          }
 
          result = tu_cs_add_entries(&cmd->draw_cs, &secondary->draw_cs);
@@ -7136,8 +7145,11 @@ tu_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
    }
 
    tu_choose_gmem_layout(cmd);
-   if (tu_is_a5xx(cmd->device))
+   if (tu_is_a5xx(cmd->device)) {
       cmd->state.a5xx_gmem = tu5_use_gmem(cmd);
+      cmd->state.a5xx_binning =
+         cmd->state.a5xx_gmem && tu5_use_binning(cmd);
+   }
 
    /* Note: because this is external, any flushes will happen before draw_cs
     * gets called. However deferred flushes could have to happen later as part
@@ -7349,6 +7361,7 @@ tu_CmdBeginRendering(VkCommandBuffer commandBuffer,
    tu_choose_gmem_layout(cmd);
    /* Adreno 5xx: the dynamic render passes are drawn in memory */
    cmd->state.a5xx_gmem = false;
+   cmd->state.a5xx_binning = false;
 
    cmd->state.renderpass_cache.pending_flush_bits =
       cmd->state.cache.pending_flush_bits;
@@ -9014,6 +9027,19 @@ tu_CmdDraw(VkCommandBuffer commandBuffer,
    }
 
    trace_end_draw(&cmd->rp_trace, cs);
+   /* Adreno 5xx: the draw again for the binning pass, which sees all */
+   if (a5xx && cmd->state.a5xx_binning) {
+      struct tu_cs *bcs = &cmd->a5xx_binning_cs;
+
+      u_foreach_bit (view, tu5_views(cmd)) {
+         tu5_bind_view(cmd, bcs, view);
+         tu_cs_emit_pkt7(bcs, CP_DRAW_INDX_OFFSET, 3);
+         tu_cs_emit(bcs, tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_INDEX) &
+                            ~CP_DRAW_INDX_OFFSET_0_VIS_CULL__MASK);
+         tu_cs_emit(bcs, instanceCount);
+         tu_cs_emit(bcs, vertexCount);
+      }
+   }
 }
 TU_GENX(tu_CmdDraw);
 
@@ -9098,6 +9124,22 @@ tu_CmdDrawIndexed(VkCommandBuffer commandBuffer,
    }
 
    trace_end_draw(&cmd->rp_trace, cs);
+   /* Adreno 5xx: the draw again for the binning pass, which sees all */
+   if (a5xx && cmd->state.a5xx_binning) {
+      struct tu_cs *bcs = &cmd->a5xx_binning_cs;
+
+      u_foreach_bit (view, tu5_views(cmd)) {
+         tu5_bind_view(cmd, bcs, view);
+         tu_cs_emit_pkt7(bcs, CP_DRAW_INDX_OFFSET, 7);
+         tu_cs_emit(bcs, tu_draw_initiator(cmd, DI_SRC_SEL_DMA) &
+                            ~CP_DRAW_INDX_OFFSET_0_VIS_CULL__MASK);
+         tu_cs_emit(bcs, instanceCount);
+         tu_cs_emit(bcs, indexCount);
+         tu_cs_emit(bcs, firstIndex);
+         tu_cs_emit_qw(bcs, cmd->state.index_va);
+         tu_cs_emit(bcs, cmd->state.max_index_count);
+      }
+   }
 }
 TU_GENX(tu_CmdDrawIndexed);
 
@@ -9195,6 +9237,16 @@ tu_CmdDrawIndirect(VkCommandBuffer commandBuffer,
                            tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_INDEX), false,
                            buf->iova + offset, drawCount, stride);
       }
+      /* again for the binning pass, which sees all */
+      if (cmd->state.a5xx_binning) {
+         u_foreach_bit (view, tu5_views(cmd)) {
+            tu5_bind_view(cmd, &cmd->a5xx_binning_cs, view);
+            tu5_draw_indirect(cmd, &cmd->a5xx_binning_cs,
+                              tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_INDEX) &
+                                 ~CP_DRAW_INDX_OFFSET_0_VIS_CULL__MASK,
+                              false, buf->iova + offset, drawCount, stride);
+         }
+      }
       return;
    }
 
@@ -9234,6 +9286,16 @@ tu_CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer,
          tu5_bind_view(cmd, cs, view);
          tu5_draw_indirect(cmd, cs, tu_draw_initiator(cmd, DI_SRC_SEL_DMA),
                            true, buf->iova + offset, drawCount, stride);
+      }
+      /* again for the binning pass, which sees all */
+      if (cmd->state.a5xx_binning) {
+         u_foreach_bit (view, tu5_views(cmd)) {
+            tu5_bind_view(cmd, &cmd->a5xx_binning_cs, view);
+            tu5_draw_indirect(cmd, &cmd->a5xx_binning_cs,
+                              tu_draw_initiator(cmd, DI_SRC_SEL_DMA) &
+                                 ~CP_DRAW_INDX_OFFSET_0_VIS_CULL__MASK,
+                              true, buf->iova + offset, drawCount, stride);
+         }
       }
       return;
    }
@@ -9999,6 +10061,7 @@ tu_CmdEndRenderPass2(VkCommandBuffer commandBuffer,
 
    tu_cs_end(&cmd_buffer->draw_cs);
    tu_cs_end(&cmd_buffer->draw_epilogue_cs);
+   tu_cs_end(&cmd_buffer->a5xx_binning_cs);
    TU_CALLX(cmd_buffer->device, tu_cmd_render)(cmd_buffer, fdm_offsets);
 
    cmd_buffer->state.cache.pending_flush_bits |=

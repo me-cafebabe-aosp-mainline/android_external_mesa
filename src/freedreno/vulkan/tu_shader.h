@@ -129,6 +129,8 @@ struct tu_shader
     * the Adrenos that have these written out with each draw (a5xx).
     */
    uint64_t binary_iova;
+   /* and of its binning variant, the vertex shader of the binning pass */
+   uint64_t binning_iova;
    struct {
       uint64_t iova;
       uint32_t per_fiber_size;
