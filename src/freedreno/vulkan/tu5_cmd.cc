@@ -1089,6 +1089,15 @@ tu5_dispatch(struct tu_cmd_buffer *cmd, const uint32_t *blocks,
 }
 
 /* The descriptor of an image view, for write_image_descriptor() */
+/* The format of a view as Adreno 5xx has it: the first plane of NV12, which
+ * has a format of its own for the UBWC of a6xx, is R8.
+ */
+static enum pipe_format
+tu5_view_format(enum pipe_format format)
+{
+   return format == PIPE_FORMAT_Y8_UNORM ? PIPE_FORMAT_R8_UNORM : format;
+}
+
 void
 tu5_image_view_descriptor(uint32_t *descriptor, const struct tu_image *image,
                           unsigned plane, enum pipe_format format,
@@ -1099,12 +1108,11 @@ tu5_image_view_descriptor(uint32_t *descriptor, const struct tu_image *image,
    uint32_t level = range->baseMipLevel;
    uint32_t levels = vk_image_subresource_level_count(&image->vk, range);
 
-   /* the first plane of NV12 (for the UBWC of a6xx) */
-   if (format == PIPE_FORMAT_Y8_UNORM)
-      format = PIPE_FORMAT_R8_UNORM;
+   format = tu5_view_format(format);
    uint32_t layers = vk_image_subresource_layer_count(&image->vk, range);
    uint64_t iova =
-      image->iova + fdl_surface_offset(layout, level, range->baseArrayLayer);
+      tu_image_plane_iova(image, plane) +
+      fdl_surface_offset(layout, level, range->baseArrayLayer);
    enum a5xx_tex_type tex_type;
    uint32_t depth = layers;
 
@@ -1250,6 +1258,8 @@ tu5_image_view_storage_descriptor(uint32_t *descriptor,
    const struct fdl_layout *layout = &image->layout[plane];
    uint32_t level = range->baseMipLevel;
    uint32_t layers = vk_image_subresource_layer_count(&image->vk, range);
+
+   format = tu5_view_format(format);
    uint32_t width = u_minify(layout->width0, level);
    uint32_t height = u_minify(layout->height0, level);
    uint32_t depth = layers;
@@ -2219,7 +2229,8 @@ tu5_image_surf(const struct tu_image *image, unsigned plane,
 
    return (struct tu5_surf) {
       .format = format,
-      .iova = image->iova + fdl_surface_offset(layout, level, layer),
+      .iova = tu_image_plane_iova(image, plane) +
+              fdl_surface_offset(layout, level, layer),
       .width = width,
       .height = height,
       .pitch = fdl_pitch(layout, level),

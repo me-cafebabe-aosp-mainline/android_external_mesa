@@ -1176,6 +1176,20 @@ tu_image_bind(struct tu_device *device,
    }
 
    assert(mem);
+
+   /* a plane of a disjoint image, in memory of its own */
+   const VkBindImagePlaneMemoryInfo *plane_info =
+      vk_find_struct_const(bind_info->pNext, BIND_IMAGE_PLANE_MEMORY_INFO);
+   if (plane_info && (image->vk.create_flags & VK_IMAGE_CREATE_DISJOINT_BIT)) {
+      unsigned plane =
+         tu6_plane_index(image->vk.format, plane_info->planeAspect);
+
+      image->plane_base[plane] =
+         mem->iova + offset - tu_image_plane_start(image, plane);
+      if (plane)
+         return VK_SUCCESS;
+   }
+
    image->mem = mem;
    image->mem_offset = offset;
    image->iova = mem->iova + offset;
@@ -1229,7 +1243,8 @@ tu_BindImageMemory2(VkDevice _device,
 
 static void
 tu_get_image_memory_requirements(struct tu_device *dev, struct tu_image *image,
-                                 VkMemoryRequirements2 *pMemoryRequirements)
+                                 VkMemoryRequirements2 *pMemoryRequirements,
+                                 VkImageAspectFlags plane_aspect = 0)
 {
    uint32_t alignment = image->layout[0].base_align;
    if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)
@@ -1244,13 +1259,20 @@ tu_get_image_memory_requirements(struct tu_device *dev, struct tu_image *image,
       (image->vk.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) ?
       dev->physical_device->memory.type_count :
       dev->physical_device->memory.non_lazy_type_count;
+   uint64_t size = image->total_size;
+
+   /* one plane of a disjoint image */
+   if (plane_aspect && (image->vk.create_flags & VK_IMAGE_CREATE_DISJOINT_BIT)) {
+      unsigned plane = tu6_plane_index(image->vk.format, plane_aspect);
+      size = image->layout[plane].size - tu_image_plane_start(image, plane);
+   }
 
    pMemoryRequirements->memoryRequirements = (VkMemoryRequirements) {
       /* Due to how we fake the sparse tile size, the real size may not be
        * aligned. CTS doesn't like this, and real apps may also be surprised,
        * so we align it.
        */
-      .size = align64(image->total_size, alignment),
+      .size = align64(size, alignment),
       .alignment = alignment,
       .memoryTypeBits = (1 << type_count) - 1,
    };
@@ -1428,8 +1450,11 @@ tu_GetImageMemoryRequirements2(VkDevice _device,
 {
    VK_FROM_HANDLE(tu_device, device, _device);
    VK_FROM_HANDLE(tu_image, image, pInfo->image);
+   const VkImagePlaneMemoryRequirementsInfo *plane_info =
+      vk_find_struct_const(pInfo->pNext, IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO);
 
-   tu_get_image_memory_requirements(device, image, pMemoryRequirements);
+   tu_get_image_memory_requirements(device, image, pMemoryRequirements,
+                                    plane_info ? plane_info->planeAspect : 0);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1460,7 +1485,8 @@ tu_GetDeviceImageMemoryRequirements(
    vk_image_init(&device->vk, &image.vk, pInfo->pCreateInfo);
    TU_CALLX(device, tu_image_init)(device, &image, pInfo->pCreateInfo, DRM_FORMAT_MOD_INVALID, NULL);
 
-   tu_get_image_memory_requirements(device, &image, pMemoryRequirements);
+   tu_get_image_memory_requirements(device, &image, pMemoryRequirements,
+                                    pInfo->planeAspect);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1487,15 +1513,19 @@ tu_get_image_subresource_layout(struct tu_image *image,
                                 const VkImageSubresource2KHR *pSubresource,
                                 VkSubresourceLayout2KHR *pLayout)
 {
-   struct fdl_layout *layout =
-      &image->layout[tu6_plane_index(image->vk.format,
-                                     pSubresource->imageSubresource.aspectMask)];
+   const unsigned plane =
+      tu6_plane_index(image->vk.format,
+                      pSubresource->imageSubresource.aspectMask);
+   struct fdl_layout *layout = &image->layout[plane];
    const struct fdl_slice *slice = layout->slices +
       pSubresource->imageSubresource.mipLevel;
 
    pLayout->subresourceLayout.offset =
       fdl_surface_offset(layout, pSubresource->imageSubresource.mipLevel,
                          pSubresource->imageSubresource.arrayLayer);
+   /* in the memory of the plane, for a disjoint image */
+   if (image->vk.create_flags & VK_IMAGE_CREATE_DISJOINT_BIT)
+      pLayout->subresourceLayout.offset -= tu_image_plane_start(image, plane);
    pLayout->subresourceLayout.rowPitch =
       fdl_pitch(layout, pSubresource->imageSubresource.mipLevel);
    pLayout->subresourceLayout.arrayPitch =
