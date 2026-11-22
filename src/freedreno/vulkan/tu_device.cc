@@ -455,6 +455,11 @@ get_device_extensions(const struct tu_physical_device *device,
          .EXT_separate_stencil_usage = true,
          .KHR_swapchain = all.KHR_swapchain,
          .EXT_queue_family_foreign = true,
+         /* also in the stock driver */
+         .KHR_device_group = true,
+         .EXT_index_type_uint8 = true,
+         .EXT_pipeline_creation_cache_control = true,
+         .EXT_pipeline_creation_feedback = true,
       } };
    }
 }
@@ -996,6 +1001,11 @@ tu_get_features(struct tu_physical_device *pdevice,
       features->hostQueryReset = true;
       features->timelineSemaphore = true;
       features->subgroupBroadcastDynamicId = true;
+
+      /* also in the stock driver */
+      features->inheritedQueries = true;
+      features->pipelineCreationCacheControl = true;
+      features->indexTypeUint8 = true;
    }
 }
 
