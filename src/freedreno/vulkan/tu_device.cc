@@ -461,6 +461,7 @@ get_device_extensions(const struct tu_physical_device *device,
          .EXT_pipeline_creation_cache_control = true,
          .EXT_pipeline_creation_feedback = true,
          .KHR_push_descriptor = true,
+         .EXT_sampler_filter_minmax = true,
          .KHR_variable_pointers = true,
          .EXT_global_priority = all.EXT_global_priority,
          .KHR_global_priority = all.KHR_global_priority,
@@ -1027,6 +1028,7 @@ tu_get_features(struct tu_physical_device *pdevice,
       features->variablePointersStorageBuffer = true;
       features->variablePointers = true;
       features->globalPriorityQuery = true;
+      features->samplerFilterMinmax = true;
    }
 }
 

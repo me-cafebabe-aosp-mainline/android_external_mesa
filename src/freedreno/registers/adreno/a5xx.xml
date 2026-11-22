@@ -2880,6 +2880,8 @@ different border-color states per texture..  Looks something like:
 0340: 3c003c00 3c003c00 00000000 00000000 00000000 00000000 00000000 00000000
 
 		 -->
+		<!-- the stock Vulkan driver puts the reduction mode here, as a6xx -->
+		<bitfield name="REDUCTION_MODE" low="0" high="1" type="uint"/>
 		<bitfield name="BCOLOR_OFFSET" low="7" high="31"/>
 	</reg32>
 	<reg32 offset="3" name="3"/>

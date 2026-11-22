@@ -366,7 +366,8 @@ tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
          continue;
       samp_map[i * 4 + 0] = desc[0];
       samp_map[i * 4 + 1] = desc[1];
-      samp_map[i * 4 + 2] = desc[2] & A5XX_TEX_SAMP_2_BCOLOR_OFFSET__MASK;
+      samp_map[i * 4 + 2] = desc[2] & (A5XX_TEX_SAMP_2_BCOLOR_OFFSET__MASK |
+                                       A5XX_TEX_SAMP_2_REDUCTION_MODE__MASK);
    }
 
    for (unsigned i = 0; i < num_tex; i++) {
