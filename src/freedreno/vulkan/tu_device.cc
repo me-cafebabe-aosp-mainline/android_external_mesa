@@ -1009,6 +1009,7 @@ tu_get_features(struct tu_physical_device *pdevice,
       features->depthClamp = true;
       features->shaderClipDistance = true;
       features->shaderCullDistance = true;
+      features->sampleRateShading = true;
    }
 }
 

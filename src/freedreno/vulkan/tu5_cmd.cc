@@ -1718,7 +1718,9 @@ tu5_program_emit(struct tu_cs *ring, struct tu5_program *emit)
    OUT_RING(ring,
             CONDREG(samp_mask_regid, A5XX_RB_RENDER_CONTROL1_SAMPLEMASK) |
                COND(s[FS].v->frag_face, A5XX_RB_RENDER_CONTROL1_FACENESS) |
-               CONDREG(samp_id_regid, A5XX_RB_RENDER_CONTROL1_SAMPLEID));
+               CONDREG(samp_id_regid, A5XX_RB_RENDER_CONTROL1_SAMPLEID) |
+               COND(s[FS].v->per_samp || s[FS].v->key.sample_shading,
+                    A5XX_RB_RENDER_CONTROL1_PER_SAMP_MODE(0x3)));
 
    OUT_PKT4(ring, REG_A5XX_SP_FS_OUTPUT_REG(0), 8);
    for (i = 0; i < 8; i++) {
