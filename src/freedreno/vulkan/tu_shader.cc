@@ -1185,8 +1185,10 @@ lower_tex_impl(nir_builder *b, nir_tex_instr *tex, struct tu_device *dev,
       nir_src_rewrite(&tex->src[tex_src_idx].src, bindless);
       tex->src[tex_src_idx].src_type = ref ? nir_tex_src_texture_2_handle : nir_tex_src_texture_handle;
 
-      /* for the input attachment case: */
-      if (!nir_def_is_intrinsic(bindless))
+      /* for the input attachment case, and for Adreno 5xx, which numbers
+       * the textures: an index that is a push constant is an intrinsic too
+       */
+      if (!nir_def_is_intrinsic(bindless) || tu_is_a5xx(dev))
          tex->src[tex_src_idx].src_type = nir_tex_src_texture_offset;
    }
 

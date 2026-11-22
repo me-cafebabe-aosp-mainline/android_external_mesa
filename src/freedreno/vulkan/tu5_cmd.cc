@@ -289,15 +289,20 @@ tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       num_samp = 1;
 
    if (num_samp) {
-      OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 4 * num_samp);
-      OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(0) |
-                      CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
-                      CP_LOAD_STATE4_0_STATE_BLOCK(sb) |
-                      CP_LOAD_STATE4_0_NUM_UNIT(num_samp));
-      OUT_RING(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_SHADER) |
-                      CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
-      OUT_RING(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+      /* a packet for all, there being at most 16 a stage */
+      const unsigned chunk = 64;
       for (unsigned i = 0; i < num_samp; i++) {
+         if (i % chunk == 0) {
+            unsigned n = MIN2(chunk, num_samp - i);
+            OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 4 * n);
+            OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(i) |
+                            CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                            CP_LOAD_STATE4_0_STATE_BLOCK(sb) |
+                            CP_LOAD_STATE4_0_NUM_UNIT(n));
+            OUT_RING(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_SHADER) |
+                            CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
+            OUT_RING(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+         }
          const uint32_t *desc = i < map->count[TU5_DESC_SAMPLER]
                                    ? tu5_descriptor(cmd, shader, &map->samp[i]) : NULL;
 
@@ -312,15 +317,19 @@ tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    }
 
    if (num_tex) {
-      OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 12 * num_tex);
-      OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(0) |
-                      CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
-                      CP_LOAD_STATE4_0_STATE_BLOCK(sb) |
-                      CP_LOAD_STATE4_0_NUM_UNIT(num_tex));
-      OUT_RING(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
-                      CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
-      OUT_RING(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+      const unsigned chunk = 64;
       for (unsigned i = 0; i < num_tex; i++) {
+         if (i % chunk == 0) {
+            unsigned n = MIN2(chunk, num_tex - i);
+            OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 12 * n);
+            OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(i) |
+                            CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                            CP_LOAD_STATE4_0_STATE_BLOCK(sb) |
+                            CP_LOAD_STATE4_0_NUM_UNIT(n));
+            OUT_RING(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
+                            CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
+            OUT_RING(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+         }
          const uint32_t *desc = tu5_descriptor(cmd, shader, &map->tex[i]);
 
          /* see tu5_image_view_descriptor(): the first six, what follows

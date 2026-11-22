@@ -798,6 +798,9 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
          layout->tile_all = layout->tile_mode &&
                             util_format_is_depth_or_stencil(format);
 
+         /* the images begin on a page, as the Gallium driver has them */
+         layout->base_align = 4096;
+
          fdl5_layout(layout, format, image->vk.samples, width0, height0,
                      image->vk.extent.depth, image->vk.mip_levels,
                      image->vk.array_layers,

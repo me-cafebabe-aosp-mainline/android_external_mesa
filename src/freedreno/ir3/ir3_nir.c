@@ -1898,9 +1898,10 @@ ir3_nir_scan_driver_consts(struct ir3_compiler *compiler, nir_shader *shader,
                case nir_intrinsic_image_store:
                case nir_intrinsic_image_size:
                   /* a4xx gets these supplied by the hw directly (maybe CP?) */
-                  if (compiler->gen == 5 &&
-                     !(intr->intrinsic == nir_intrinsic_image_load &&
-                        !(nir_intrinsic_access(intr) & ACCESS_COHERENT))) {
+                  /* the loads of images are as their stores, see
+                   * emit_intrinsic_load_image()
+                   */
+                  if (compiler->gen == 5) {
                      idx = nir_src_as_uint(intr->src[0]);
                      if (image_dims->mask & (1 << idx))
                         break;
