@@ -1098,6 +1098,10 @@ tu5_image_view_descriptor(uint32_t *descriptor, const struct tu_image *image,
    const struct fdl_layout *layout = &image->layout[plane];
    uint32_t level = range->baseMipLevel;
    uint32_t levels = vk_image_subresource_level_count(&image->vk, range);
+
+   /* the first plane of NV12 (for the UBWC of a6xx) */
+   if (format == PIPE_FORMAT_Y8_UNORM)
+      format = PIPE_FORMAT_R8_UNORM;
    uint32_t layers = vk_image_subresource_layer_count(&image->vk, range);
    uint64_t iova =
       image->iova + fdl_surface_offset(layout, level, range->baseArrayLayer);

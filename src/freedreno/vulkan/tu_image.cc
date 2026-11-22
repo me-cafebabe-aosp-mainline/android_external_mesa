@@ -189,6 +189,7 @@ tu_image_view_init(struct tu_device *device,
    assert(iview->vk.format != VK_FORMAT_UNDEFINED);
 
    iview->image = image;
+   iview->a5xx_planes = 0;
 
    const struct fdl_layout *layouts[3];
 
@@ -282,7 +283,24 @@ tu_image_view_init(struct tu_device *device,
 
    TU_CALLX(device, fdl6_view_init)(&iview->view, layouts, &args, device->use_z24uint_s8uint);
 
-   if (tu_is_a5xx(device)) {
+   if (tu_is_a5xx(device) && aspect_mask == VK_IMAGE_ASPECT_COLOR_BIT &&
+       vk_format_get_plane_count(vk_format) > 1) {
+      /* One descriptor for each plane, in its own format: the shader puts
+       * the components together and converts them (nir_vk_lower_ycbcr_tex),
+       * the swizzles of the conversion included.
+       */
+      static const unsigned char identity[4] = {
+         PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y, PIPE_SWIZZLE_Z, PIPE_SWIZZLE_W,
+      };
+
+      iview->a5xx_planes = vk_format_get_plane_count(vk_format);
+      for (unsigned p = 0; p < iview->a5xx_planes; p++) {
+         tu5_image_view_descriptor(
+            p ? iview->a5xx_plane_descriptor[p - 1] : iview->view.descriptor,
+            image, p, tu6_plane_format(vk_format, p), range,
+            pCreateInfo->viewType, identity);
+      }
+   } else if (tu_is_a5xx(device)) {
       tu5_image_view_descriptor(iview->view.descriptor, image,
                                 tu6_plane_index(image->vk.format, aspect_mask),
                                 args.format, range, pCreateInfo->viewType,

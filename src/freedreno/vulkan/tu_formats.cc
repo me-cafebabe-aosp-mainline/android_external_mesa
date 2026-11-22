@@ -397,6 +397,22 @@ end:
       buffer &= ~no;
       if (ycbcr_info)
          linear = optimal = buffer = 0;
+
+      /* The multi-planar formats of the stock driver, which the shaders
+       * sample plane by plane (TU5_YCBCR_PLANE_SLOT)
+       */
+      if (vk_format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM ||
+          vk_format == VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM) {
+         linear = optimal =
+            VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+            VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_MINMAX_BIT |
+            VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
+            VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT |
+            VK_FORMAT_FEATURE_2_MIDPOINT_CHROMA_SAMPLES_BIT |
+            VK_FORMAT_FEATURE_2_COSITED_CHROMA_SAMPLES_BIT |
+            VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER_BIT;
+      }
    }
 
    out_properties->linearTilingFeatures = linear;
@@ -905,7 +921,13 @@ tu_GetPhysicalDeviceImageFormatProperties2(
    }
 
    if (ycbcr_props)
-      ycbcr_props->combinedImageSamplerDescriptorCount = 1;
+      /* Adreno 5xx: the other planes come after the sampler, the
+       * descriptor taking TU5_YCBCR_SLOTS slots instead of 2
+       */
+      ycbcr_props->combinedImageSamplerDescriptorCount =
+         physical_device->info->chip == 5 &&
+               vk_format_get_plane_count(base_info->format) > 1
+            ? TU5_YCBCR_SLOTS / 2 : 1;
 
    if (hic_props) {
       /* This should match tu_image_init() as much as possible given the

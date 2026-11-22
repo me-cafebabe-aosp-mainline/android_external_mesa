@@ -443,6 +443,7 @@ get_device_extensions(const struct tu_physical_device *device,
          .KHR_multiview = true,
          .KHR_relaxed_block_layout = true,
          .KHR_sampler_mirror_clamp_to_edge = true,
+         .KHR_sampler_ycbcr_conversion = true,
          .KHR_separate_depth_stencil_layouts = true,
          .KHR_shader_draw_parameters = true,
          .KHR_shader_float_controls = true,
@@ -1030,6 +1031,7 @@ tu_get_features(struct tu_physical_device *pdevice,
       features->globalPriorityQuery = true;
       features->samplerFilterMinmax = true;
       features->vertexPipelineStoresAndAtomics = true;
+      features->samplerYcbcrConversion = true;
    }
 }
 

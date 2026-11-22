@@ -325,8 +325,31 @@ lower_load_push_constant(struct tu_device *dev,
    nir_def_replace(&instr->def, load);
 }
 
+/* Adreno 5xx: the planes of the elements of a binding of combined image
+ * samplers with conversions, which are textures of their own: as many as
+ * its multi-planar formats have at most, 1 otherwise.
+ */
+static unsigned
+tu5_binding_planes(const struct tu_descriptor_set_layout *set_layout,
+                   const struct tu_descriptor_set_binding_layout *binding)
+{
+   const struct vk_ycbcr_conversion_state *ycbcr =
+      tu_immutable_ycbcr_samplers(set_layout, binding);
+   unsigned planes = 1;
+
+   if (!ycbcr)
+      return 1;
+
+   for (unsigned i = 0; i < binding->array_size; i++) {
+      if (vk_format_get_ycbcr_info(ycbcr[i].format))
+         planes = MAX2(planes, vk_format_get_plane_count(ycbcr[i].format));
+   }
+   return planes;
+}
+
 /* The first of the numbers of a binding in a shader for Adreno 5xx, one for
- * each element of the binding, given when first asked for.
+ * each element of the binding (for each of its planes, see
+ * tu5_binding_planes()), given when first asked for.
  */
 static unsigned
 tu5_desc_base(struct tu_shader *shader,
@@ -357,7 +380,10 @@ tu5_desc_base(struct tu_shader *shader,
                   kind == TU5_DESC_UBO ? TU5_MAX_UBOS :
                   kind == TU5_DESC_SSBO ? TU5_MAX_SSBOS : TU5_MAX_IMAGES;
    unsigned base = map->count[kind];
-   unsigned count = binding_layout->array_size;
+   const unsigned planes =
+      kind == TU5_DESC_TEXTURE
+         ? tu5_binding_planes(layout->set[set].layout, binding_layout) : 1;
+   unsigned count = binding_layout->array_size * planes;
 
    if (base + count > max) {
       mesa_loge("a5xx: too many descriptors of kind %u in a shader", kind);
@@ -393,7 +419,8 @@ tu5_desc_base(struct tu_shader *shader,
          .set = (uint8_t)set,
          .dynamic = dynamic,
          .storage = storage,
-         .offset = (offset + i * binding_layout->size) / 4,
+         .offset = (offset + (i / planes) * binding_layout->size) / 4 +
+                   TU5_YCBCR_PLANE_SLOT(i % planes) * A6XX_TEX_CONST_DWORDS,
       };
    }
    map->count[kind] += count;
@@ -684,7 +711,7 @@ build_bindless(struct tu_device *dev, nir_builder *b,
                struct tu_shader *shader,
                const struct tu_pipeline_layout *layout,
                uint32_t read_only_input_attachments,
-               bool dynamic_renderpass)
+               bool dynamic_renderpass, unsigned plane = 0)
 {
    nir_variable *var = nir_deref_instr_get_variable(deref);
 
@@ -703,11 +730,18 @@ build_bindless(struct tu_device *dev, nir_builder *b,
 
       shader->active_desc_sets |= 1u << set;
 
+      /* the textures of the planes of an element follow each other */
+      const unsigned planes =
+         is_sampler ? 1 : tu5_binding_planes(layout->set[set].layout,
+                                             bind_layout);
+      first += plane;
+
       if (deref->deref_type == nir_deref_type_var)
          return nir_imm_int(b, first);
 
       assert(deref->deref_type == nir_deref_type_array);
-      return nir_iadd_imm(b, deref->arr.index.ssa, first);
+      return nir_iadd_imm(b, nir_imul_imm(b, deref->arr.index.ssa, planes),
+                          first);
    }
 
    /* input attachments use non bindless workaround */
@@ -1228,7 +1262,8 @@ lower_tex_immutable(struct tu_device *dev,
 
    const struct vk_ycbcr_conversion_state *ycbcr_samplers =
       tu_immutable_ycbcr_samplers(set_layout, binding);
-   if (ycbcr_samplers) {
+   /* Adreno 5xx samples the planes one by one, see tu5_lower_ycbcr() */
+   if (ycbcr_samplers && !tu_is_a5xx(dev)) {
       const struct vk_ycbcr_conversion_state *ycbcr_sampler = ycbcr_samplers + array_index;
       lower_tex_ycbcr(ycbcr_sampler, builder, tex);
    }
@@ -1273,6 +1308,16 @@ lower_tex_impl(nir_builder *b, nir_tex_instr *tex, struct tu_device *dev,
           uint32_t read_only_input_attachments, bool dynamic_renderpass,
           bool ref)
 {
+   /* Adreno 5xx samples the planes one by one, see tu5_lower_ycbcr() */
+   unsigned plane = 0;
+   if (tu_is_a5xx(dev) && !ref) {
+      int plane_src_idx = nir_tex_instr_src_index(tex, nir_tex_src_plane);
+      if (plane_src_idx >= 0) {
+         plane = nir_src_as_uint(tex->src[plane_src_idx].src);
+         nir_tex_instr_remove_src(tex, plane_src_idx);
+      }
+   }
+
    int sampler_src_idx = nir_tex_instr_src_index(tex, ref ? nir_tex_src_sampler_2_deref : nir_tex_src_sampler_deref);
    if (sampler_src_idx >= 0) {
       nir_deref_instr *deref = nir_src_as_deref(tex->src[sampler_src_idx].src);
@@ -1290,7 +1335,7 @@ lower_tex_impl(nir_builder *b, nir_tex_instr *tex, struct tu_device *dev,
       nir_deref_instr *deref = nir_src_as_deref(tex->src[tex_src_idx].src);
       nir_def *bindless = build_bindless(dev, b, deref, 0, shader, layout,
                                          read_only_input_attachments,
-                                         dynamic_renderpass);
+                                         dynamic_renderpass, plane);
       nir_src_rewrite(&tex->src[tex_src_idx].src, bindless);
       tex->src[tex_src_idx].src_type = ref ? nir_tex_src_texture_2_handle : nir_tex_src_texture_handle;
 
@@ -1335,6 +1380,22 @@ struct lower_instr_params {
    bool dynamic_renderpass;
    struct ir3_const_allocations *const_allocs;
 };
+
+/* Adreno 5xx, which has no multi-planar formats: the conversion of the
+ * immutable sampler of a binding, for nir_vk_lower_ycbcr_tex()
+ */
+static const struct vk_ycbcr_conversion_state *
+tu5_lookup_ycbcr(const void *data, uint32_t set, uint32_t binding,
+                 uint32_t array_index)
+{
+   const struct tu_pipeline_layout *layout =
+      (const struct tu_pipeline_layout *) data;
+   const struct tu_descriptor_set_layout *set_layout = layout->set[set].layout;
+   const struct vk_ycbcr_conversion_state *ycbcr =
+      tu_immutable_ycbcr_samplers(set_layout, &set_layout->binding[binding]);
+
+   return ycbcr ? &ycbcr[array_index] : NULL;
+}
 
 static bool
 lower_instr(nir_builder *b, nir_instr *instr, void *cb_data)
@@ -1774,6 +1835,12 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
                                                nir_metadata_none,
                                                &params);
    }
+
+   /* Adreno 5xx: the planes sampled one by one, then put together and
+    * converted, see TU5_YCBCR_PLANE_SLOT
+    */
+   if (tu_is_a5xx(dev))
+      progress |= nir_vk_lower_ycbcr_tex(shader, tu5_lookup_ycbcr, layout);
 
    progress |= nir_shader_instructions_pass(shader,
                                             lower_instr,

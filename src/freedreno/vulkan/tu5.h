@@ -13,6 +13,13 @@
 
 #include "tu_common.h"
 
+/* The descriptors of a combined image sampler with a conversion of a
+ * multi-planar format, in slots of 16 dwords: the first plane, the sampler,
+ * then the other planes.
+ */
+#define TU5_YCBCR_SLOTS 4
+#define TU5_YCBCR_PLANE_SLOT(p) ((p) ? (p) + 1 : 0)
+
 /* The cache flushes asked for, tu_cmd_flush_bits */
 void tu5_emit_flushes(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                       uint32_t flushes);

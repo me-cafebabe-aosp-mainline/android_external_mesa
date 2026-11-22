@@ -65,6 +65,13 @@ struct tu_image_view
    struct fdl6_view *view_stencil;
 
    unsigned char swizzle[4];
+
+   /* Adreno 5xx, which has no multi-planar formats: the descriptors of the
+    * other planes of a view of one, that the shaders sample one by one (see
+    * TU5_YCBCR_PLANE_SLOT)
+    */
+   uint32_t a5xx_plane_descriptor[2][FDL6_TEX_CONST_DWORDS];
+   uint8_t a5xx_planes;
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(tu_image_view, vk.base, VkImageView,
                                VK_OBJECT_TYPE_IMAGE_VIEW);
