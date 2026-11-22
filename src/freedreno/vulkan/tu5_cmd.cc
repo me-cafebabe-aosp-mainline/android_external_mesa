@@ -1095,9 +1095,14 @@ tu5_image_view_descriptor(uint32_t *descriptor, const struct tu_image *image,
                    A5XX_TEX_CONST_2_PITCH(fdl_pitch(layout, level)) |
                    A5XX_TEX_CONST_2_TYPE(tex_type);
    if (type == VK_IMAGE_VIEW_TYPE_3D) {
+      /* The size the slices stop being made smaller at, from level 2 on,
+       * see fdl5_layout(); none if they never stop, as with two levels.
+       */
+      const unsigned last = layout->mip_levels - 1;
+      const bool stops = last >= 2 && layout->slices[last - 1].size0 <= 0xf000;
+
       descriptor[3] =
-         A5XX_TEX_CONST_3_MIN_LAYERSZ(
-            layout->slices[layout->mip_levels - 1].size0) |
+         A5XX_TEX_CONST_3_MIN_LAYERSZ(stops ? layout->slices[last].size0 : 0) |
          A5XX_TEX_CONST_3_ARRAY_PITCH(layout->slices[level].size0);
    } else {
       descriptor[3] = A5XX_TEX_CONST_3_ARRAY_PITCH(layout->layer_size);
