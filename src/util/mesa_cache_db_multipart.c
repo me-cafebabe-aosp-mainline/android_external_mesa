@@ -18,7 +18,9 @@ mesa_cache_db_multipart_open(struct mesa_cache_db_multipart *db,
 #if DETECT_OS_WINDOWS
    return false;
 #else
-   db->num_parts = debug_get_num_option("MESA_DISK_CACHE_DATABASE_NUM_PARTS", 50);
+   /* 50 parts, unless the caller has asked for another number */
+   db->num_parts = debug_get_num_option("MESA_DISK_CACHE_DATABASE_NUM_PARTS",
+                                        db->num_parts ? db->num_parts : 50);
    db->cache_path = cache_path;
    db->parts = calloc(db->num_parts, sizeof(*db->parts));
    if (!db->parts)

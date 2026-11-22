@@ -895,7 +895,7 @@ disk_cache_generate_cache_dir(void *mem_ctx, const char *gpu_name,
                               const char *driver_id,
                               const char *cache_dir_name_custom,
                               enum disk_cache_type cache_type,
-                              bool mkdir)
+                              bool mkdir, const char *dir)
 {
 
    char *cache_dir_name;
@@ -910,7 +910,12 @@ disk_cache_generate_cache_dir(void *mem_ctx, const char *gpu_name,
          cache_dir_name = CACHE_DIR_NAME_DB;
    }
 
-   const char *path = os_get_option_secure("MESA_SHADER_CACHE_DIR");
+   /* the directory of disk_cache_create_in_dir(), before what the
+    * environment says
+    */
+   const char *path = dir;
+   if (!path)
+      path = os_get_option_secure("MESA_SHADER_CACHE_DIR");
 
    if (!path) {
       path = os_get_option_secure("MESA_GLSL_CACHE_DIR");
@@ -1263,7 +1268,7 @@ disk_cache_delete_old_cache(void)
 {
    void *ctx = ralloc_context(NULL);
    const char *dirname = disk_cache_generate_cache_dir(ctx, NULL, NULL, NULL,
-                                                       DISK_CACHE_MULTI_FILE, false);
+                                                       DISK_CACHE_MULTI_FILE, false, NULL);
    if (!dirname)
       goto finish;
 
