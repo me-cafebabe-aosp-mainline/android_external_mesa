@@ -788,9 +788,6 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
       };
 
       if (a5xx) {
-         /* TODO: explicit layouts, for imported buffers */
-         if (plane_layouts)
-            return vk_error(device, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
 
          /* The depth buffers have no tile mode: these are tiled at every
           * level, which the textures are to be told.
@@ -805,6 +802,30 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
                      image->vk.extent.depth, image->vk.mip_levels,
                      image->vk.array_layers,
                      image->vk.image_type == VK_IMAGE_TYPE_3D);
+
+         /* The layout an imported buffer has, as gralloc made it: linear, of
+          * one level and one layer, with the pitch and the offset given.
+          */
+         if (plane_layouts) {
+            const VkSubresourceLayout *pl = &plane_layouts[i];
+            uint32_t pitch = pl->rowPitch;
+            uint32_t nblocksy = util_format_get_nblocksy(format, height0);
+
+            if (layout->tile_mode || image->vk.mip_levels > 1 ||
+                image->vk.array_layers > 1 || image->vk.extent.depth > 1 ||
+                pitch < util_format_get_nblocksx(format, width0) * layout->cpp ||
+                (pitch & 63))
+               return vk_error(device, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
+
+            /* the pitch is its own alignment, fdl_pitch() leaving it be */
+            layout->pitch0 = pitch;
+            layout->pitchalign = ffs(pitch) - 1;
+            layout->slices[0].offset = pl->offset;
+            layout->slices[0].size0 = pitch * nblocksy;
+            layout->layer_size = pl->arrayPitch ? pl->arrayPitch
+                                                : layout->slices[0].size0;
+            layout->size = pl->offset + layout->slices[0].size0;
+         }
       } else if (!fdl6_layout_image(layout, &device->physical_device->dev_info,
                                     &params, plane_layouts ? &plane_layout : NULL)) {
          assert(plane_layouts); /* can only fail with explicit layout */
