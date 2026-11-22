@@ -5,6 +5,8 @@
 
 #include "tu_buffer_view.h"
 
+#include "tu5.h"
+
 #include "tu_buffer.h"
 #include "tu_device.h"
 
@@ -31,6 +33,13 @@ tu_CreateBufferView(VkDevice _device,
    fdl6_buffer_view_init<CHIP>(
       view->descriptor, vk_format_to_pipe_format(view->vk.format),
       swiz, vk_buffer_address(&buffer->vk, view->vk.offset), view->vk.range);
+
+   if (tu_is_a5xx(device)) {
+      tu5_buffer_view_descriptor(view->descriptor,
+                                 vk_format_to_pipe_format(view->vk.format),
+                                 buffer->iova + view->vk.offset,
+                                 view->vk.range);
+   }
 
    *pView = tu_buffer_view_to_handle(view);
 

@@ -67,6 +67,8 @@ void tu5_image_view_descriptor(uint32_t *descriptor,
                                const VkImageSubresourceRange *range,
                                VkImageViewType type, const unsigned char *swiz);
 
+void tu5_buffer_view_descriptor(uint32_t *descriptor, enum pipe_format format,
+                                uint64_t iova, uint32_t range);
 void tu5_image_view_storage_descriptor(uint32_t *descriptor,
                                        const struct tu_image *image,
                                        unsigned plane, enum pipe_format format,

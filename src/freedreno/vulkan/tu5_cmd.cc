@@ -323,9 +323,13 @@ tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       for (unsigned i = 0; i < num_tex; i++) {
          const uint32_t *desc = tu5_descriptor(cmd, shader, &map->tex[i]);
 
-         /* see tu5_image_view_descriptor() */
-         for (unsigned j = 0; j < 12; j++)
+         /* see tu5_image_view_descriptor(): the first six, what follows
+          * them in the descriptor being for the storage images
+          */
+         for (unsigned j = 0; j < 6; j++)
             OUT_RING(cs, desc ? desc[j] : 0);
+         for (unsigned j = 6; j < 12; j++)
+            OUT_RING(cs, 0x00000000);
       }
    }
 
@@ -979,6 +983,38 @@ tu5_image_view_descriptor(uint32_t *descriptor, const struct tu_image *image,
    }
    descriptor[4] = (uint32_t)iova;
    descriptor[5] = (uint32_t)(iova >> 32) | A5XX_TEX_CONST_5_DEPTH(depth);
+}
+
+/* The descriptor of a buffer view, both as a texture and as a storage image,
+ * see tu5_image_view_storage_descriptor(). The number of texels is in the
+ * width, and what does not fit there in the height.
+ */
+void
+tu5_buffer_view_descriptor(uint32_t *descriptor, enum pipe_format format,
+                           uint64_t iova, uint32_t range)
+{
+   uint32_t cpp = util_format_get_blocksize(format);
+   uint32_t elements = range / cpp;
+
+   memset(descriptor, 0, A6XX_TEX_CONST_DWORDS * sizeof(uint32_t));
+
+   descriptor[0] = A5XX_TEX_CONST_0_FMT(fd5_pipe2tex(format)) |
+                   fd5_tex_swiz(format, PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y,
+                                PIPE_SWIZZLE_Z, PIPE_SWIZZLE_W) |
+                   COND(util_format_is_srgb(format), A5XX_TEX_CONST_0_SRGB);
+   descriptor[1] = A5XX_TEX_CONST_1_WIDTH(elements & 0x7fff) |
+                   A5XX_TEX_CONST_1_HEIGHT(elements >> 15);
+   descriptor[2] = A5XX_TEX_CONST_2_BUFFER |
+                   A5XX_TEX_CONST_2_TYPE(A5XX_TEX_BUFFER);
+   descriptor[4] = (uint32_t)iova;
+   descriptor[5] = (uint32_t)(iova >> 32);
+
+   descriptor[6] = A5XX_SSBO_1_0_FMT(fd5_pipe2tex(format)) |
+                   A5XX_SSBO_1_0_WIDTH(elements & 0x7fff);
+   descriptor[7] = A5XX_SSBO_1_1_HEIGHT(elements >> 15);
+   descriptor[8] = cpp;
+   /* for the size, which the shader divides by the bytes of a texel */
+   descriptor[9] = ffs(cpp) - 1;
 }
 
 /* The descriptor of an image view as a storage image: that of a texture,
