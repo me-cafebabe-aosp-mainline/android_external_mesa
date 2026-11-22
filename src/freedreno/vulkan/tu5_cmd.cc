@@ -15,6 +15,7 @@
 
 #include "ir3/ir3_shader.h"
 
+#include "tu_buffer.h"
 #include "tu_cmd_buffer.h"
 #include "tu_cs.h"
 #include "tu_device.h"
@@ -1064,10 +1065,59 @@ tu5_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *ring)
    OUT_RING(ring, 0x00000000);
 }
 
-/* One colour target: a level and a layer of an image, or none */
+/* What is drawn into or sampled from: a level and a layer of an image, or
+ * a part of a buffer taken as an image.
+ */
+struct tu5_surf {
+   enum pipe_format format;
+   uint64_t iova;
+   uint32_t width, height;
+   uint32_t pitch;      /* bytes */
+   uint32_t layer_size; /* bytes */
+   enum a5xx_tile_mode tile_mode;
+   uint32_t samples;
+};
+
+static struct tu5_surf
+tu5_image_surf(const struct tu_image *image, unsigned plane,
+               enum pipe_format format, uint32_t level, uint32_t layer)
+{
+   const struct fdl_layout *layout = &image->layout[plane];
+
+   return (struct tu5_surf) {
+      .format = format,
+      .iova = image->iova + fdl_surface_offset(layout, level, layer),
+      .width = u_minify(layout->width0, level),
+      .height = u_minify(layout->height0, level),
+      .pitch = fdl_pitch(layout, level),
+      .layer_size = fdl_layer_stride(layout, level),
+      .tile_mode = (enum a5xx_tile_mode)fdl_tile_mode(layout, level),
+      .samples = layout->nr_samples,
+   };
+}
+
+/* The address and the pitch must be multiples of 64 bytes */
+static struct tu5_surf
+tu5_buffer_surf(enum pipe_format format, uint64_t iova, uint32_t width,
+                uint32_t height, uint32_t pitch)
+{
+   assert(!(iova & 63) && !(pitch & 63));
+
+   return (struct tu5_surf) {
+      .format = format,
+      .iova = iova,
+      .width = width,
+      .height = height,
+      .pitch = pitch,
+      .layer_size = align(pitch * height, 64),
+      .tile_mode = TILE5_LINEAR,
+      .samples = 1,
+   };
+}
+
+/* One colour target, or none */
 static void
-tu5_emit_mrt_surface(struct tu_cs *cs, unsigned i, const struct tu_image *image,
-                     enum pipe_format pformat, uint32_t level, uint32_t layer)
+tu5_emit_mrt_surf(struct tu_cs *cs, unsigned i, const struct tu5_surf *surf)
 {
    enum a5xx_color_fmt format = (enum a5xx_color_fmt)0;
    enum a5xx_tile_mode tile_mode = TILE5_LINEAR;
@@ -1077,19 +1127,17 @@ tu5_emit_mrt_surface(struct tu_cs *cs, unsigned i, const struct tu_image *image,
    uint32_t size = 0;
    uint64_t base = 0;
 
-   if (image) {
-      const struct fdl_layout *layout = &image->layout[0];
+   if (surf) {
+      format = fd5_pipe2color(surf->format);
+      swap = fd5_pipe2swap(surf->format);
+      srgb = util_format_is_srgb(surf->format);
+      sint = util_format_is_pure_sint(surf->format);
+      uint = util_format_is_pure_uint(surf->format);
 
-      format = fd5_pipe2color(pformat);
-      swap = fd5_pipe2swap(pformat);
-      srgb = util_format_is_srgb(pformat);
-      sint = util_format_is_pure_sint(pformat);
-      uint = util_format_is_pure_uint(pformat);
-
-      stride = fdl_pitch(layout, level);
-      size = fdl_layer_stride(layout, level);
-      tile_mode = (enum a5xx_tile_mode)fdl_tile_mode(layout, level);
-      base = image->iova + fdl_surface_offset(layout, level, layer);
+      stride = surf->pitch;
+      size = surf->layer_size;
+      tile_mode = surf->tile_mode;
+      base = surf->iova;
    }
 
    OUT_PKT4(cs, REG_A5XX_RB_MRT_BUF_INFO(i), 5);
@@ -1115,6 +1163,57 @@ tu5_emit_mrt_surface(struct tu_cs *cs, unsigned i, const struct tu_image *image,
    OUT_RING(cs, A5XX_RB_MRT_FLAG_BUFFER_ARRAY_PITCH(0));
 }
 
+/* A surface as the one 2D texture of the blits, sampled by texel */
+static void
+tu5_emit_blit_src(struct tu_cs *cs, const struct tu5_surf *surf, bool linear)
+{
+   enum a5xx_tex_filter filter = linear ? A5XX_TEX_LINEAR : A5XX_TEX_NEAREST;
+
+   OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 4);
+   OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(0) |
+                   CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                   CP_LOAD_STATE4_0_STATE_BLOCK(SB4_FS_TEX) |
+                   CP_LOAD_STATE4_0_NUM_UNIT(1));
+   OUT_RING(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_SHADER) |
+                   CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
+   OUT_RING(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+   OUT_RING(cs, A5XX_TEX_SAMP_0_XY_MAG(filter) | A5XX_TEX_SAMP_0_XY_MIN(filter) |
+                   A5XX_TEX_SAMP_0_WRAP_S(A5XX_TEX_CLAMP_TO_EDGE) |
+                   A5XX_TEX_SAMP_0_WRAP_T(A5XX_TEX_CLAMP_TO_EDGE) |
+                   A5XX_TEX_SAMP_0_WRAP_R(A5XX_TEX_CLAMP_TO_EDGE));
+   OUT_RING(cs, A5XX_TEX_SAMP_1_UNNORM_COORDS |
+                   A5XX_TEX_SAMP_1_CUBEMAPSEAMLESSFILTOFF |
+                   A5XX_TEX_SAMP_1_MIN_LOD(0.0f) | A5XX_TEX_SAMP_1_MAX_LOD(0.125f));
+   OUT_RING(cs, 0x00000000);
+   OUT_RING(cs, 0x00000000);
+
+   OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 12);
+   OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(0) |
+                   CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                   CP_LOAD_STATE4_0_STATE_BLOCK(SB4_FS_TEX) |
+                   CP_LOAD_STATE4_0_NUM_UNIT(1));
+   OUT_RING(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
+                   CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
+   OUT_RING(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+   OUT_RING(cs, A5XX_TEX_CONST_0_TILE_MODE(surf->tile_mode) |
+                   A5XX_TEX_CONST_0_FMT(fd5_pipe2tex(surf->format)) |
+                   A5XX_TEX_CONST_0_SAMPLES(tu_msaa_samples(surf->samples)) |
+                   fd5_tex_swiz(surf->format, PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y,
+                                PIPE_SWIZZLE_Z, PIPE_SWIZZLE_W) |
+                   COND(util_format_is_srgb(surf->format),
+                        A5XX_TEX_CONST_0_SRGB));
+   OUT_RING(cs, A5XX_TEX_CONST_1_WIDTH(surf->width) |
+                   A5XX_TEX_CONST_1_HEIGHT(surf->height));
+   OUT_RING(cs, A5XX_TEX_CONST_2_PITCHALIGN(0) |
+                   A5XX_TEX_CONST_2_PITCH(surf->pitch) |
+                   A5XX_TEX_CONST_2_TYPE(A5XX_TEX_2D));
+   OUT_RING(cs, A5XX_TEX_CONST_3_ARRAY_PITCH(surf->layer_size));
+   OUT_RING(cs, (uint32_t)surf->iova);
+   OUT_RING(cs, (uint32_t)(surf->iova >> 32) | A5XX_TEX_CONST_5_DEPTH(1));
+   for (unsigned i = 6; i < 12; i++)
+      OUT_RING(cs, 0x00000000);
+}
+
 /* The colour targets of the subpass */
 static void
 tu5_emit_mrt(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
@@ -1128,13 +1227,16 @@ tu5_emit_mrt(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
          const struct tu_image_view *iview =
             cmd->state.attachments[subpass->color_attachments[i].attachment];
 
-         tu5_emit_mrt_surface(cs, i, iview->image,
-                              vk_format_to_pipe_format(iview->vk.format),
-                              iview->vk.base_mip_level,
-                              iview->vk.base_array_layer);
+         struct tu5_surf surf =
+            tu5_image_surf(iview->image, 0,
+                           vk_format_to_pipe_format(iview->vk.format),
+                           iview->vk.base_mip_level,
+                           iview->vk.base_array_layer);
+
+         tu5_emit_mrt_surf(cs, i, &surf);
          components |= 0xf << (i * 4);
       } else {
-         tu5_emit_mrt_surface(cs, i, NULL, PIPE_FORMAT_NONE, 0, 0);
+         tu5_emit_mrt_surf(cs, i, NULL);
       }
    }
 
@@ -1273,8 +1375,14 @@ struct tu5_rect_draw {
    const uint32_t *fs_consts;
    uint32_t fs_consts_dwords;
 
+   /* The texture of a blit, and whether it is filtered */
+   const struct tu5_surf *src;
+   bool src_linear;
    /* Texture coordinates of the corners of the rectangle, and a third one */
    float s0, t0, s1, t1, r;
+
+   /* The components not to write, of the colour target */
+   uint32_t keep_mask;
 };
 
 static void
@@ -1379,7 +1487,8 @@ tu5_draw_rect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       OUT_PKT4(cs, REG_A5XX_RB_MRT_CONTROL(i), 1);
       OUT_RING(cs, COND((int)i == d->rt,
                         A5XX_RB_MRT_CONTROL_ROP_CODE(ROP_COPY) |
-                           A5XX_RB_MRT_CONTROL_COMPONENT_ENABLE(0xf)));
+                           A5XX_RB_MRT_CONTROL_COMPONENT_ENABLE(
+                              0xf & ~d->keep_mask)));
 
       OUT_PKT4(cs, REG_A5XX_RB_MRT_BLEND_CONTROL(i), 1);
       OUT_RING(cs, 0x00000000);
@@ -1432,10 +1541,13 @@ tu5_draw_rect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       tu5_emit_const(cs, prog.fs, 0, d->fs_consts_dwords, d->fs_consts);
    tu5_emit_immediates(cs, prog.fs);
 
+   if (d->src)
+      tu5_emit_blit_src(cs, d->src, d->src_linear);
+
    OUT_PKT4(cs, REG_A5XX_TPL1_VS_TEX_COUNT, 1);
    OUT_RING(cs, 0);
    OUT_PKT4(cs, REG_A5XX_TPL1_FS_TEX_COUNT, 1);
-   OUT_RING(cs, 0);
+   OUT_RING(cs, d->src ? 1 : 0);
 
    OUT_PKT7(cs, CP_DRAW_INDX_OFFSET, 3);
    OUT_RING(cs, CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(DI_PT_TRISTRIP) |
@@ -1480,30 +1592,42 @@ tu5_clear_rect(struct tu_cmd_buffer *cmd, struct tu_cs *cs, int rt,
    tu5_draw_rect(cmd, cs, &d);
 }
 
-/* Bind a level and a layer of an image as the one target, for the clears and
- * the blits into it.
+/* Bind one colour target, or the depth and stencil buffer of an image, for
+ * the clears and the blits.
  */
 static void
-tu5_bind_target(struct tu_cs *cs, const struct tu_image *image,
-                enum pipe_format format, uint32_t level, uint32_t layer)
+tu5_bind_surf(struct tu_cs *cs, const struct tu5_surf *color,
+              const struct tu_image *zs, uint32_t level, uint32_t layer)
 {
-   bool zs = util_format_is_depth_or_stencil(format);
-
-   tu5_emit_zs_surface(cs, zs ? image : NULL, level, layer);
-   tu5_emit_mrt_surface(cs, 0, zs ? NULL : image, format, level, layer);
+   tu5_emit_zs_surface(cs, zs, level, layer);
+   tu5_emit_mrt_surf(cs, 0, color);
    for (unsigned i = 1; i < A5XX_MAX_RENDER_TARGETS; i++)
-      tu5_emit_mrt_surface(cs, i, NULL, PIPE_FORMAT_NONE, 0, 0);
+      tu5_emit_mrt_surf(cs, i, NULL);
 
    OUT_PKT4(cs, REG_A5XX_RB_RENDER_COMPONENTS, 1);
-   OUT_RING(cs, zs ? 0x0 : 0xf);
+   OUT_RING(cs, color ? 0xf : 0x0);
 
-   tu5_emit_msaa(cs, (VkSampleCountFlagBits)image->vk.samples);
+   tu5_emit_msaa(cs, (VkSampleCountFlagBits)(color ? color->samples
+                                                   : zs->vk.samples));
 
    OUT_PKT4(cs, REG_A5XX_RB_RENDER_CNTL, 1);
    OUT_RING(cs, 0x00000008);
 
    OUT_PKT4(cs, REG_A5XX_GRAS_SC_CNTL, 1);
    OUT_RING(cs, 0x00000008);
+}
+
+static void
+tu5_bind_target(struct tu_cs *cs, const struct tu_image *image,
+                enum pipe_format format, uint32_t level, uint32_t layer)
+{
+   if (util_format_is_depth_or_stencil(format)) {
+      tu5_bind_surf(cs, NULL, image, level, layer);
+   } else {
+      struct tu5_surf surf = tu5_image_surf(image, 0, format, level, layer);
+
+      tu5_bind_surf(cs, &surf, NULL, 0, 0);
+   }
 }
 
 /* The clears of the attachments that the subpass that starts uses first */
@@ -1629,6 +1753,359 @@ tu5_clear_image(struct tu_cmd_buffer *cmd, struct tu_image *image,
          tu5_sysmem_end(cmd, cs);
       }
    }
+}
+
+/* Copies and blits, outside of render passes: a rectangle sampling the source
+ * drawn into the destination.
+ */
+static void
+tu5_blit_rect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+              const struct tu5_surf *dst, VkRect2D dst_rect,
+              const struct tu5_surf *src, float s0, float t0, float s1,
+              float t1, bool linear, uint32_t keep_mask)
+{
+   struct tu5_rect_draw d = {
+      .fs = GLOBAL_SH_FS_BLIT,
+      .width = dst->width,
+      .height = dst->height,
+      .rect = dst_rect,
+      .rt = 0,
+      .src = src,
+      .src_linear = linear,
+      .s0 = s0,
+      .t0 = t0,
+      .s1 = s1,
+      .t1 = t1,
+      .keep_mask = keep_mask,
+   };
+
+   if (!dst_rect.extent.width || !dst_rect.extent.height)
+      return;
+
+   tu5_bind_surf(cs, dst, NULL, 0, 0);
+   tu5_draw_rect(cmd, cs, &d);
+}
+
+/* The window of the blits is not that of a framebuffer: the largest */
+static void
+tu5_blit_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+{
+   tu5_sysmem_begin(cmd, cs, 16384, 16384);
+}
+
+/* Texels are copied as unsigned integers of their size, for the bits to come
+ * through as they are.
+ */
+static enum pipe_format
+tu5_copy_format(enum pipe_format format)
+{
+   switch (util_format_get_blocksize(format)) {
+   case 1:
+      return PIPE_FORMAT_R8_UINT;
+   case 2:
+      return PIPE_FORMAT_R16_UINT;
+   case 4:
+      return PIPE_FORMAT_R32_UINT;
+   case 8:
+      return PIPE_FORMAT_R32G32_UINT;
+   case 16:
+      return PIPE_FORMAT_R32G32B32A32_UINT;
+   default:
+      return PIPE_FORMAT_NONE;
+   }
+}
+
+/* The plane of an aspect of an image, the format to copy it as, and the
+ * components of that format the aspect does not have.
+ */
+static enum pipe_format
+tu5_aspect_copy_format(const struct tu_image *image, VkImageAspectFlags aspect,
+                       unsigned *plane, uint32_t *keep_mask)
+{
+   *plane = tu6_plane_index(image->vk.format, aspect);
+   *keep_mask = 0;
+
+   enum pipe_format format = tu6_plane_format(image->vk.format, *plane);
+
+   if (format == PIPE_FORMAT_Z24_UNORM_S8_UINT ||
+       format == PIPE_FORMAT_Z24X8_UNORM) {
+      /* depth in the low three bytes, stencil in the high one */
+      if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT)
+         *keep_mask = 0x8;
+      else if (aspect == VK_IMAGE_ASPECT_STENCIL_BIT)
+         *keep_mask = 0x7;
+      return PIPE_FORMAT_R8G8B8A8_UINT;
+   }
+
+   /* TODO: compressed formats, by block */
+   if (util_format_is_compressed(format))
+      return PIPE_FORMAT_NONE;
+
+   return tu5_copy_format(format);
+}
+
+/* A rectangle of texels between an image surface and the rows of a buffer.
+ * The targets and the textures take addresses and pitches that are multiples
+ * of 64 bytes: a buffer that is not laid out so goes row by row, each from
+ * the 64 bytes before it.
+ */
+static void
+tu5_copy_buffer_rect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                     const struct tu5_surf *image, uint32_t x, uint32_t y,
+                     uint64_t va, uint32_t pitch, uint32_t w, uint32_t h,
+                     bool to_buffer, uint32_t keep_mask)
+{
+   enum pipe_format format = image->format;
+   uint32_t cpp = util_format_get_blocksize(format);
+
+   if (!(va & 63) && !(pitch & 63)) {
+      struct tu5_surf buf = tu5_buffer_surf(format, va, w, h, pitch);
+
+      if (to_buffer) {
+         tu5_blit_rect(cmd, cs, &buf, (VkRect2D) { { 0, 0 }, { w, h } }, image,
+                       x, y, x + w, y + h, false, 0);
+      } else {
+         tu5_blit_rect(cmd, cs, image, (VkRect2D) { { (int32_t)x, (int32_t)y }, { w, h } },
+                       &buf, 0, 0, w, h, false, keep_mask);
+      }
+      return;
+   }
+
+   for (uint32_t row = 0; row < h; row++) {
+      uint64_t row_va = va + (uint64_t)row * pitch;
+      uint32_t bx = (row_va & 63) / cpp;
+      struct tu5_surf buf =
+         tu5_buffer_surf(format, row_va & ~63ull, bx + w, 1,
+                         align((bx + w) * cpp, 64));
+
+      if (to_buffer) {
+         tu5_blit_rect(cmd, cs, &buf, (VkRect2D) { { (int32_t)bx, 0 }, { w, 1 } },
+                       image, x, y + row, x + w, y + row + 1, false, 0);
+      } else {
+         tu5_blit_rect(cmd, cs, image,
+                       (VkRect2D) { { (int32_t)x, (int32_t)(y + row) }, { w, 1 } },
+                       &buf, bx, 0, bx + w, 1, false, keep_mask);
+      }
+   }
+}
+
+static void
+tu5_copy_buffer_image(struct tu_cmd_buffer *cmd, struct tu_buffer *buffer,
+                      struct tu_image *image, const VkBufferImageCopy2 *info,
+                      bool to_buffer)
+{
+   struct tu_cs *cs = &cmd->cs;
+   const VkImageSubresourceLayers *sub = &info->imageSubresource;
+   bool is_3d = image->vk.image_type == VK_IMAGE_TYPE_3D;
+   uint32_t layers = MAX2(info->imageExtent.depth,
+                          vk_image_subresource_layer_count(&image->vk, sub));
+   unsigned plane;
+   uint32_t keep_mask;
+   enum pipe_format format =
+      tu5_aspect_copy_format(image, sub->aspectMask, &plane, &keep_mask);
+
+   /* TODO: the stencil of packed depth and stencil, a byte a texel in the
+    * buffer
+    */
+   if (format == PIPE_FORMAT_NONE ||
+       (keep_mask == 0x7 && sub->aspectMask == VK_IMAGE_ASPECT_STENCIL_BIT)) {
+      mesa_logw("a5xx: copy between a buffer and %s not implemented",
+                util_format_name(vk_format_to_pipe_format(image->vk.format)));
+      return;
+   }
+
+   uint32_t cpp = util_format_get_blocksize(format);
+   uint32_t row_length = info->bufferRowLength ? info->bufferRowLength
+                                               : info->imageExtent.width;
+   uint32_t image_height = info->bufferImageHeight ? info->bufferImageHeight
+                                                   : info->imageExtent.height;
+   uint32_t pitch = row_length * cpp;
+   uint64_t layer_size = (uint64_t)image_height * pitch;
+
+   tu5_blit_begin(cmd, cs);
+   for (uint32_t i = 0; i < layers; i++) {
+      uint32_t layer = (is_3d ? info->imageOffset.z : sub->baseArrayLayer) + i;
+      struct tu5_surf surf =
+         tu5_image_surf(image, plane, format, sub->mipLevel, layer);
+
+      tu5_copy_buffer_rect(cmd, cs, &surf, info->imageOffset.x,
+                           info->imageOffset.y,
+                           buffer->iova + info->bufferOffset + layer_size * i,
+                           pitch, info->imageExtent.width,
+                           info->imageExtent.height, to_buffer, keep_mask);
+   }
+   tu5_sysmem_end(cmd, cs);
+}
+
+void
+tu5_copy_buffer_to_image(struct tu_cmd_buffer *cmd, struct tu_buffer *src,
+                         struct tu_image *dst, const VkBufferImageCopy2 *info)
+{
+   tu5_copy_buffer_image(cmd, src, dst, info, false);
+}
+
+void
+tu5_copy_image_to_buffer(struct tu_cmd_buffer *cmd, struct tu_image *src,
+                         struct tu_buffer *dst, const VkBufferImageCopy2 *info)
+{
+   tu5_copy_buffer_image(cmd, dst, src, info, true);
+}
+
+void
+tu5_copy_image(struct tu_cmd_buffer *cmd, struct tu_image *src_image,
+               struct tu_image *dst_image, const VkImageCopy2 *info)
+{
+   struct tu_cs *cs = &cmd->cs;
+   unsigned src_plane, dst_plane;
+   uint32_t src_keep, dst_keep;
+   enum pipe_format src_format =
+      tu5_aspect_copy_format(src_image, info->srcSubresource.aspectMask,
+                             &src_plane, &src_keep);
+   enum pipe_format dst_format =
+      tu5_aspect_copy_format(dst_image, info->dstSubresource.aspectMask,
+                             &dst_plane, &dst_keep);
+   bool src_3d = src_image->vk.image_type == VK_IMAGE_TYPE_3D;
+   bool dst_3d = dst_image->vk.image_type == VK_IMAGE_TYPE_3D;
+   uint32_t layers =
+      MAX2(info->extent.depth,
+           vk_image_subresource_layer_count(&src_image->vk,
+                                            &info->srcSubresource));
+
+   /* TODO: between compressed and other formats, and multisampled images */
+   if (src_format == PIPE_FORMAT_NONE || src_format != dst_format ||
+       src_image->vk.samples != VK_SAMPLE_COUNT_1_BIT) {
+      mesa_logw("a5xx: copy from %s to %s not implemented",
+                util_format_name(vk_format_to_pipe_format(src_image->vk.format)),
+                util_format_name(vk_format_to_pipe_format(dst_image->vk.format)));
+      return;
+   }
+
+   tu5_blit_begin(cmd, cs);
+   for (uint32_t i = 0; i < layers; i++) {
+      struct tu5_surf src = tu5_image_surf(
+         src_image, src_plane, src_format, info->srcSubresource.mipLevel,
+         (src_3d ? info->srcOffset.z : info->srcSubresource.baseArrayLayer) + i);
+      struct tu5_surf dst = tu5_image_surf(
+         dst_image, dst_plane, dst_format, info->dstSubresource.mipLevel,
+         (dst_3d ? info->dstOffset.z : info->dstSubresource.baseArrayLayer) + i);
+      VkRect2D rect = { { info->dstOffset.x, info->dstOffset.y },
+                        { info->extent.width, info->extent.height } };
+
+      tu5_blit_rect(cmd, cs, &dst, rect, &src, info->srcOffset.x,
+                    info->srcOffset.y, info->srcOffset.x + info->extent.width,
+                    info->srcOffset.y + info->extent.height, false, dst_keep);
+   }
+   tu5_sysmem_end(cmd, cs);
+}
+
+/* TODO: depth and stencil, 3D images, multisampled sources */
+void
+tu5_blit_image(struct tu_cmd_buffer *cmd, struct tu_image *src_image,
+               struct tu_image *dst_image, const VkImageBlit2 *info,
+               VkFilter filter)
+{
+   struct tu_cs *cs = &cmd->cs;
+   enum pipe_format src_format = vk_format_to_pipe_format(src_image->vk.format);
+   enum pipe_format dst_format = vk_format_to_pipe_format(dst_image->vk.format);
+   uint32_t layers = vk_image_subresource_layer_count(&dst_image->vk,
+                                                      &info->dstSubresource);
+
+   if (util_format_is_depth_or_stencil(dst_format) ||
+       util_format_is_compressed(src_format)) {
+      mesa_logw("a5xx: blit from %s to %s not implemented",
+                util_format_name(src_format), util_format_name(dst_format));
+      return;
+   }
+
+   /* The rectangle is drawn from its top left: mirror the source instead */
+   int32_t dx0 = info->dstOffsets[0].x, dx1 = info->dstOffsets[1].x;
+   int32_t dy0 = info->dstOffsets[0].y, dy1 = info->dstOffsets[1].y;
+   float s0 = info->srcOffsets[0].x, s1 = info->srcOffsets[1].x;
+   float t0 = info->srcOffsets[0].y, t1 = info->srcOffsets[1].y;
+
+   if (dx0 > dx1) {
+      int32_t tmp = dx0; dx0 = dx1; dx1 = tmp;
+      float ftmp = s0; s0 = s1; s1 = ftmp;
+   }
+   if (dy0 > dy1) {
+      int32_t tmp = dy0; dy0 = dy1; dy1 = tmp;
+      float ftmp = t0; t0 = t1; t1 = ftmp;
+   }
+
+   VkRect2D rect = { { dx0, dy0 },
+                     { (uint32_t)(dx1 - dx0), (uint32_t)(dy1 - dy0) } };
+
+   tu5_blit_begin(cmd, cs);
+   for (uint32_t i = 0; i < layers; i++) {
+      struct tu5_surf src =
+         tu5_image_surf(src_image, 0, src_format, info->srcSubresource.mipLevel,
+                        info->srcSubresource.baseArrayLayer + i);
+      struct tu5_surf dst =
+         tu5_image_surf(dst_image, 0, dst_format, info->dstSubresource.mipLevel,
+                        info->dstSubresource.baseArrayLayer + i);
+
+      tu5_blit_rect(cmd, cs, &dst, rect, &src, s0, t0, s1, t1,
+                    filter == VK_FILTER_LINEAR, 0);
+   }
+   tu5_sysmem_end(cmd, cs);
+}
+
+/* Buffers are copied as rows of bytes, each from the 64 bytes before it */
+void
+tu5_copy_buffer(struct tu_cmd_buffer *cmd, uint64_t dst_va, uint64_t src_va,
+                uint64_t size)
+{
+   struct tu_cs *cs = &cmd->cs;
+
+   tu5_blit_begin(cmd, cs);
+   while (size) {
+      uint32_t src_x = src_va & 63, dst_x = dst_va & 63;
+      uint32_t width = MIN2(size, 0x4000 - MAX2(src_x, dst_x));
+      struct tu5_surf src =
+         tu5_buffer_surf(PIPE_FORMAT_R8_UINT, src_va & ~63ull, src_x + width, 1,
+                         align(src_x + width, 64));
+      struct tu5_surf dst =
+         tu5_buffer_surf(PIPE_FORMAT_R8_UINT, dst_va & ~63ull, dst_x + width, 1,
+                         align(dst_x + width, 64));
+
+      tu5_blit_rect(cmd, cs, &dst, (VkRect2D) { { (int32_t)dst_x, 0 }, { width, 1 } },
+                    &src, src_x, 0, src_x + width, 1, false, 0);
+
+      src_va += width;
+      dst_va += width;
+      size -= width;
+   }
+   tu5_sysmem_end(cmd, cs);
+}
+
+/* vkCmdFillBuffer(): the offset and the size are multiples of four */
+void
+tu5_fill_buffer(struct tu_cmd_buffer *cmd, uint64_t dst_va, uint64_t size,
+                uint32_t data)
+{
+   struct tu_cs *cs = &cmd->cs;
+   VkClearValue value = {};
+   uint32_t dwords = size / 4;
+
+   value.color.uint32[0] = data;
+
+   tu5_blit_begin(cmd, cs);
+   while (dwords) {
+      uint32_t dst_x = (dst_va & 63) / 4;
+      uint32_t width = MIN2(dwords, 0x4000 - dst_x);
+      struct tu5_surf dst =
+         tu5_buffer_surf(PIPE_FORMAT_R32_UINT, dst_va & ~63ull, dst_x + width,
+                         1, align((dst_x + width) * 4, 64));
+
+      tu5_bind_surf(cs, &dst, NULL, 0, 0);
+      tu5_clear_rect(cmd, cs, 0, VK_IMAGE_ASPECT_COLOR_BIT, &value,
+                     (VkRect2D) { { (int32_t)dst_x, 0 }, { width, 1 } },
+                     dst.width, dst.height);
+
+      dst_va += width * 4;
+      dwords -= width;
+   }
+   tu5_sysmem_end(cmd, cs);
 }
 
 /* vkCmdClearAttachments(), in the draw stream of the render pass */

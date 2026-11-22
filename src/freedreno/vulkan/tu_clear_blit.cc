@@ -2432,6 +2432,11 @@ tu6_blit_image(struct tu_cmd_buffer *cmd,
                const VkImageBlit2 *info,
                VkFilter filter)
 {
+   if (tu_is_a5xx(cmd->device)) {
+      tu5_blit_image(cmd, src_image, dst_image, info, filter);
+      return;
+   }
+
    const struct blit_ops *ops = &r2d_ops<CHIP>;
    struct tu_cs *cs = &cmd->cs;
    bool z_scale = false;
@@ -2615,6 +2620,11 @@ tu_copy_buffer_to_image(struct tu_cmd_buffer *cmd,
                         struct tu_image *dst_image,
                         const VkBufferImageCopy2 *info)
 {
+   if (tu_is_a5xx(cmd->device)) {
+      tu5_copy_buffer_to_image(cmd, src_buffer, dst_image, info);
+      return;
+   }
+
    struct tu_cs *cs = &cmd->cs;
    uint32_t layers = MAX2(info->imageExtent.depth,
                           vk_image_subresource_layer_count(&dst_image->vk,
@@ -2840,6 +2850,11 @@ tu_copy_image_to_buffer(struct tu_cmd_buffer *cmd,
                         const VkBufferImageCopy2 *info,
                         bool *unaligned_store)
 {
+   if (tu_is_a5xx(cmd->device)) {
+      tu5_copy_image_to_buffer(cmd, src_image, dst_buffer, info);
+      return;
+   }
+
    struct tu_cs *cs = &cmd->cs;
    uint32_t layers = MAX2(info->imageExtent.depth,
                           vk_image_subresource_layer_count(&src_image->vk,
@@ -3074,6 +3089,11 @@ tu_copy_image_to_image(struct tu_cmd_buffer *cmd,
                        struct tu_image *dst_image,
                        const VkImageCopy2 *info)
 {
+   if (tu_is_a5xx(cmd->device)) {
+      tu5_copy_image(cmd, src_image, dst_image, info);
+      return;
+   }
+
    const struct blit_ops *ops = &r2d_ops<CHIP>;
    struct tu_cs *cs = &cmd->cs;
 
@@ -3523,6 +3543,11 @@ copy_buffer(struct tu_cmd_buffer *cmd,
             uint32_t block_size,
             bool *unaligned_store)
 {
+   if (tu_is_a5xx(cmd->device)) {
+      tu5_copy_buffer(cmd, dst_va, src_va, size);
+      return;
+   }
+
    const struct blit_ops *ops = &r2d_ops<CHIP>;
    struct tu_cs *cs = &cmd->cs;
    uint64_t blocks = size / block_size;
@@ -3661,6 +3686,11 @@ tu_cmd_fill_buffer(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
    const struct blit_ops *ops = &r2d_ops<CHIP>;
    struct tu_cs *cs = &cmd->cs;
+
+   if (tu_is_a5xx(cmd->device)) {
+      tu5_fill_buffer(cmd, dstAddr, fillSize & ~3ull, data);
+      return;
+   }
 
    trace_start_fill_buffer(&cmd->trace, &cmd->cs, cmd);
 

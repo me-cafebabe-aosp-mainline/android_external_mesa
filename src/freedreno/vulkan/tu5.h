@@ -31,6 +31,23 @@ void tu5_clear_image(struct tu_cmd_buffer *cmd, struct tu_image *image,
                      const VkClearValue *value, uint32_t range_count,
                      const VkImageSubresourceRange *ranges);
 
+/* Copies and blits */
+void tu5_copy_buffer_to_image(struct tu_cmd_buffer *cmd, struct tu_buffer *src,
+                              struct tu_image *dst,
+                              const VkBufferImageCopy2 *info);
+void tu5_copy_image_to_buffer(struct tu_cmd_buffer *cmd, struct tu_image *src,
+                              struct tu_buffer *dst,
+                              const VkBufferImageCopy2 *info);
+void tu5_copy_image(struct tu_cmd_buffer *cmd, struct tu_image *src,
+                    struct tu_image *dst, const VkImageCopy2 *info);
+void tu5_blit_image(struct tu_cmd_buffer *cmd, struct tu_image *src,
+                    struct tu_image *dst, const VkImageBlit2 *info,
+                    VkFilter filter);
+void tu5_copy_buffer(struct tu_cmd_buffer *cmd, uint64_t dst_va,
+                     uint64_t src_va, uint64_t size);
+void tu5_fill_buffer(struct tu_cmd_buffer *cmd, uint64_t dst_va, uint64_t size,
+                     uint32_t data);
+
 /* vkCmdClearAttachments() */
 void tu5_clear_attachments(struct tu_cmd_buffer *cmd,
                            uint32_t attachment_count,
