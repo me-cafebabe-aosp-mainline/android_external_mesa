@@ -4785,8 +4785,11 @@ tu_bind_descriptor_sets(struct tu_cmd_buffer *cmd,
    uint32_t a5xx_old_dyn[MAX_DYNAMIC_BUFFERS_SIZE];
    if (a5xx_same) {
       for (unsigned i = 0; i < info->descriptorSetCount; i++) {
-         if (descriptors_state->sets[info->firstSet + i] !=
-             tu_descriptor_set_from_handle(info->pDescriptorSets[i]))
+         struct tu_descriptor_set *set =
+            tu_descriptor_set_from_handle(info->pDescriptorSets[i]);
+         /* the push set is the same set with what was pushed last */
+         if (descriptors_state->sets[info->firstSet + i] != set ||
+             set == &descriptors_state->push_set)
             a5xx_same = false;
       }
       if (a5xx_same)
