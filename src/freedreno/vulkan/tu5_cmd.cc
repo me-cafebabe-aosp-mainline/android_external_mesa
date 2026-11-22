@@ -1474,6 +1474,15 @@ tu5_program_emit(struct tu_cs *ring, struct tu5_program *emit)
 
          uint32_t inloc = s[FS].v->inputs[j].inloc;
 
+         /* What the vertex shader does not write of these reads as zero */
+         if ((s[FS].v->inputs[j].slot == VARYING_SLOT_LAYER ||
+              s[FS].v->inputs[j].slot == VARYING_SLOT_VIEWPORT) &&
+             ir3_find_output(s[VS].v, (gl_varying_slot)s[FS].v->inputs[j].slot) < 0) {
+            if (compmask & 0x1)
+               vinterp[inloc / 16] |= 0b10 << ((inloc % 16) * 2);
+            continue;
+         }
+
          if (s[FS].v->inputs[j].flat ||
              (s[FS].v->inputs[j].rasterflat && emit->rasterflat)) {
             uint32_t loc = inloc;

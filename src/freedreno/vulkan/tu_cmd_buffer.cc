@@ -8449,8 +8449,13 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
                 /* note: draw_count is 0 for indirect */
                 uint32_t draw_count)
 {
-   if (tu_is_a5xx(cmd->device))
+   if (tu_is_a5xx(cmd->device)) {
+      /* what the barriers between the subpasses left to be flushed, for an
+       * attachment written by one to be read by the next
+       */
+      tu_emit_cache_flush_renderpass<CHIP>(cmd);
       return tu5_draw_state(cmd, cs, indexed);
+   }
 
    const struct tu_program_state *program = &cmd->state.program;
    struct tu_render_pass_state *rp = &cmd->state.rp;
