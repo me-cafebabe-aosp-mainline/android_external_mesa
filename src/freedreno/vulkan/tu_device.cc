@@ -459,6 +459,11 @@ get_device_extensions(const struct tu_physical_device *device,
          /* also in the stock driver */
          .KHR_device_group = true,
          .EXT_index_type_uint8 = true,
+         /* with none of the line modes, as in the stock driver */
+         .EXT_line_rasterization = true,
+         .KHR_line_rasterization = true,
+         /* STORE_OP_NONE: not stored, see tu_render_pass_attachment */
+         .QCOM_render_pass_store_ops = true,
          .EXT_pipeline_creation_cache_control = true,
          .EXT_pipeline_creation_feedback = true,
          .KHR_push_descriptor = true,
@@ -1453,7 +1458,7 @@ tu_get_properties(struct tu_physical_device *pdevice,
       props->maxDescriptorSetSamplers = 96;
       /* as in the stock driver */
       props->maxDescriptorSetSampledImages = 6 * TU5_MAX_TEXTURES;
-      props->maxDescriptorSetUniformBuffers = 72;
+      props->maxDescriptorSetUniformBuffers = 84;
       props->maxDescriptorSetUniformBuffersDynamic =
          MIN2(MAX_DYNAMIC_UNIFORM_BUFFERS, TU5_MAX_UBOS - 2);
       props->maxDescriptorSetStorageBuffers = 2 * TU5_MAX_SSBOS;
