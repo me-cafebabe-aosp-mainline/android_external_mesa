@@ -2612,6 +2612,9 @@ bit 7 for RECTLIST (clear) when z32s8 (used for clear of depth32?  not set
 	</reg32>
 	<!-- either blob is doing it wrong, or this is not per-stage anymore: -->
 	<reg64 offset="0xe706" name="TPL1_TP_BORDER_COLOR_BASE_ADDR" type="address"/>
+	<!-- those of the compute shaders, from the stock Vulkan driver -->
+	<reg32 offset="0xe762" name="TPL1_TP_CS_BORDER_COLOR_BASE_ADDR_LO"/>
+	<reg32 offset="0xe763" name="TPL1_TP_CS_BORDER_COLOR_BASE_ADDR_HI"/>
 
 	<!--
 	so these have the same info that is normally in the CP_LOAD_STATE

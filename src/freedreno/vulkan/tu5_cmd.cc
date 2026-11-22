@@ -936,7 +936,8 @@ tu5_dispatch(struct tu_cmd_buffer *cmd, const uint32_t *blocks,
    if (instrlen > 0)
       tu5_emit_shader(cs, v, so.iova);
 
-   OUT_PKT4(cs, REG_A5XX_TPL1_TP_BORDER_COLOR_BASE_ADDR_LO, 2);
+   /* the compute shaders have a base of their own */
+   OUT_PKT4(cs, REG_A5XX_TPL1_TP_CS_BORDER_COLOR_BASE_ADDR_LO, 2);
    tu_cs_emit_qw(cs, global_iova(cmd, bcolor_builtin));
 
    tu5_emit_immediates(cs, v);
