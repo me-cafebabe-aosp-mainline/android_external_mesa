@@ -6384,8 +6384,11 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
 
          tu_lrz_flush_valid_at_secondary_rp_boundary(
             cmd, secondary->state.lrz, &cmd->draw_cs);
-         if (tu_is_a5xx(cmd->device))
+         if (tu_is_a5xx(cmd->device)) {
             tu5_write_view_bases(cmd, &cmd->draw_cs);
+            /* what the secondary command buffer leaves is not known */
+            cmd->state.a5xx_vs = cmd->state.a5xx_fs = NULL;
+         }
 
          result = tu_cs_add_entries(&cmd->draw_cs, &secondary->draw_cs);
          if (result != VK_SUCCESS) {

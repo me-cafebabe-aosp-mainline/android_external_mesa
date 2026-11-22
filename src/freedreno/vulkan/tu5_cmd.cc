@@ -854,6 +854,9 @@ void
 tu5_dispatch(struct tu_cmd_buffer *cmd, const uint32_t *blocks,
              const uint32_t *offsets, uint64_t indirect_iova)
 {
+   /* the program state of the draws is to be written out again */
+   cmd->state.a5xx_vs = cmd->state.a5xx_fs = NULL;
+
    struct tu_cs *cs = &cmd->cs;
    const struct tu_shader *shader = cmd->state.shaders[MESA_SHADER_COMPUTE];
    const struct ir3_shader_variant *v = shader->variant;
@@ -1831,6 +1834,9 @@ tu5_program_emit(struct tu_cs *ring, struct tu5_program *emit)
 void
 tu5_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *ring)
 {
+   /* the program state of the draws is to be written out again */
+   cmd->state.a5xx_vs = cmd->state.a5xx_fs = NULL;
+
    tu5_set_render_mode(ring, BYPASS);
    tu5_cache_flush(ring);
 
@@ -2420,6 +2426,9 @@ static void
 tu5_draw_rect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
               const struct tu5_rect_draw *d)
 {
+   /* the program state of the draws is to be written out again */
+   cmd->state.a5xx_vs = cmd->state.a5xx_fs = NULL;
+
    struct tu5_program prog = {};
 
    prog.vs_shader = tu5_global_shader(cmd->device, GLOBAL_SH_VS_RECT5);
@@ -2708,6 +2717,9 @@ static void
 tu5_sysmem_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t width,
                  uint32_t height)
 {
+   /* the program state of the draws is to be written out again */
+   cmd->state.a5xx_vs = cmd->state.a5xx_fs = NULL;
+
    const struct fd_dev_info *info = cmd->device->physical_device->info;
 
    tu5_set_render_mode(cs, BYPASS);
@@ -3510,6 +3522,9 @@ tu5_clear_attachments(struct tu_cmd_buffer *cmd, uint32_t attachment_count,
 void
 tu5_emit_subpass_begin(struct tu_cmd_buffer *cmd)
 {
+   /* the program state of the draws is to be written out again */
+   cmd->state.a5xx_vs = cmd->state.a5xx_fs = NULL;
+
    struct tu_cs *cs = &cmd->draw_cs;
 
    tu5_emit_load_clears(cmd, cs);
@@ -3966,16 +3981,31 @@ tu5_draw_state(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool indexed)
       .fs_shader = tu5_shader_from(fs_shader),
    };
 
+   /* The program and the constants of the shaders themselves are written
+    * out again only for other shaders, or when something else may have
+    * changed them: a clear, a blit, a dispatch, a secondary command buffer,
+    * the start of a subpass.
+    */
+   const bool same_program = cmd->state.a5xx_vs == vs_shader &&
+                             cmd->state.a5xx_fs == fs_shader;
+
    tu5_emit_depth_stencil(cmd, cs, prog.fs);
    tu5_emit_viewport_scissor(cmd, cs);
-   tu5_program_emit(cs, &prog);
-   tu5_emit_rasterizer(cmd, cs, prog.vs, prog.max_loc, indexed);
+   if (!same_program) {
+      tu5_program_emit(cs, &prog);
+      cmd->state.a5xx_vs = vs_shader;
+      cmd->state.a5xx_fs = fs_shader;
+      cmd->state.a5xx_max_loc = prog.max_loc;
+   }
+   tu5_emit_rasterizer(cmd, cs, prog.vs, cmd->state.a5xx_max_loc, indexed);
    tu5_emit_blend(cmd, cs, prog.fs);
    tu5_emit_vertex_bufs(cmd, cs, prog.vs);
 
-   tu5_emit_immediates(cs, prog.vs);
+   if (!same_program) {
+      tu5_emit_immediates(cs, prog.vs);
+      tu5_emit_immediates(cs, prog.fs);
+   }
    tu5_emit_vs_params(cmd, cs, prog.vs);
-   tu5_emit_immediates(cs, prog.fs);
 
    tu5_emit_user_consts(cmd, cs, vs_shader);
    tu5_emit_user_consts(cmd, cs, fs_shader);

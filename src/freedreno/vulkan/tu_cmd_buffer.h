@@ -622,6 +622,12 @@ struct tu_cmd_state
    struct tu_draw_state lrz_and_depth_plane_state;
 
    struct tu_vs_params last_vs_params;
+
+   /* Adreno 5xx: the shaders whose program state the draw stream has last,
+    * NULL when something else may have changed it since, see tu5_draw_state()
+    */
+   const struct tu_shader *a5xx_vs, *a5xx_fs;
+   unsigned a5xx_max_loc;
    bool last_draw_indexed;
 
    struct tu_tess_params tess_params;
