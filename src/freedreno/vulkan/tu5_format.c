@@ -119,6 +119,11 @@ static struct fd5_format formats[PIPE_FORMAT_COUNT] = {
    _T(B5G5R5A1_UNORM, 5_5_5_1_UNORM, R5G5B5A1_UNORM, WXYZ),
    _T(B5G5R5X1_UNORM, 5_5_5_1_UNORM, R5G5B5A1_UNORM, WXYZ),
    _T(B4G4R4A4_UNORM, 4_4_4_4_UNORM, R4G4B4A4_UNORM, WXYZ),
+   /* for textures alone, the swizzle of the format putting the components
+    * in place
+    */
+   _T(A4R4G4B4_UNORM, 4_4_4_4_UNORM, NONE,           WZYX),
+   _T(A4B4G4R4_UNORM, 4_4_4_4_UNORM, NONE,           WZYX),
 
    /* 24-bit */
    V_(R8G8B8_UNORM,   8_8_8_UNORM, NONE, WZYX),

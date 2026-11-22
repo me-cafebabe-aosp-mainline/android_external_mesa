@@ -116,6 +116,7 @@ nir_def *ir3_nir_try_propagate_bit_shift(nir_builder *b,
                                              int32_t shift);
 
 bool ir3_nir_lower_subgroups_filter(const nir_intrinsic_instr *intrin, const void *data);
+bool ir3_nir_lower_subgroups_of_one(nir_shader *nir);
 bool ir3_nir_lower_shuffle(nir_shader *nir, struct ir3_shader *shader);
 bool ir3_nir_opt_subgroups(nir_shader *nir, struct ir3_shader_variant *v);
 

@@ -1008,9 +1008,17 @@ tu_get_physical_device_properties_1_1(struct tu_physical_device *pdevice,
 
    p->subgroupQuadOperationsInAllStages = false;
 
-   /* Adreno 5xx: what the compiler has for it */
-   if (pdevice->info->chip == 5)
-      p->subgroupSupportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT;
+   /* Adreno 5xx: each invocation is a subgroup of its own, see
+    * ir3_nir_lower_subgroups_of_one()
+    */
+   if (pdevice->info->chip == 5) {
+      p->subgroupSize = 1;
+      p->subgroupSupportedStages = VK_SHADER_STAGE_COMPUTE_BIT |
+                                   VK_SHADER_STAGE_FRAGMENT_BIT |
+                                   VK_SHADER_STAGE_VERTEX_BIT;
+      p->subgroupSupportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT |
+                                       VK_SUBGROUP_FEATURE_VOTE_BIT;
+   }
 
    p->pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_ALL_CLIP_PLANES;
    p->maxMultiviewViewCount =
@@ -1062,6 +1070,10 @@ tu_get_physical_device_properties_1_2(struct tu_physical_device *pdevice,
          .patch = 1,
       };
    }
+
+   /* Adreno 5xx has not passed the conformance tests */
+   if (pdevice->info->chip == 5)
+      p->conformanceVersion = (VkConformanceVersion) {};
 
    p->denormBehaviorIndependence =
       VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL;
@@ -1373,17 +1385,19 @@ tu_get_properties(struct tu_physical_device *pdevice,
       props->maxPerStageDescriptorUniformBuffers = TU5_MAX_UBOS - 2;
       props->maxPerStageDescriptorStorageBuffers = TU5_MAX_SSBOS;
       props->maxPerStageDescriptorStorageImages = TU5_MAX_IMAGES;
-      props->maxPerStageResources =
-         TU5_MAX_SAMPLERS + TU5_MAX_TEXTURES + TU5_MAX_UBOS - 2 + MAX_RTS;
-      props->maxDescriptorSetSamplers = 2 * TU5_MAX_SAMPLERS;
-      props->maxDescriptorSetSampledImages = 2 * TU5_MAX_TEXTURES;
-      props->maxDescriptorSetUniformBuffers = 2 * (TU5_MAX_UBOS - 2);
+      /* The limits of a stage hold for each shader; those of a pipeline
+       * layout can be as the specification would have them.
+       */
+      props->maxPerStageResources = 128;
+      props->maxDescriptorSetSamplers = 96;
+      props->maxDescriptorSetSampledImages = 96;
+      props->maxDescriptorSetUniformBuffers = 72;
       props->maxDescriptorSetUniformBuffersDynamic =
          MIN2(MAX_DYNAMIC_UNIFORM_BUFFERS, TU5_MAX_UBOS - 2);
       props->maxDescriptorSetStorageBuffers = 2 * TU5_MAX_SSBOS;
       props->maxDescriptorSetStorageBuffersDynamic =
          MIN2(MAX_DYNAMIC_STORAGE_BUFFERS, TU5_MAX_SSBOS);
-      props->maxDescriptorSetStorageImages = 2 * TU5_MAX_IMAGES;
+      props->maxDescriptorSetStorageImages = 24;
       props->maxComputeSharedMemorySize = 16384;
       props->maxComputeWorkGroupInvocations = 1024;
       props->maxComputeWorkGroupSize[0] = 1024;
