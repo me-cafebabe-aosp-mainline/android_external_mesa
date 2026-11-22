@@ -1714,7 +1714,34 @@ struct tu5_surf {
    uint32_t samples;
    /* As a texture: the component each of its four reads, if not its own */
    const unsigned char *swiz;
+   /* As a texture: the slices of a level of a 3D image, if not zero, and the
+    * size of those of its last level
+    */
+   uint32_t depth;
+   uint32_t min_layer_size;
 };
+
+/* A level of a 3D image as a texture */
+static struct tu5_surf
+tu5_image_surf_3d(const struct tu_image *image, enum pipe_format format,
+                  uint32_t level)
+{
+   const struct fdl_layout *layout = &image->layout[0];
+   struct tu5_surf surf = {
+      .format = format,
+      .iova = image->iova + fdl_surface_offset(layout, level, 0),
+      .width = u_minify(layout->width0, level),
+      .height = u_minify(layout->height0, level),
+      .pitch = fdl_pitch(layout, level),
+      .layer_size = layout->slices[level].size0,
+      .tile_mode = (enum a5xx_tile_mode)fdl_tile_mode(layout, level),
+      .samples = 1,
+      .depth = u_minify(layout->depth0, level),
+      .min_layer_size = layout->slices[layout->mip_levels - 1].size0,
+   };
+
+   return surf;
+}
 
 static struct tu5_surf
 tu5_image_surf(const struct tu_image *image, unsigned plane,
@@ -1858,10 +1885,14 @@ tu5_emit_blit_src(struct tu_cs *cs, const struct tu5_surf *surf, bool linear)
                    A5XX_TEX_CONST_1_HEIGHT(surf->height));
    OUT_RING(cs, A5XX_TEX_CONST_2_PITCHALIGN(0) |
                    A5XX_TEX_CONST_2_PITCH(surf->pitch) |
-                   A5XX_TEX_CONST_2_TYPE(A5XX_TEX_2D));
-   OUT_RING(cs, A5XX_TEX_CONST_3_ARRAY_PITCH(surf->layer_size));
+                   A5XX_TEX_CONST_2_TYPE(surf->depth ? A5XX_TEX_3D
+                                                     : A5XX_TEX_2D));
+   OUT_RING(cs, A5XX_TEX_CONST_3_ARRAY_PITCH(surf->layer_size) |
+                   COND(surf->depth,
+                        A5XX_TEX_CONST_3_MIN_LAYERSZ(surf->min_layer_size)));
    OUT_RING(cs, (uint32_t)surf->iova);
-   OUT_RING(cs, (uint32_t)(surf->iova >> 32) | A5XX_TEX_CONST_5_DEPTH(1));
+   OUT_RING(cs, (uint32_t)(surf->iova >> 32) |
+                   A5XX_TEX_CONST_5_DEPTH(surf->depth ? surf->depth : 1));
    for (unsigned i = 6; i < 12; i++)
       OUT_RING(cs, 0x00000000);
 }
@@ -2428,7 +2459,8 @@ tu5_blit_rect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
               const struct tu5_surf *dst, VkRect2D dst_rect,
               const struct tu5_surf *src, float s0, float t0, float s1,
               float t1, bool linear, uint32_t keep_mask,
-              enum global_shader fs = GLOBAL_SH_FS_BLIT, int sample = -1)
+              enum global_shader fs = GLOBAL_SH_FS_BLIT, int sample = -1,
+              float r = 0.0f)
 {
    /* A sample of the source into the same of the destination */
    const uint32_t consts[4] = { (uint32_t)MAX2(sample, 0) };
@@ -2444,6 +2476,7 @@ tu5_blit_rect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       .t0 = t0,
       .s1 = s1,
       .t1 = t1,
+      .r = r,
       .keep_mask = keep_mask,
    };
 
@@ -2708,7 +2741,7 @@ tu5_copy_image(struct tu_cmd_buffer *cmd, struct tu_image *src_image,
    tu5_sysmem_end(cmd, cs);
 }
 
-/* TODO: depth and stencil, 3D images, multisampled sources */
+/* TODO: depth and stencil, multisampled sources */
 void
 tu5_blit_image(struct tu_cmd_buffer *cmd, struct tu_image *src_image,
                struct tu_image *dst_image, const VkImageBlit2 *info,
@@ -2744,14 +2777,56 @@ tu5_blit_image(struct tu_cmd_buffer *cmd, struct tu_image *src_image,
    VkRect2D rect = { { dx0, dy0 },
                      { (uint32_t)(dx1 - dx0), (uint32_t)(dy1 - dy0) } };
 
+   /* The slices of the 3D images, as tu6_blit_image() has them: when their
+    * number is not that of the source, or when they are mirrored, each one
+    * samples the source as a 3D texture.
+    */
+   bool src_3d = src_image->vk.image_type == VK_IMAGE_TYPE_3D;
+   bool dst_3d = dst_image->vk.image_type == VK_IMAGE_TYPE_3D;
+   bool z_scale = false;
+   int32_t src0_z = info->srcOffsets[0].z;
+   int32_t src1_z = info->srcOffsets[1].z;
+   int32_t dst_z = MIN2(info->dstOffsets[0].z, info->dstOffsets[1].z);
+
+   if (dst_3d || src_3d) {
+      layers = abs(info->dstOffsets[1].z - info->dstOffsets[0].z);
+      if ((info->srcOffsets[1].z - info->srcOffsets[0].z !=
+           info->dstOffsets[1].z - info->dstOffsets[0].z) ||
+          info->srcOffsets[1].z < info->srcOffsets[0].z)
+         z_scale = src_3d;
+      if (info->dstOffsets[1].z < info->dstOffsets[0].z) {
+         src0_z = info->srcOffsets[1].z;
+         src1_z = info->srcOffsets[0].z;
+      }
+      if (vk_image_subresource_layer_count(&dst_image->vk,
+                                           &info->dstSubresource) > 1) {
+         layers = vk_image_subresource_layer_count(&dst_image->vk,
+                                                   &info->dstSubresource);
+      }
+   }
+
    tu5_blit_begin(cmd, cs);
    for (uint32_t i = 0; i < layers; i++) {
-      struct tu5_surf src =
-         tu5_image_surf(src_image, 0, src_format, info->srcSubresource.mipLevel,
-                        info->srcSubresource.baseArrayLayer + i);
       struct tu5_surf dst =
          tu5_image_surf(dst_image, 0, dst_format, info->dstSubresource.mipLevel,
-                        info->dstSubresource.baseArrayLayer + i);
+                        (dst_3d ? dst_z : info->dstSubresource.baseArrayLayer) +
+                           i);
+
+      if (z_scale) {
+         struct tu5_surf src = tu5_image_surf_3d(src_image, src_format,
+                                                 info->srcSubresource.mipLevel);
+         float t = ((float)i + 0.5f) / (float)layers;
+
+         tu5_blit_rect(cmd, cs, &dst, rect, &src, s0, t0, s1, t1,
+                       filter == VK_FILTER_LINEAR, 0, GLOBAL_SH_FS_BLIT_ZSCALE,
+                       -1, t * (src1_z - src0_z) + src0_z);
+         continue;
+      }
+
+      struct tu5_surf src =
+         tu5_image_surf(src_image, 0, src_format, info->srcSubresource.mipLevel,
+                        (src_3d ? MIN2(src0_z, src1_z)
+                                : info->srcSubresource.baseArrayLayer) + i);
 
       tu5_blit_rect(cmd, cs, &dst, rect, &src, s0, t0, s1, t1,
                     filter == VK_FILTER_LINEAR, 0);
@@ -2920,12 +2995,63 @@ tu5_clear_attachments(struct tu_cmd_buffer *cmd, uint32_t attachment_count,
          continue;
       }
 
-      /* TODO: the layers past the first one of layered framebuffers */
+      /* The layers past the first: the target is bound to each in turn,
+       * then to the first again.
+       */
+      uint32_t a = rt >= 0 ? subpass->color_attachments[rt].attachment
+                           : subpass->depth_stencil_attachment.attachment;
+      /* A secondary command buffer need not know the framebuffer: there,
+       * the first layer alone is cleared, and the window is the largest.
+       *
+       * TODO: the other layers, as the primary command buffer runs it
+       */
+      const struct tu_image_view *iview =
+         cmd->state.attachments ? cmd->state.attachments[a] : NULL;
+      enum pipe_format format = vk_format_to_pipe_format(
+         cmd->state.pass->attachments[a].format);
+      uint32_t width = fb ? fb->width : 16384;
+      uint32_t height = fb ? fb->height : 16384;
+      bool rebound = false;
+
       for (uint32_t r = 0; r < rect_count; r++) {
-         if (rects[r].baseArrayLayer != 0)
-            continue;
-         tu5_clear_rect(cmd, cs, rt, att->aspectMask, &att->clearValue,
-                        rects[r].rect, fb->width, fb->height);
+         for (uint32_t l = 0; l < rects[r].layerCount; l++) {
+            uint32_t layer = rects[r].baseArrayLayer + l;
+
+            if (!iview && layer)
+               continue;
+
+            if (layer || rebound) {
+               if (rt >= 0) {
+                  struct tu5_surf surf =
+                     tu5_image_surf(iview->image, 0, format,
+                                    iview->vk.base_mip_level,
+                                    iview->vk.base_array_layer + layer);
+
+                  tu5_emit_mrt_surf(cs, rt, &surf);
+               } else {
+                  tu5_emit_zs_surface(cs, iview->image,
+                                      iview->vk.base_mip_level,
+                                      iview->vk.base_array_layer + layer);
+               }
+               rebound = layer != 0;
+            }
+
+            tu5_clear_rect(cmd, cs, rt, att->aspectMask, &att->clearValue,
+                           rects[r].rect, width, height);
+         }
+      }
+
+      if (rebound) {
+         if (rt >= 0) {
+            struct tu5_surf surf =
+               tu5_image_surf(iview->image, 0, format, iview->vk.base_mip_level,
+                              iview->vk.base_array_layer);
+
+            tu5_emit_mrt_surf(cs, rt, &surf);
+         } else {
+            tu5_emit_zs_surface(cs, iview->image, iview->vk.base_mip_level,
+                                iview->vk.base_array_layer);
+         }
       }
    }
 }
@@ -2959,6 +3085,27 @@ tu5_cmd_render(struct tu_cmd_buffer *cmd)
 
    tu5_sysmem_begin(cmd, cs, fb->width, fb->height);
    tu_cs_emit_call(cs, &cmd->draw_cs);
+
+   /* The resolves of the last subpass: those of the others are in the draw
+    * stream, see tu_CmdNextSubpass2().
+    */
+   const struct tu_subpass *subpass = cmd->state.subpass;
+
+   if (subpass->resolve_attachments) {
+      for (unsigned i = 0; i < subpass->resolve_count; i++) {
+         uint32_t a = subpass->resolve_attachments[i].attachment;
+
+         if (a == VK_ATTACHMENT_UNUSED)
+            continue;
+
+         uint32_t src = tu_subpass_get_attachment_to_resolve(subpass, i);
+
+         tu5_resolve_sysmem(cmd, cs, cmd->state.attachments[src],
+                            cmd->state.attachments[a], fb->layers,
+                            &cmd->state.render_area);
+      }
+   }
+
    tu5_sysmem_end(cmd, cs);
 }
 
@@ -3230,9 +3377,12 @@ tu5_emit_blend(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 
       if (i < subpass->color_count &&
           subpass->color_attachments[i].attachment != VK_ATTACHMENT_UNUSED) {
-         const struct tu_image_view *iview =
-            cmd->state.attachments[subpass->color_attachments[i].attachment];
-         enum pipe_format format = vk_format_to_pipe_format(iview->vk.format);
+         /* of the render pass: a secondary command buffer need not know the
+          * framebuffer
+          */
+         enum pipe_format format = vk_format_to_pipe_format(
+            cmd->state.pass->attachments[subpass->color_attachments[i].attachment]
+               .format);
          bool is_int = util_format_is_pure_integer(format);
          bool has_alpha = util_format_has_alpha(format);
          uint32_t write_mask =

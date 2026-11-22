@@ -7496,7 +7496,11 @@ tu_CmdNextSubpass2(VkCommandBuffer commandBuffer,
 
    tu_next_subpass_lrz(cmd, subpass, new_subpass);
 
-   if (cmd->state.tiling->possible) {
+   /* Adreno 5xx: the render passes go to the images themselves, for now */
+   const bool tiling_possible =
+      cmd->state.tiling->possible && !tu_is_a5xx(cmd->device);
+
+   if (tiling_possible) {
       if (cmd->state.pass->has_fdm)
          tu_cs_set_writeable(cs, true);
 
@@ -7518,7 +7522,7 @@ tu_CmdNextSubpass2(VkCommandBuffer commandBuffer,
 
    tu6_emit_sysmem_resolves<CHIP>(cmd, cs, subpass);
 
-   if (cmd->state.tiling->possible)
+   if (tiling_possible)
       tu_cond_exec_end(cs);
 
    /* Handle dependencies for the next subpass */

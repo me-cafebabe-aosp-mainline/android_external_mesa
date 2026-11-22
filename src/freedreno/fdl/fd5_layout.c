@@ -15,6 +15,7 @@ void
 fdl5_layout_image(struct fdl_layout *layout, const struct fdl_image_params *params)
 {
    memset(layout, 0, sizeof(*layout));
+   layout->mip_levels = mip_levels;
 
    assert(params->nr_samples > 0);
    assert(!params->ubwc && !params->force_ubwc);
