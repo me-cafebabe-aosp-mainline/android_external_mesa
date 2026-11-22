@@ -43,6 +43,10 @@ bool tu5_format_depth_supported(enum pipe_format format);
 }
 #endif
 
+/* The border colours */
+void tu5_pack_border_color(void *entry, const VkClearColorValue *val,
+                           bool is_int);
+
 /* Queries */
 void tu5_emit_sample_count_addr(struct tu_cs *cs, uint64_t iova);
 uint32_t tu5_always_on_counter_reg(void);

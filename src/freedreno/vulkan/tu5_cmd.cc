@@ -301,12 +301,12 @@ tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
          const uint32_t *desc = i < map->count[TU5_DESC_SAMPLER]
                                    ? tu5_descriptor(cmd, shader, &map->samp[i]) : NULL;
 
-         /* The same as those of Adreno 6xx but for the border colour.
-          * TODO: border colours
+         /* The same as those of Adreno 6xx, of which the third one has the
+          * border colour alone here: its number among those of the device.
           */
          OUT_RING(cs, desc ? desc[0] : 0);
          OUT_RING(cs, desc ? desc[1] : 0);
-         OUT_RING(cs, 0x00000000);
+         OUT_RING(cs, desc ? desc[2] & A5XX_TEX_SAMP_2_BCOLOR_OFFSET__MASK : 0);
          OUT_RING(cs, 0x00000000);
       }
    }
@@ -596,6 +596,74 @@ tu5_emit_user_consts(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    }
 }
 
+/* A border colour as Adreno 5xx takes it. The components are in the order
+ * the format has them, which is that of the colour for all but the formats
+ * with blue first: the colours of Vulkan being the same either way, these
+ * are packed the one way.
+ *
+ * TODO: custom border colours, which would be for a format
+ */
+struct PACKED tu5_bcolor_entry {
+   uint32_t fp32[4];
+   uint16_t ui16[4];
+   int16_t si16[4];
+   uint16_t fp16[4];
+   uint16_t rgb565;
+   uint16_t rgb5a1;
+   uint16_t rgba4;
+   uint8_t __pad0[2];
+   uint8_t ui8[4];
+   int8_t si8[4];
+   uint32_t rgb10a2;
+   uint32_t z24; /* also s8? */
+   uint16_t srgb[4]; /* as fp16[], clamped */
+   uint8_t __pad1[56];
+};
+static_assert(sizeof(struct tu5_bcolor_entry) == 128, "");
+
+void
+tu5_pack_border_color(void *entry, const VkClearColorValue *val, bool is_int)
+{
+   struct tu5_bcolor_entry *e = (struct tu5_bcolor_entry *)entry;
+
+   memset(e, 0, sizeof(*e));
+
+   for (unsigned c = 0; c < 4; c++) {
+      if (is_int) {
+         e->fp32[c] = val->uint32[c];
+         e->fp16[c] = (uint16_t)MIN2(val->uint32[c], 0xffffu);
+         continue;
+      }
+
+      float f = val->float32[c];
+      float f_u = CLAMP(f, 0, 1);
+      float f_s = CLAMP(f, -1, 1);
+
+      e->fp32[c] = fui(f);
+      e->fp16[c] = _mesa_float_to_half(f);
+      e->srgb[c] = _mesa_float_to_half(f_u);
+      e->ui16[c] = f_u * 0xffff;
+      e->si16[c] = f_s * 0x7fff;
+      e->ui8[c] = f_u * 0xff;
+      e->si8[c] = f_s * 0x7f;
+      if (c == 1)
+         e->rgb565 |= (int)(f_u * 0x3f) << 5;
+      else if (c < 3)
+         e->rgb565 |= (int)(f_u * 0x1f) << (c ? 11 : 0);
+      if (c == 3)
+         e->rgb5a1 |= (f_u > 0.5f) ? 0x8000 : 0;
+      else
+         e->rgb5a1 |= (int)(f_u * 0x1f) << (c * 5);
+      if (c == 3)
+         e->rgb10a2 |= (int)(f_u * 0x3) << 30;
+      else
+         e->rgb10a2 |= (int)(f_u * 0x3ff) << (c * 10);
+      e->rgba4 |= (int)(f_u * 0xf) << (c * 4);
+      if (c == 0)
+         e->z24 = f_u * 0xffffff;
+   }
+}
+
 /* For the occlusion queries: where the count of the samples that passed is
  * to be copied by the event that follows.
  */
@@ -749,6 +817,9 @@ tu5_dispatch(struct tu_cmd_buffer *cmd, const uint32_t *blocks,
 
    if (instrlen > 0)
       tu5_emit_shader(cs, v, so.iova);
+
+   OUT_PKT4(cs, REG_A5XX_TPL1_TP_BORDER_COLOR_BASE_ADDR_LO, 2);
+   tu_cs_emit_qw(cs, global_iova(cmd, bcolor_builtin));
 
    tu5_emit_immediates(cs, v);
    tu5_emit_user_consts(cmd, cs, shader);
@@ -3607,6 +3678,10 @@ tu5_draw_state(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool indexed)
    OUT_PKT4(cs, REG_A5XX_VFD_INDEX_OFFSET, 2);
    OUT_RING(cs, cmd->state.last_vs_params.vertex_offset);
    OUT_RING(cs, cmd->state.last_vs_params.first_instance);
+
+   /* see tu5_pack_border_color() */
+   OUT_PKT4(cs, REG_A5XX_TPL1_TP_BORDER_COLOR_BASE_ADDR_LO, 2);
+   tu_cs_emit_qw(cs, global_iova(cmd, bcolor_builtin));
 
    OUT_PKT4(cs, REG_A5XX_TPL1_CS_TEX_COUNT, 1);
    OUT_RING(cs, 0);
