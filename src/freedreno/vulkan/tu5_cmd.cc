@@ -1872,11 +1872,20 @@ tu5_emit_load_clears(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
       const struct tu_image_view *iview = cmd->state.attachments[a];
       enum pipe_format format = vk_format_to_pipe_format(iview->vk.format);
       bool zs = util_format_is_depth_or_stencil(format);
+      VkImageAspectFlags aspects = att->clear_mask;
+
+      /* The clear of what has depth alone, or stencil alone, is said to be
+       * that of a colour, see attachment_set_ops().
+       */
+      if (zs && (aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
+         aspects = format == PIPE_FORMAT_S8_UINT ? VK_IMAGE_ASPECT_STENCIL_BIT
+                                                 : VK_IMAGE_ASPECT_DEPTH_BIT;
+      }
 
       for (uint32_t layer = 0; layer < fb->layers; layer++) {
          tu5_bind_target(cs, iview->image, format, iview->vk.base_mip_level,
                          iview->vk.base_array_layer + layer);
-         tu5_clear_rect(cmd, cs, zs ? -1 : 0, att->clear_mask,
+         tu5_clear_rect(cmd, cs, zs ? -1 : 0, aspects,
                         &cmd->state.clear_values[a], cmd->state.render_area,
                         iview->vk.extent.width, iview->vk.extent.height);
       }
