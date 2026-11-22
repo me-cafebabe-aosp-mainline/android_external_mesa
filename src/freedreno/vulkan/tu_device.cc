@@ -1444,9 +1444,15 @@ tu_get_properties(struct tu_physical_device *pdevice,
       /* The limits of a stage hold for each shader; those of a pipeline
        * layout can be as the specification would have them.
        */
-      props->maxPerStageResources = 128;
+      /* As in the stock driver. The sampled images, the input attachments
+       * and the storage images read as textures share the 128 textures of
+       * the hardware, which a shader using them all at their limits would
+       * overflow (see tu5_desc_base()).
+       */
+      props->maxPerStageResources = 158;
       props->maxDescriptorSetSamplers = 96;
-      props->maxDescriptorSetSampledImages = 96;
+      /* as in the stock driver */
+      props->maxDescriptorSetSampledImages = 6 * TU5_MAX_TEXTURES;
       props->maxDescriptorSetUniformBuffers = 72;
       props->maxDescriptorSetUniformBuffersDynamic =
          MIN2(MAX_DYNAMIC_UNIFORM_BUFFERS, TU5_MAX_UBOS - 2);
