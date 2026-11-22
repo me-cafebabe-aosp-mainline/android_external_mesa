@@ -4440,12 +4440,21 @@ tu5_draw_state(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool indexed)
    }
    tu5_emit_vs_params(cmd, cs, prog.vs);
 
-   tu5_emit_user_consts(cmd, cs, vs_shader);
-   tu5_emit_user_consts(cmd, cs, fs_shader);
-   tu5_emit_textures(cmd, cs, vs_shader);
-   tu5_emit_textures(cmd, cs, fs_shader);
-   tu5_emit_ssbos(cmd, cs, fs_shader);
-   tu5_emit_images(cmd, cs, fs_shader);
+   /* What the shaders read through the descriptor sets and the push
+    * constants, again only for other shaders (or after something else
+    * changed it, which writes the program out again too) or other sets or
+    * constants.
+    */
+   if (!same_program ||
+       (cmd->state.dirty &
+        (TU_CMD_DIRTY_DESC_SETS | TU_CMD_DIRTY_SHADER_CONSTS))) {
+      tu5_emit_user_consts(cmd, cs, vs_shader);
+      tu5_emit_user_consts(cmd, cs, fs_shader);
+      tu5_emit_textures(cmd, cs, vs_shader);
+      tu5_emit_textures(cmd, cs, fs_shader);
+      tu5_emit_ssbos(cmd, cs, fs_shader);
+      tu5_emit_images(cmd, cs, fs_shader);
+   }
 
    OUT_PKT4(cs, REG_A5XX_VFD_INDEX_OFFSET, 2);
    OUT_RING(cs, cmd->state.last_vs_params.vertex_offset);

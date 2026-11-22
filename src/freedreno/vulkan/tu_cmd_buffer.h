@@ -633,6 +633,11 @@ struct tu_cmd_state
     * tu5_use_gmem()
     */
    bool a5xx_gmem;
+
+   /* Adreno 5xx: the graphics pipeline vkCmdBindPipeline() bound last, to
+    * bind it again for nothing (Skia binds it before each draw)
+    */
+   const struct tu_pipeline *a5xx_gfx_pipeline;
    bool last_draw_indexed;
 
    struct tu_tess_params tess_params;

@@ -4767,6 +4767,27 @@ tu_bind_descriptor_sets(struct tu_cmd_buffer *cmd,
    struct tu_descriptor_state *descriptors_state =
       tu_get_descriptors_state(cmd, bind_point);
 
+   /* Adreno 5xx: Skia binds the same sets before each draw. What they hold
+    * is written out with the draw, again only if they are other sets, or
+    * the same with other dynamic offsets.
+    */
+   const bool a5xx_gfx = tu_is_a5xx(cmd->device) &&
+                         bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS;
+   bool a5xx_same = a5xx_gfx &&
+                    info->firstSet + info->descriptorSetCount <=
+                    descriptors_state->max_sets_bound;
+   uint32_t a5xx_old_dyn[MAX_DYNAMIC_BUFFERS_SIZE];
+   if (a5xx_same) {
+      for (unsigned i = 0; i < info->descriptorSetCount; i++) {
+         if (descriptors_state->sets[info->firstSet + i] !=
+             tu_descriptor_set_from_handle(info->pDescriptorSets[i]))
+            a5xx_same = false;
+      }
+      if (a5xx_same)
+         memcpy(a5xx_old_dyn, descriptors_state->dynamic_descriptors,
+                sizeof(a5xx_old_dyn));
+   }
+
    descriptors_state->max_sets_bound =
       MAX2(descriptors_state->max_sets_bound,
            info->firstSet + info->descriptorSetCount);
@@ -4883,7 +4904,13 @@ tu_bind_descriptor_sets(struct tu_cmd_buffer *cmd,
    if (dynamic_offset_offset) {
       descriptors_state->max_dynamic_offset_size =
          MAX2(descriptors_state->max_dynamic_offset_size, dynamic_offset_offset);
+   }
 
+   /* Adreno 5xx reads the dynamic descriptors from dynamic_descriptors with
+    * each draw, it has no reserved set for them (reserved_set_idx is -1: the
+    * set_iova[] written below would be the end of dynamic_descriptors).
+    */
+   if (dynamic_offset_offset && !tu_is_a5xx(cmd->device)) {
       /* allocate and fill out dynamic descriptor set */
       struct tu_cs_memory dynamic_desc_set;
       int reserved_set_idx = cmd->device->physical_device->reserved_set_idx;
@@ -4902,6 +4929,11 @@ tu_bind_descriptor_sets(struct tu_cmd_buffer *cmd,
       assert(reserved_set_idx >= 0); /* reserved set must be bound */
       descriptors_state->set_iova[reserved_set_idx] = dynamic_desc_set.iova | BINDLESS_DESCRIPTOR_64B;
    }
+
+   if (a5xx_same &&
+       !memcmp(a5xx_old_dyn, descriptors_state->dynamic_descriptors,
+               sizeof(a5xx_old_dyn)))
+      return;
 
    tu_dirty_desc_sets(cmd, bind_point);
 }
@@ -5529,6 +5561,17 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
    }
 
    assert(pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS);
+
+   /* Binding the pipeline that is bound changes nothing: what of its state
+    * is static, nothing may have set since it was bound
+    * (VUID-vkCmdDraw-None-02859). Copying all of its dynamic state again
+    * is the most of what recording a draw costs where each is bound before.
+    */
+   if (tu_is_a5xx(cmd->device)) {
+      if (cmd->state.a5xx_gfx_pipeline == pipeline)
+         return;
+      cmd->state.a5xx_gfx_pipeline = pipeline;
+   }
 
    struct tu_graphics_pipeline *gfx_pipeline = tu_pipeline_to_graphics(pipeline);
    cmd->state.dirty |= TU_CMD_DIRTY_DESC_SETS | TU_CMD_DIRTY_SHADER_CONSTS |
