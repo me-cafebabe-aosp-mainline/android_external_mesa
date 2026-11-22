@@ -2941,6 +2941,21 @@ emit_intrinsic(struct ir3_context *ctx, nir_intrinsic_instr *intr)
       struct ir3_instruction *offset =
          ir3_RGETPOS(b, ir3_get_src(ctx, &intr->src[0])[0], 0);
       offset->dsts[0]->wrmask = 0x3;
+
+      if (ctx->compiler->gen == 5) {
+         /* a5xx gets no f32 positions (every sample at the same one): get
+          * the f16 ones and convert them, as the blob does
+          */
+         struct ir3_instruction *pos[2];
+
+         offset->cat5.type = TYPE_F16;
+         offset->dsts[0]->flags |= IR3_REG_HALF;
+         ir3_split_dest(b, pos, offset, 0, 2);
+         for (unsigned i = 0; i < 2; i++)
+            dst[i] = ir3_COV(b, pos[i], TYPE_F16, TYPE_F32);
+         break;
+      }
+
       offset->cat5.type = TYPE_F32;
 
       ir3_split_dest(b, dst, offset, 0, 2);
@@ -3079,6 +3094,22 @@ emit_intrinsic(struct ir3_context *ctx, nir_intrinsic_instr *intr)
             create_sysval_input(ctx, SYSTEM_VALUE_SAMPLE_MASK_IN, 0x1);
       }
       dst[0] = ctx->samp_mask_in;
+
+      /* a5xx gives the coverage of the pixel to the invocations of each
+       * sample too: keep the bit of the sample, as the blob does
+       */
+      if (ctx->compiler->gen == 5 &&
+          (ctx->so->key.sample_shading || ctx->s->info.fs.uses_sample_shading)) {
+         if (!ctx->samp_id) {
+            ctx->samp_id = create_sysval_input(ctx, SYSTEM_VALUE_SAMPLE_ID, 0x1);
+            ctx->samp_id->dsts[0]->flags |= IR3_REG_HALF;
+         }
+         struct ir3_instruction *id =
+            ir3_COV(b, ctx->samp_id, TYPE_U16, TYPE_U32);
+         struct ir3_instruction *bit =
+            ir3_SHL_B(b, create_immed(b, 1), 0, id, 0);
+         dst[0] = ir3_AND_B(b, ctx->samp_mask_in, 0, bit, 0);
+      }
       break;
    case nir_intrinsic_load_user_clip_plane:
       idx = nir_intrinsic_ucp_id(intr);
