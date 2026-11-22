@@ -2255,6 +2255,84 @@ tu5_emit_blit_src(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 }
 
 /* The colour targets of the subpass */
+/* GMEM: where an attachment is in GMEM, as a surface of a tile */
+static struct tu5_surf
+tu5_gmem_surf(const struct tu_cmd_buffer *cmd, uint32_t a, bool stencil)
+{
+   const struct tu_render_pass_attachment *att = &cmd->state.pass->attachments[a];
+   const VkExtent2D tile0 = cmd->state.tiling->tile0;
+   enum pipe_format format = vk_format_to_pipe_format(att->format);
+   uint32_t cpp = att->cpp;
+   uint32_t offset = att->gmem_offset[TU_GMEM_LAYOUT_FULL];
+
+   if (att->format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+      if (stencil) {
+         format = PIPE_FORMAT_S8_UINT;
+         cpp = 1;
+         offset = att->gmem_offset_stencil[TU_GMEM_LAYOUT_FULL];
+      } else {
+         format = PIPE_FORMAT_Z32_FLOAT;
+         cpp = 4;
+      }
+   }
+
+   return (struct tu5_surf) {
+      .format = format,
+      .iova = offset,
+      .width = tile0.width,
+      .height = tile0.height,
+      .pitch = tile0.width * cpp,
+      .layer_size = tile0.width * cpp * tile0.height,
+      .tile_mode = TILE5_2,
+      .samples = 1,
+   };
+}
+
+/* GMEM: the depth and stencil buffers of an attachment in GMEM */
+static void
+tu5_emit_zs_gmem(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t a)
+{
+   const struct tu_render_pass_attachment *att = &cmd->state.pass->attachments[a];
+   struct tu5_surf z = tu5_gmem_surf(cmd, a, false);
+   enum a5xx_depth_format fmt = fd5_pipe2depth(z.format);
+
+   OUT_PKT4(cs, REG_A5XX_RB_DEPTH_BUFFER_INFO, 5);
+   OUT_RING(cs, A5XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(fmt));
+   tu_cs_emit_qw(cs, z.iova);
+   OUT_RING(cs, A5XX_RB_DEPTH_BUFFER_PITCH(z.pitch));
+   OUT_RING(cs, A5XX_RB_DEPTH_BUFFER_ARRAY_PITCH(z.layer_size));
+
+   OUT_PKT4(cs, REG_A5XX_GRAS_SU_DEPTH_BUFFER_INFO, 1);
+   OUT_RING(cs, A5XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(fmt));
+
+   OUT_PKT4(cs, REG_A5XX_RB_DEPTH_FLAG_BUFFER_BASE_LO, 3);
+   OUT_RING(cs, 0x00000000);
+   OUT_RING(cs, 0x00000000);
+   OUT_RING(cs, 0x00000000);
+
+   OUT_PKT4(cs, REG_A5XX_GRAS_LRZ_BUFFER_BASE_LO, 3);
+   OUT_RING(cs, 0x00000000);
+   OUT_RING(cs, 0x00000000);
+   OUT_RING(cs, 0x00000000);
+
+   OUT_PKT4(cs, REG_A5XX_GRAS_LRZ_FAST_CLEAR_BUFFER_BASE_LO, 2);
+   OUT_RING(cs, 0x00000000);
+   OUT_RING(cs, 0x00000000);
+
+   if (att->format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+      struct tu5_surf st = tu5_gmem_surf(cmd, a, true);
+
+      OUT_PKT4(cs, REG_A5XX_RB_STENCIL_INFO, 5);
+      OUT_RING(cs, A5XX_RB_STENCIL_INFO_SEPARATE_STENCIL);
+      tu_cs_emit_qw(cs, st.iova);
+      OUT_RING(cs, A5XX_RB_STENCIL_PITCH(st.pitch));
+      OUT_RING(cs, A5XX_RB_STENCIL_ARRAY_PITCH(st.layer_size));
+   } else {
+      OUT_PKT4(cs, REG_A5XX_RB_STENCIL_INFO, 1);
+      OUT_RING(cs, 0x00000000);
+   }
+}
+
 static void
 tu5_emit_mrt(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t layer)
 {
@@ -2264,14 +2342,19 @@ tu5_emit_mrt(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t layer)
    for (unsigned i = 0; i < A5XX_MAX_RENDER_TARGETS; i++) {
       if (i < subpass->color_count &&
           subpass->color_attachments[i].attachment != VK_ATTACHMENT_UNUSED) {
-         const struct tu_image_view *iview =
-            cmd->state.attachments[subpass->color_attachments[i].attachment];
+         uint32_t a = subpass->color_attachments[i].attachment;
+         struct tu5_surf surf;
 
-         struct tu5_surf surf =
-            tu5_image_surf(iview->image, 0,
-                           vk_format_to_pipe_format(iview->vk.format),
-                           iview->vk.base_mip_level,
-                           iview->vk.base_array_layer + layer);
+         if (cmd->state.a5xx_gmem) {
+            surf = tu5_gmem_surf(cmd, a, false);
+         } else {
+            const struct tu_image_view *iview = cmd->state.attachments[a];
+
+            surf = tu5_image_surf(iview->image, 0,
+                                  vk_format_to_pipe_format(iview->vk.format),
+                                  iview->vk.base_mip_level,
+                                  iview->vk.base_array_layer + layer);
+         }
 
          tu5_emit_mrt_surf(cs, i, &surf);
          components |= 0xf << (i * 4);
@@ -2359,7 +2442,9 @@ tu5_emit_zs(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t layer)
 {
    uint32_t a = cmd->state.subpass->depth_stencil_attachment.attachment;
 
-   if (a != VK_ATTACHMENT_UNUSED) {
+   if (a != VK_ATTACHMENT_UNUSED && cmd->state.a5xx_gmem) {
+      tu5_emit_zs_gmem(cmd, cs, a);
+   } else if (a != VK_ATTACHMENT_UNUSED) {
       const struct tu_image_view *iview = cmd->state.attachments[a];
 
       tu5_emit_zs_surface(cs, iview->image, iview->vk.base_mip_level,
@@ -3525,6 +3610,317 @@ tu5_clear_attachments(struct tu_cmd_buffer *cmd, uint32_t attachment_count,
    }
 }
 
+/* GMEM: the clears of the attachments that the subpass that starts uses
+ * first, drawn into them as they are bound, in each tile
+ */
+static void
+tu5_emit_gmem_clears(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+{
+   const struct tu_render_pass *pass = cmd->state.pass;
+   const struct tu_subpass *subpass = cmd->state.subpass;
+   const struct tu_framebuffer *fb = cmd->state.framebuffer;
+   uint32_t subpass_idx = subpass - pass->subpasses;
+
+   for (uint32_t a = 0; a < pass->attachment_count; a++) {
+      const struct tu_render_pass_attachment *att = &pass->attachments[a];
+
+      if (!att->clear_mask || att->first_subpass_idx != subpass_idx)
+         continue;
+
+      if (a == subpass->depth_stencil_attachment.attachment) {
+         VkImageAspectFlags aspects = att->clear_mask;
+
+         if (aspects & VK_IMAGE_ASPECT_COLOR_BIT)
+            aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
+         tu5_clear_rect(cmd, cs, -1, aspects, &cmd->state.clear_values[a],
+                        cmd->state.render_area, fb->width, fb->height);
+         continue;
+      }
+
+      for (unsigned i = 0; i < subpass->color_count; i++) {
+         if (subpass->color_attachments[i].attachment != a)
+            continue;
+         tu5_clear_rect(cmd, cs, i, VK_IMAGE_ASPECT_COLOR_BIT,
+                        &cmd->state.clear_values[a], cmd->state.render_area,
+                        fb->width, fb->height);
+      }
+   }
+}
+
+/* Whether a render pass that begins draws to GMEM, tile by tile: for now,
+ * not those with multisampling, input attachments, resolves, layers or
+ * views, which read or write their attachments in memory.
+ */
+bool
+tu5_use_gmem(struct tu_cmd_buffer *cmd)
+{
+   const struct tu_render_pass *pass = cmd->state.pass;
+   const struct tu_framebuffer *fb = cmd->state.framebuffer;
+
+   if (TU_DEBUG(SYSMEM))
+      return false;
+   if (cmd->state.gmem_layout != TU_GMEM_LAYOUT_FULL ||
+       !cmd->state.tiling->possible)
+      return false;
+   if (fb->layers > 1 || pass->num_views)
+      return false;
+
+   for (uint32_t i = 0; i < pass->subpass_count; i++) {
+      const struct tu_subpass *subpass = &pass->subpasses[i];
+
+      if (subpass->samples > VK_SAMPLE_COUNT_1_BIT || subpass->input_count ||
+          subpass->resolve_attachments || subpass->multiview_mask)
+         return false;
+   }
+
+   for (uint32_t a = 0; a < pass->attachment_count; a++) {
+      const struct tu_render_pass_attachment *att = &pass->attachments[a];
+
+      if (att->samples > VK_SAMPLE_COUNT_1_BIT ||
+          att->format == VK_FORMAT_S8_UINT)
+         return false;
+      if (!att->gmem && (att->load || att->store || att->clear_mask))
+         return false;
+   }
+
+   return true;
+}
+
+/* GMEM: an attachment of the tile, out of memory or into it, by a blit of
+ * the resolve engine: the memory side bound as the colour target 0, or as
+ * the depth or the stencil buffer, the GMEM side the destination.
+ */
+static void
+tu5_gmem_blit(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t a,
+              bool stencil, bool store)
+{
+   const struct tu_render_pass_attachment *att = &cmd->state.pass->attachments[a];
+   const struct tu_image_view *iview = cmd->state.attachments[a];
+   const struct tu_image *image = iview->image;
+   struct tu5_surf gmem = tu5_gmem_surf(cmd, a, stencil);
+   const bool zs = vk_format_is_depth_or_stencil(att->format);
+   const unsigned plane = (att->format == VK_FORMAT_D32_SFLOAT_S8_UINT && stencil) ? 1 : 0;
+   const struct fdl_layout *layout = &image->layout[plane];
+   uint32_t level = iview->vk.base_mip_level;
+   uint32_t layer = iview->vk.base_array_layer;
+   uint64_t mem = image->iova + fdl_surface_offset(layout, level, layer);
+   enum a5xx_blit_buf buf = BLIT_MRT0;
+
+   if (!store) {
+      /* the memory side as the colour target 0: depth as colour of its size,
+       * as the Gallium driver has it
+       */
+      enum pipe_format format = gmem.format;
+
+      if (zs) {
+         switch (gmem.format) {
+         case PIPE_FORMAT_Z16_UNORM:
+            format = PIPE_FORMAT_R8G8_UNORM;
+            break;
+         case PIPE_FORMAT_S8_UINT:
+            format = PIPE_FORMAT_R8_UNORM;
+            break;
+         case PIPE_FORMAT_Z32_FLOAT:
+            format = PIPE_FORMAT_R32_FLOAT;
+            break;
+         default:
+            format = PIPE_FORMAT_R8G8B8A8_UNORM;
+            break;
+         }
+      }
+
+      OUT_PKT4(cs, REG_A5XX_RB_MRT_BUF_INFO(0), 5);
+      OUT_RING(cs, A5XX_RB_MRT_BUF_INFO_COLOR_FORMAT(fd5_pipe2color(format)) |
+                      A5XX_RB_MRT_BUF_INFO_COLOR_TILE_MODE(
+                         (enum a5xx_tile_mode)fdl_tile_mode(layout, level)) |
+                      A5XX_RB_MRT_BUF_INFO_COLOR_SWAP(zs ? WZYX : fd5_pipe2swap(format)));
+      OUT_RING(cs, A5XX_RB_MRT_PITCH(fdl_pitch(layout, level)));
+      OUT_RING(cs, A5XX_RB_MRT_ARRAY_PITCH(fdl_layer_stride(layout, level)));
+      tu_cs_emit_qw(cs, mem);
+
+      OUT_PKT4(cs, REG_A5XX_RB_BLIT_FLAG_DST_LO, 4);
+      OUT_RING(cs, 0x00000000);
+      OUT_RING(cs, 0x00000000);
+      OUT_RING(cs, 0x00000000);
+      OUT_RING(cs, 0x00000000);
+
+      OUT_PKT4(cs, REG_A5XX_RB_RESOLVE_CNTL_3, 5);
+      OUT_RING(cs, 0x00000000);
+      tu_cs_emit_qw(cs, gmem.iova);
+      OUT_RING(cs, A5XX_RB_BLIT_DST_PITCH(gmem.pitch));
+      OUT_RING(cs, A5XX_RB_BLIT_DST_ARRAY_PITCH(gmem.layer_size));
+   } else {
+      /* the GMEM side bound, the memory side the destination */
+      if (zs) {
+         if (stencil) {
+            OUT_PKT4(cs, REG_A5XX_RB_STENCIL_INFO, 5);
+            OUT_RING(cs, A5XX_RB_STENCIL_INFO_SEPARATE_STENCIL);
+            tu_cs_emit_qw(cs, gmem.iova);
+            OUT_RING(cs, A5XX_RB_STENCIL_PITCH(gmem.pitch));
+            OUT_RING(cs, A5XX_RB_STENCIL_ARRAY_PITCH(gmem.layer_size));
+            buf = BLIT_S;
+         } else {
+            tu5_emit_zs_gmem(cmd, cs, a);
+            buf = BLIT_ZS;
+         }
+      } else {
+         tu5_emit_mrt_surf(cs, 0, &gmem);
+      }
+
+      OUT_PKT4(cs, REG_A5XX_RB_BLIT_FLAG_DST_LO, 4);
+      OUT_RING(cs, 0x00000000);
+      OUT_RING(cs, 0x00000000);
+      OUT_RING(cs, 0x00000000);
+      OUT_RING(cs, 0x00000000);
+
+      OUT_PKT4(cs, REG_A5XX_RB_RESOLVE_CNTL_3, 5);
+      OUT_RING(cs, 0x00000004 |
+                      COND(fdl_tile_mode(layout, level), A5XX_RB_RESOLVE_CNTL_3_TILED));
+      tu_cs_emit_qw(cs, mem);
+      OUT_RING(cs, A5XX_RB_BLIT_DST_PITCH(fdl_pitch(layout, level)));
+      OUT_RING(cs, A5XX_RB_BLIT_DST_ARRAY_PITCH(fdl_layer_stride(layout, level)));
+
+      OUT_PKT4(cs, REG_A5XX_RB_CLEAR_CNTL, 1);
+      OUT_RING(cs, 0x00000000);
+   }
+
+   OUT_PKT4(cs, REG_A5XX_RB_BLIT_CNTL, 1);
+   OUT_RING(cs, A5XX_RB_BLIT_CNTL_BUF(buf));
+
+   tu5_event_write(cmd, cs, BLIT, true);
+}
+
+/* GMEM: the render pass, tile by tile: the loads, the draw stream, the stores */
+static void
+tu5_cmd_render_gmem(struct tu_cmd_buffer *cmd)
+{
+   const struct tu_framebuffer *fb = cmd->state.framebuffer;
+   const struct tu_render_pass *pass = cmd->state.pass;
+   const struct tu_tiling_config *tiling = cmd->state.tiling;
+   const VkRect2D *ra = &cmd->state.render_area;
+   const VkExtent2D tile0 = tiling->tile0;
+   struct tu_cs *cs = &cmd->cs;
+   const struct fd_dev_info *info = cmd->device->physical_device->info;
+
+   cmd->state.a5xx_vs = cmd->state.a5xx_fs = NULL;
+
+   tu5_set_render_mode(cs, BYPASS);
+   tu5_cache_flush(cs);
+   tu5_emit_lrz_flush(cmd, cs);
+
+   OUT_PKT4(cs, REG_A5XX_GRAS_CL_CNTL, 1);
+   OUT_RING(cs, 0x00000080);
+
+   OUT_PKT7(cs, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
+   OUT_RING(cs, 0x0);
+
+   OUT_PKT4(cs, REG_A5XX_PC_POWER_CNTL, 1);
+   OUT_RING(cs, info->num_sp_cores - 1);
+   OUT_PKT4(cs, REG_A5XX_VFD_POWER_CNTL, 1);
+   OUT_RING(cs, info->num_sp_cores - 1);
+
+   /* 0x10000000 for BYPASS.. 0x7c13c080 for GMEM: */
+   tu_cs_emit_wfi(cs);
+   OUT_PKT4(cs, REG_A5XX_RB_CCU_CNTL, 1);
+   OUT_RING(cs, 0x7c13c080);
+
+   OUT_PKT4(cs, REG_A5XX_VPC_SO_OVERRIDE, 1);
+   OUT_RING(cs, 0);
+
+   tu5_set_render_mode(cs, GMEM);
+
+   /* the tiles the render area covers */
+   uint32_t tx0 = ra->offset.x / tile0.width;
+   uint32_t ty0 = ra->offset.y / tile0.height;
+   uint32_t tx1 = DIV_ROUND_UP(ra->offset.x + ra->extent.width, tile0.width);
+   uint32_t ty1 = DIV_ROUND_UP(ra->offset.y + ra->extent.height, tile0.height);
+
+   for (uint32_t ty = ty0; ty < ty1; ty++) {
+      for (uint32_t tx = tx0; tx < tx1; tx++) {
+         uint32_t x1 = tx * tile0.width, y1 = ty * tile0.height;
+         uint32_t x2 = MIN2(x1 + tile0.width, fb->width) - 1;
+         uint32_t y2 = MIN2(y1 + tile0.height, fb->height) - 1;
+
+         /* what the stores write, the render area of the tile */
+         uint32_t rx1 = MAX2(x1, (uint32_t)ra->offset.x);
+         uint32_t ry1 = MAX2(y1, (uint32_t)ra->offset.y);
+         uint32_t rx2 = MIN2(x2, ra->offset.x + ra->extent.width - 1);
+         uint32_t ry2 = MIN2(y2, ra->offset.y + ra->extent.height - 1);
+
+         OUT_PKT4(cs, REG_A5XX_GRAS_SC_WINDOW_SCISSOR_TL, 2);
+         OUT_RING(cs, A5XX_GRAS_SC_WINDOW_SCISSOR_TL_X(x1) |
+                         A5XX_GRAS_SC_WINDOW_SCISSOR_TL_Y(y1));
+         OUT_RING(cs, A5XX_GRAS_SC_WINDOW_SCISSOR_BR_X(x2) |
+                         A5XX_GRAS_SC_WINDOW_SCISSOR_BR_Y(y2));
+
+         OUT_PKT4(cs, REG_A5XX_RB_RESOLVE_CNTL_1, 2);
+         OUT_RING(cs, A5XX_RB_RESOLVE_CNTL_1_X(x1) | A5XX_RB_RESOLVE_CNTL_1_Y(y1));
+         OUT_RING(cs, A5XX_RB_RESOLVE_CNTL_2_X(x2) | A5XX_RB_RESOLVE_CNTL_2_Y(y2));
+
+         OUT_PKT7(cs, CP_SET_VISIBILITY_OVERRIDE, 1);
+         OUT_RING(cs, 0x1);
+
+         OUT_PKT4(cs, REG_A5XX_RB_WINDOW_OFFSET, 1);
+         OUT_RING(cs, A5XX_RB_WINDOW_OFFSET_X(x1) | A5XX_RB_WINDOW_OFFSET_Y(y1));
+
+         /* the loads */
+         OUT_PKT4(cs, REG_A5XX_RB_CNTL, 1);
+         OUT_RING(cs, A5XX_RB_CNTL_WIDTH(tile0.width) |
+                         A5XX_RB_CNTL_HEIGHT(tile0.height) | A5XX_RB_CNTL_BYPASS);
+
+         for (uint32_t a = 0; a < pass->attachment_count; a++) {
+            const struct tu_render_pass_attachment *att = &pass->attachments[a];
+
+            if (!att->gmem)
+               continue;
+            if (att->load)
+               tu5_gmem_blit(cmd, cs, a, false, false);
+            if (att->load_stencil)
+               tu5_gmem_blit(cmd, cs, a, true, false);
+         }
+
+         /* the draws, which bind the attachments in GMEM at the start of
+          * each subpass
+          */
+         OUT_PKT4(cs, REG_A5XX_RB_CNTL, 1);
+         OUT_RING(cs, A5XX_RB_CNTL_WIDTH(tile0.width) |
+                         A5XX_RB_CNTL_HEIGHT(tile0.height));
+
+         tu_cs_emit_call(cs, &cmd->draw_cs);
+
+         /* the stores, of the render area alone */
+         OUT_PKT4(cs, REG_A5XX_RB_RESOLVE_CNTL_1, 2);
+         OUT_RING(cs, A5XX_RB_RESOLVE_CNTL_1_X(rx1) | A5XX_RB_RESOLVE_CNTL_1_Y(ry1));
+         OUT_RING(cs, A5XX_RB_RESOLVE_CNTL_2_X(rx2) | A5XX_RB_RESOLVE_CNTL_2_Y(ry2));
+
+         for (uint32_t a = 0; a < pass->attachment_count; a++) {
+            const struct tu_render_pass_attachment *att = &pass->attachments[a];
+
+            if (!att->gmem)
+               continue;
+            if (att->store)
+               tu5_gmem_blit(cmd, cs, a, false, true);
+            if (att->store_stencil)
+               tu5_gmem_blit(cmd, cs, a, true, true);
+         }
+      }
+   }
+
+   OUT_PKT7(cs, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
+   OUT_RING(cs, 0x0);
+   tu5_emit_lrz_flush(cmd, cs);
+   tu5_cache_flush(cs);
+   tu5_set_render_mode(cs, BYPASS);
+
+   /* the state after, as after the render passes in memory */
+   tu5_sysmem_begin(cmd, cs, fb->width, fb->height);
+
+   /* what the queries of the render pass end with */
+   tu_cs_emit_call(cs, &cmd->draw_epilogue_cs);
+
+   tu5_sysmem_end(cmd, cs);
+}
+
 void
 tu5_emit_subpass_begin(struct tu_cmd_buffer *cmd)
 {
@@ -3533,11 +3929,19 @@ tu5_emit_subpass_begin(struct tu_cmd_buffer *cmd)
 
    struct tu_cs *cs = &cmd->draw_cs;
 
-   tu5_emit_load_clears(cmd, cs);
+   if (cmd->state.a5xx_gmem) {
+      /* the clears are into the attachments in GMEM, as they are bound */
+      tu5_emit_zs(cmd, cs, 0);
+      tu5_emit_mrt(cmd, cs, 0);
+      tu5_emit_msaa(cs, cmd->state.subpass->samples);
+      tu5_emit_gmem_clears(cmd, cs);
+   } else {
+      tu5_emit_load_clears(cmd, cs);
 
-   tu5_emit_zs(cmd, cs, 0);
-   tu5_emit_mrt(cmd, cs, 0);
-   tu5_emit_msaa(cs, cmd->state.subpass->samples);
+      tu5_emit_zs(cmd, cs, 0);
+      tu5_emit_mrt(cmd, cs, 0);
+      tu5_emit_msaa(cs, cmd->state.subpass->samples);
+   }
 
    OUT_PKT4(cs, REG_A5XX_RB_RENDER_CNTL, 1);
    OUT_RING(cs, 0x00000008);
@@ -3554,6 +3958,11 @@ tu5_cmd_render(struct tu_cmd_buffer *cmd)
 {
    const struct tu_framebuffer *fb = cmd->state.framebuffer;
    struct tu_cs *cs = &cmd->cs;
+
+   if (cmd->state.a5xx_gmem) {
+      tu5_cmd_render_gmem(cmd);
+      return;
+   }
 
    tu5_sysmem_begin(cmd, cs, fb->width, fb->height);
    tu_cs_emit_call(cs, &cmd->draw_cs);

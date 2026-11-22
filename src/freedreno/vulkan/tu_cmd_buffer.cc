@@ -7093,6 +7093,8 @@ tu_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
    }
 
    tu_choose_gmem_layout(cmd);
+   if (tu_is_a5xx(cmd->device))
+      cmd->state.a5xx_gmem = tu5_use_gmem(cmd);
 
    /* Note: because this is external, any flushes will happen before draw_cs
     * gets called. However deferred flushes could have to happen later as part
@@ -7302,6 +7304,8 @@ tu_CmdBeginRendering(VkCommandBuffer commandBuffer,
    }
 
    tu_choose_gmem_layout(cmd);
+   /* Adreno 5xx: the dynamic render passes are drawn in memory */
+   cmd->state.a5xx_gmem = false;
 
    cmd->state.renderpass_cache.pending_flush_bits =
       cmd->state.cache.pending_flush_bits;

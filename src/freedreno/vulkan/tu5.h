@@ -48,6 +48,9 @@ bool tu5_format_tileable(enum pipe_format format);
 void tu5_pack_border_color(void *entry, const VkClearColorValue *val,
                            bool is_int);
 
+/* GMEM */
+bool tu5_use_gmem(struct tu_cmd_buffer *cmd);
+
 /* Multiview */
 uint32_t tu5_views(const struct tu_cmd_buffer *cmd);
 void tu5_bind_view(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t view);

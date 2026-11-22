@@ -628,6 +628,11 @@ struct tu_cmd_state
     */
    const struct tu_shader *a5xx_vs, *a5xx_fs;
    unsigned a5xx_max_loc;
+
+   /* Adreno 5xx: whether the render pass draws to GMEM, tile by tile, see
+    * tu5_use_gmem()
+    */
+   bool a5xx_gmem;
    bool last_draw_indexed;
 
    struct tu_tess_params tess_params;
