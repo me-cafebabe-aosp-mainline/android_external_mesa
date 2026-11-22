@@ -1834,8 +1834,11 @@ tu5_program_emit(struct tu_cs *ring, struct tu5_program *emit)
                      A5XX_VPC_CLIP_CNTL_CLIP_DIST_03_LOC(clip0_loc) |
                      A5XX_VPC_CLIP_CNTL_CLIP_DIST_47_LOC(clip1_loc));
 
+   /* the cull distances too, as the stock driver has it: the GPU hangs on
+    * 4 cull distances or more otherwise
+    */
    OUT_PKT4(ring, REG_A5XX_PC_CLIP_CNTL, 1);
-   OUT_RING(ring, A5XX_PC_CLIP_CNTL_CLIP_MASK(clip_mask));
+   OUT_RING(ring, A5XX_PC_CLIP_CNTL_CLIP_MASK(clip_cull_mask));
 
    if (!emit->binning_pass)
       if (s[FS].instrlen)
