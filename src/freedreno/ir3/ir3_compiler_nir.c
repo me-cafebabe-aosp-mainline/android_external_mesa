@@ -1740,14 +1740,6 @@ emit_intrinsic_load_image(struct ir3_context *ctx, nir_intrinsic_instr *intr,
       return;
    }
 
-   /* Adreno 5xx has 16 texture slots a stage, which the sampled images may
-    * take all of: read the images as they are written.
-    */
-   if (ctx->compiler->gen == 5) {
-      ctx->funcs->emit_intrinsic_load_image(ctx, intr, dst);
-      return;
-   }
-
    /* The sparse set of texture descriptors for non-coherent load_images means we can't do indirection, so
     * fall back to coherent load.
     */

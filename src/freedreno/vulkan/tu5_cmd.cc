@@ -324,13 +324,37 @@ tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                   const struct tu_shader *shader)
 {
    const struct tu5_desc_map *map = &shader->const_state.a5xx;
+   const struct ir3_ibo_mapping *m = &shader->variant->image_mapping;
    unsigned num_tex = map->count[TU5_DESC_TEXTURE];
    unsigned num_samp = map->count[TU5_DESC_SAMPLER];
    uint32_t *samp_map, *tex_map;
 
-   if (!tu5_emit_tex_tables(cmd, cs, shader->variant->type, num_samp, num_tex,
+   /* The storage images that are only read are read as textures, after the
+    * others.
+    */
+   unsigned num_slots = num_tex;
+
+   for (unsigned i = 0; i < map->count[TU5_DESC_IMAGE]; i++) {
+      if (m->image_to_tex[i] != IBO_INVALID)
+         num_slots = MAX2(num_slots, m->tex_base + m->image_to_tex[i] + 1);
+   }
+
+   if (!tu5_emit_tex_tables(cmd, cs, shader->variant->type, num_samp, num_slots,
                             &samp_map, &tex_map))
       return;
+
+   for (unsigned i = 0; i < map->count[TU5_DESC_IMAGE]; i++) {
+      if (m->image_to_tex[i] == IBO_INVALID)
+         continue;
+
+      const uint32_t *desc = tu5_descriptor(cmd, shader, &map->image[i]);
+
+      /* see tu5_image_view_storage_descriptor() */
+      if (desc) {
+         memcpy(&tex_map[(m->tex_base + m->image_to_tex[i]) * 16], desc,
+                6 * sizeof(uint32_t));
+      }
+   }
 
    for (unsigned i = 0; i < num_samp; i++) {
       const uint32_t *desc = tu5_descriptor(cmd, shader, &map->samp[i]);
@@ -467,9 +491,7 @@ tu5_emit_images(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       if (!desc)
          desc = none;
 
-      /* these are read as they are written, see emit_intrinsic_load_image():
-       * no texture
-       */
+      /* those read as textures are in the tables of tu5_emit_textures() */
 
       OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 2);
       OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(v->num_ssbos + i) |

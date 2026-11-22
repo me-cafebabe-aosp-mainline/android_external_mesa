@@ -48,7 +48,7 @@ struct tu_push_constant_range
  * the samplers and the uniform buffers it uses, and these are where the
  * descriptor of each number is, to be written out with the draws.
  */
-#define TU5_MAX_TEXTURES 32
+#define TU5_MAX_TEXTURES 24
 #define TU5_MAX_SAMPLERS 16
 #define TU5_MAX_UBOS     32
 #define TU5_MAX_SSBOS    16
