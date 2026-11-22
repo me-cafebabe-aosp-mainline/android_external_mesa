@@ -968,6 +968,8 @@ tu_get_features(struct tu_physical_device *pdevice,
       features->textureCompressionBC = true;
       features->samplerMirrorClampToEdge = true;
       features->fragmentStoresAndAtomics = true;
+      features->multiDrawIndirect = true;
+      features->occlusionQueryPrecise = true;
    }
 }
 

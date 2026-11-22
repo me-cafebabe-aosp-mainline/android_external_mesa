@@ -9,6 +9,8 @@
 #include "tu_query_pool.h"
 #include "perfcntrs/freedreno_perfcntr.h"
 
+#include "tu5.h"
+
 #include <fcntl.h>
 
 #include "nir/nir_builder.h"
@@ -1084,12 +1086,18 @@ emit_begin_occlusion_query(struct tu_cmd_buffer *cmdbuf,
 
    uint64_t begin_iova = occlusion_query_iova(pool, query, begin);
 
-   tu_cs_emit_regs(cs,
-                   A6XX_RB_SAMPLE_COUNTER_CNTL(.copy = true));
+   if (!tu_is_a5xx(cmdbuf->device)) {
+      tu_cs_emit_regs(cs,
+                      A6XX_RB_SAMPLE_COUNTER_CNTL(.copy = true));
+   }
 
    if (!cmdbuf->device->physical_device->info->props.has_event_write_sample_count) {
-      tu_cs_emit_regs(cs,
-                        A6XX_RB_SAMPLE_COUNTER_BASE(.qword = begin_iova));
+      if (tu_is_a5xx(cmdbuf->device)) {
+         tu5_emit_sample_count_addr(cs, begin_iova);
+      } else {
+         tu_cs_emit_regs(cs,
+                           A6XX_RB_SAMPLE_COUNTER_BASE(.qword = begin_iova));
+      }
       tu_cs_emit_pkt7(cs, CP_EVENT_WRITE, 1);
       tu_cs_emit(cs, ZPASS_DONE);
       if (CHIP == A7XX) {
@@ -1516,12 +1524,18 @@ emit_end_occlusion_query(struct tu_cmd_buffer *cmdbuf,
       tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
    }
 
-   tu_cs_emit_regs(cs,
-                   A6XX_RB_SAMPLE_COUNTER_CNTL(.copy = true));
+   if (!tu_is_a5xx(cmdbuf->device)) {
+      tu_cs_emit_regs(cs,
+                      A6XX_RB_SAMPLE_COUNTER_CNTL(.copy = true));
+   }
 
    if (!cmdbuf->device->physical_device->info->props.has_event_write_sample_count) {
-      tu_cs_emit_regs(cs,
-                        A6XX_RB_SAMPLE_COUNTER_BASE(.qword = end_iova));
+      if (tu_is_a5xx(cmdbuf->device)) {
+         tu5_emit_sample_count_addr(cs, end_iova);
+      } else {
+         tu_cs_emit_regs(cs,
+                           A6XX_RB_SAMPLE_COUNTER_BASE(.qword = end_iova));
+      }
       tu_cs_emit_pkt7(cs, CP_EVENT_WRITE, 1);
       tu_cs_emit(cs, ZPASS_DONE);
       if (CHIP == A7XX) {
@@ -2121,7 +2135,9 @@ tu_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
    }
 
    tu_cs_emit_pkt7(cs, CP_REG_TO_MEM, 3);
-   tu_cs_emit(cs, CP_REG_TO_MEM_0_REG(__CP_ALWAYS_ON_COUNTER<CHIP>({}).reg) |
+   tu_cs_emit(cs, CP_REG_TO_MEM_0_REG(tu_is_a5xx(cmd->device)
+                                           ? tu5_always_on_counter_reg()
+                                           : __CP_ALWAYS_ON_COUNTER<CHIP>({}).reg) |
                   CP_REG_TO_MEM_0_CNT(2) |
                   CP_REG_TO_MEM_0_64B);
    tu_cs_emit_qw(cs, query_result_iova(pool, query, uint64_t, 0));

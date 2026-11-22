@@ -596,6 +596,89 @@ tu5_emit_user_consts(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    }
 }
 
+/* For the occlusion queries: where the count of the samples that passed is
+ * to be copied by the event that follows.
+ */
+void
+tu5_emit_sample_count_addr(struct tu_cs *cs, uint64_t iova)
+{
+   OUT_PKT4(cs, REG_A5XX_RB_SAMPLE_COUNT_CONTROL, 1);
+   OUT_RING(cs, A5XX_RB_SAMPLE_COUNT_CONTROL_COPY);
+
+   OUT_PKT4(cs, REG_A5XX_RB_SAMPLE_COUNT_ADDR_LO, 2);
+   tu_cs_emit_qw(cs, iova);
+}
+
+/* For the timestamp queries: the low half of the 64 bit counter */
+uint32_t
+tu5_always_on_counter_reg(void)
+{
+   return REG_A5XX_RBBM_ALWAYSON_COUNTER_LO;
+}
+
+/* vkCmdDrawIndirect(), vkCmdDrawIndexedIndirect(): after the state of the
+ * draw, a draw for each of the structures of the buffer. What the vertex
+ * shader reads of them as constants is copied to where these are loaded from.
+ */
+void
+tu5_draw_indirect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                  uint32_t initiator, bool indexed, uint64_t iova,
+                  uint32_t count, uint32_t stride)
+{
+   const struct ir3_shader_variant *vs =
+      cmd->state.shaders[MESA_SHADER_VERTEX]->variant;
+   uint32_t param = ir3_const_state(vs)->offsets.driver_param;
+   uint64_t tmp = global_iova_arr(cmd, cs_indirect_xyz, 0);
+
+   for (uint32_t i = 0; i < count; i++, iova += stride) {
+      if (param < vs->constlen) {
+         /* the first vertex, then the first instance */
+         uint64_t first = iova + (indexed ? 3 : 2) * sizeof(uint32_t);
+         uint32_t id[4] = {};
+
+         id[IR3_DP_VS(draw_id)] = i;
+
+         tu_cs_emit_wfi(cs);
+         OUT_PKT7(cs, CP_MEM_WRITE, 2 + 4);
+         tu_cs_emit_qw(cs, tmp);
+         tu_cs_emit_array(cs, id, 4);
+
+         OUT_PKT7(cs, CP_MEM_TO_MEM, 5);
+         OUT_RING(cs, 0x00000000);
+         tu_cs_emit_qw(cs, tmp + IR3_DP_VS(vtxid_base) * sizeof(uint32_t));
+         tu_cs_emit_qw(cs, first);
+
+         OUT_PKT7(cs, CP_MEM_TO_MEM, 5);
+         OUT_RING(cs, 0x00000000);
+         tu_cs_emit_qw(cs, tmp + IR3_DP_VS(instid_base) * sizeof(uint32_t));
+         tu_cs_emit_qw(cs, first + sizeof(uint32_t));
+         tu_cs_emit_wfi(cs);
+
+         OUT_PKT7(cs, CP_LOAD_STATE4, 3);
+         OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(param) |
+                         CP_LOAD_STATE4_0_STATE_SRC(SS4_INDIRECT) |
+                         CP_LOAD_STATE4_0_STATE_BLOCK(SB4_VS_SHADER) |
+                         CP_LOAD_STATE4_0_NUM_UNIT(1));
+         OUT_RING(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
+                         (uint32_t)tmp);
+         OUT_RING(cs, (uint32_t)(tmp >> 32));
+      }
+
+      if (indexed) {
+         OUT_PKT7(cs, CP_DRAW_INDX_INDIRECT, 6);
+         OUT_RING(cs, initiator);
+         tu_cs_emit_qw(cs, cmd->state.index_va);
+         OUT_RING(cs, A5XX_CP_DRAW_INDX_INDIRECT_3_MAX_INDICES(
+                         cmd->state.max_index_count));
+         tu_cs_emit_qw(cs, iova);
+      } else {
+         OUT_PKT7(cs, CP_DRAW_INDIRECT, 3);
+         OUT_RING(cs, initiator);
+         tu_cs_emit_qw(cs, iova);
+      }
+   }
+}
+
 /* vkCmdDispatch(): the compute shader and all its state, then the grid */
 void
 tu5_dispatch(struct tu_cmd_buffer *cmd, const uint32_t *blocks,
@@ -3085,6 +3168,8 @@ tu5_cmd_render(struct tu_cmd_buffer *cmd)
 
    tu5_sysmem_begin(cmd, cs, fb->width, fb->height);
    tu_cs_emit_call(cs, &cmd->draw_cs);
+   /* what the queries of the render pass end with */
+   tu_cs_emit_call(cs, &cmd->draw_epilogue_cs);
 
    /* The resolves of the last subpass: those of the others are in the draw
     * stream, see tu_CmdNextSubpass2().

@@ -9108,6 +9108,12 @@ tu_CmdDrawIndirect(VkCommandBuffer commandBuffer,
 
    tu6_draw_common<CHIP>(cmd, cs, false, 0);
 
+   if (tu_is_a5xx(cmd->device)) {
+      tu5_draw_indirect(cmd, cs, tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_INDEX),
+                        false, buf->iova + offset, drawCount, stride);
+      return;
+   }
+
    tu_cs_emit_pkt7(cs, CP_DRAW_INDIRECT_MULTI, 6);
    tu_cs_emit(cs, tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_INDEX));
    tu_cs_emit(cs, A6XX_CP_DRAW_INDIRECT_MULTI_1_OPCODE(INDIRECT_OP_NORMAL) |
@@ -9138,6 +9144,12 @@ tu_CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer,
       draw_wfm(cmd);
 
    tu6_draw_common<CHIP>(cmd, cs, true, 0);
+
+   if (tu_is_a5xx(cmd->device)) {
+      tu5_draw_indirect(cmd, cs, tu_draw_initiator(cmd, DI_SRC_SEL_DMA), true,
+                        buf->iova + offset, drawCount, stride);
+      return;
+   }
 
    tu_cs_emit_pkt7(cs, CP_DRAW_INDIRECT_MULTI, 9);
    tu_cs_emit(cs, tu_draw_initiator(cmd, DI_SRC_SEL_DMA));

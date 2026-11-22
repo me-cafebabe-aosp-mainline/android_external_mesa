@@ -43,6 +43,15 @@ bool tu5_format_depth_supported(enum pipe_format format);
 }
 #endif
 
+/* Queries */
+void tu5_emit_sample_count_addr(struct tu_cs *cs, uint64_t iova);
+uint32_t tu5_always_on_counter_reg(void);
+
+/* vkCmdDrawIndirect(), vkCmdDrawIndexedIndirect() */
+void tu5_draw_indirect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                       uint32_t initiator, bool indexed, uint64_t iova,
+                       uint32_t count, uint32_t stride);
+
 /* vkCmdDispatch(), vkCmdDispatchIndirect(): indirect_iova is 0 for the first */
 void tu5_dispatch(struct tu_cmd_buffer *cmd, const uint32_t *blocks,
                   const uint32_t *offsets, uint64_t indirect_iova);
