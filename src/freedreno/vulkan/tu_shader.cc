@@ -407,6 +407,8 @@ tu5_desc_base(struct tu_shader *shader,
    return base;
 }
 
+static nir_def *tu5_ibo_base(nir_builder *b, const struct tu_shader *shader);
+
 static void
 lower_vulkan_resource_index(struct tu_device *dev, nir_builder *b,
                             nir_intrinsic_instr *instr,
@@ -440,14 +442,17 @@ lower_vulkan_resource_index(struct tu_device *dev, nir_builder *b,
        * these read theirs through pointers, as uniform buffers. See
        * lower_ssbo_ubo_intrinsic().
        */
-      if (b->shader->info.stage == MESA_SHADER_VERTEX)
+      const bool vs_ibo = shader->const_state.a5xx.vs_ibo;
+      if (b->shader->info.stage == MESA_SHADER_VERTEX && !vs_ibo)
          ubo = true;
 
       unsigned first = tu5_desc_base(shader, layout, set, binding,
                                      ubo ? TU5_DESC_UBO : TU5_DESC_SSBO);
 
-      nir_def *def = nir_vec3(b, nir_imm_int(b, 0),
-                              nir_iadd_imm(b, vulkan_idx, first),
+      nir_def *index = nir_iadd_imm(b, vulkan_idx, first);
+      if (vs_ibo && !ubo)
+         index = nir_iadd(b, index, tu5_ibo_base(b, shader));
+      nir_def *def = nir_vec3(b, nir_imm_int(b, 0), index,
                               nir_imm_int(b, 0));
 
       nir_def_replace(&instr->def, def);
@@ -535,7 +540,8 @@ lower_load_vulkan_descriptor(nir_builder *b, nir_intrinsic_instr *intrin)
 
 static bool
 lower_ssbo_ubo_intrinsic(struct tu_device *dev,
-                         nir_builder *b, nir_intrinsic_instr *intrin)
+                         nir_builder *b, nir_intrinsic_instr *intrin,
+                         const struct tu_shader *shader)
 {
    const nir_intrinsic_info *info = &nir_intrinsic_infos[intrin->intrinsic];
 
@@ -562,7 +568,11 @@ lower_ssbo_ubo_intrinsic(struct tu_device *dev,
 
    if (tu_is_a5xx(dev)) {
       /* The buffers are numbered, see lower_vulkan_resource_index() */
-      if (b->shader->info.stage == MESA_SHADER_VERTEX &&
+      const bool vs_ibo =
+         b->shader->info.stage == MESA_SHADER_VERTEX &&
+         shader->const_state.a5xx.vs_ibo;
+
+      if (b->shader->info.stage == MESA_SHADER_VERTEX && !vs_ibo &&
           intrin->intrinsic == nir_intrinsic_load_ssbo) {
          /* Read through the pointer, and never ahead of the draw as the
           * constants are: what was written before the draw is to be seen.
@@ -579,7 +589,7 @@ lower_ssbo_ubo_intrinsic(struct tu_device *dev,
          return true;
       }
 
-      if (b->shader->info.stage == MESA_SHADER_VERTEX &&
+      if (b->shader->info.stage == MESA_SHADER_VERTEX && !vs_ibo &&
           intrin->intrinsic != nir_intrinsic_load_ubo) {
          /* TODO: the sizes of the storage buffers. The stores and the
           * atomics are not a feature of the vertex shaders.
@@ -949,6 +959,10 @@ lower_image_deref(struct tu_device *dev, nir_builder *b,
       nir_def *index = deref->deref_type == nir_deref_type_var
                           ? nir_imm_int(b, first)
                           : nir_iadd_imm(b, deref->arr.index.ssa, first);
+      /* the slots of the vertex shader follow those of the fragment shader */
+      if (b->shader->info.stage == MESA_SHADER_VERTEX &&
+          shader->const_state.a5xx.vs_ibo)
+         index = nir_iadd(b, index, tu5_ibo_base(b, shader));
 
       shader->active_desc_sets |= 1u << var->data.descriptor_set;
       nir_rewrite_image_intrinsic(instr, index, false);
@@ -998,7 +1012,7 @@ lower_intrinsic(nir_builder *b, nir_intrinsic_instr *instr,
    case nir_intrinsic_ssbo_atomic:
    case nir_intrinsic_ssbo_atomic_swap:
    case nir_intrinsic_get_ssbo_size:
-      return lower_ssbo_ubo_intrinsic(dev, b, instr);
+      return lower_ssbo_ubo_intrinsic(dev, b, instr, shader);
 
    case nir_intrinsic_image_deref_load:
    case nir_intrinsic_image_deref_sparse_load:
@@ -1512,6 +1526,50 @@ tu5_lower_view_index(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
    return true;
 }
 
+/* Adreno 5xx: a vertex shader that writes storage buffers, or uses images,
+ * goes through the storage state, which it shares with the fragment shader.
+ */
+static bool
+tu5_vs_uses_ibo(nir_shader *shader)
+{
+   if (shader->info.stage != MESA_SHADER_VERTEX)
+      return false;
+
+   nir_foreach_function_impl (impl, shader) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+            case nir_intrinsic_store_ssbo:
+            case nir_intrinsic_ssbo_atomic:
+            case nir_intrinsic_ssbo_atomic_swap:
+            case nir_intrinsic_get_ssbo_size:
+            case nir_intrinsic_image_deref_load:
+            case nir_intrinsic_image_deref_store:
+            case nir_intrinsic_image_deref_atomic:
+            case nir_intrinsic_image_deref_atomic_swap:
+            case nir_intrinsic_image_deref_size:
+            case nir_intrinsic_image_deref_samples:
+               return true;
+            default:
+               break;
+            }
+         }
+      }
+   }
+   return false;
+}
+
+/* The first slot of the vertex shader, see tu5_desc_map::vs_ibo: a
+ * constant, for ir3 to find the sizes of the images
+ */
+static nir_def *
+tu5_ibo_base(nir_builder *b, const struct tu_shader *shader)
+{
+   return nir_imm_int(b, TU5_VS_IBO_BASE);
+}
+
 static bool
 tu5_uses_view_index(nir_shader *shader)
 {
@@ -1586,6 +1644,8 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
       ir3_const_alloc(const_allocs, IR3_CONST_ALLOC_PUSH_CONSTS,
                       push_consts_vec4, offset_align_vec4);
    }
+
+   const_state->a5xx.vs_ibo = tu_is_a5xx(dev) && tu5_vs_uses_ibo(shader);
 
    const_state->a5xx.view_loc = ~0u;
    if (tu_is_a5xx(dev) && tu5_uses_view_index(shader)) {

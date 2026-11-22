@@ -53,6 +53,12 @@ struct tu_push_constant_range
 #define TU5_MAX_UBOS     32
 #define TU5_MAX_SSBOS    16
 #define TU5_MAX_IMAGES   8
+/* The slots of the storage state of the graphics shaders (buffers and
+ * images), which the vertex and the fragment shader share: those of the
+ * vertex shader from TU5_VS_IBO_BASE, those of the fragment shader under it
+ */
+#define TU5_GFX_IBO_SLOTS 24
+#define TU5_VS_IBO_BASE   16
 
 enum tu5_desc_kind {
    TU5_DESC_TEXTURE,
@@ -89,6 +95,12 @@ struct tu5_desc_map
     * the views are drawn one after the other, each with its own.
     */
    uint32_t view_loc;
+
+   /* The vertex shader goes through the storage state it shares with the
+    * fragment shader, in its slots from TU5_VS_IBO_BASE; it reads its
+    * storage buffers as uniform buffers otherwise.
+    */
+   bool vs_ibo;
 
    /* The numbers the bindings were given */
    uint8_t num_bindings;

@@ -318,6 +318,16 @@ tu5_emit_tex_tables(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    return true;
 }
 
+/* The first slot of a shader in the storage state: the vertex shader shares
+ * that of the graphics shaders with the fragment shader, from
+ * TU5_VS_IBO_BASE (see tu5_desc_map::vs_ibo).
+ */
+static unsigned
+tu5_ibo_slot_base(const struct tu_shader *shader)
+{
+   return shader->variant->type == MESA_SHADER_VERTEX ? TU5_VS_IBO_BASE : 0;
+}
+
 /* The textures and the samplers of a shader */
 static void
 tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
@@ -333,10 +343,12 @@ tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
     * others.
     */
    unsigned num_slots = num_tex;
+   /* the images are numbered from the first slot of the shader */
+   const unsigned ibase = tu5_ibo_slot_base(shader);
 
    for (unsigned i = 0; i < map->count[TU5_DESC_IMAGE]; i++) {
-      if (m->image_to_tex[i] != IBO_INVALID)
-         num_slots = MAX2(num_slots, m->tex_base + m->image_to_tex[i] + 1);
+      if (m->image_to_tex[ibase + i] != IBO_INVALID)
+         num_slots = MAX2(num_slots, m->tex_base + m->image_to_tex[ibase + i] + 1);
    }
 
    if (!tu5_emit_tex_tables(cmd, cs, shader->variant->type, num_samp, num_slots,
@@ -344,14 +356,14 @@ tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       return;
 
    for (unsigned i = 0; i < map->count[TU5_DESC_IMAGE]; i++) {
-      if (m->image_to_tex[i] == IBO_INVALID)
+      if (m->image_to_tex[ibase + i] == IBO_INVALID)
          continue;
 
       const uint32_t *desc = tu5_descriptor(cmd, shader, &map->image[i]);
 
       /* see tu5_image_view_storage_descriptor() */
       if (desc) {
-         memcpy(&tex_map[(m->tex_base + m->image_to_tex[i]) * 16], desc,
+         memcpy(&tex_map[(m->tex_base + m->image_to_tex[ibase + i]) * 16], desc,
                 6 * sizeof(uint32_t));
       }
    }
@@ -381,6 +393,7 @@ tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    }
 }
 
+
 /* The storage buffers of a fragment or of a compute shader */
 static void
 tu5_emit_ssbos(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
@@ -394,6 +407,10 @@ tu5_emit_ssbos(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       return;
 
    switch (shader->variant->type) {
+   case MESA_SHADER_VERTEX:
+      if (!shader->const_state.a5xx.vs_ibo)
+         return; /* read as uniform buffers */
+      FALLTHROUGH;
    case MESA_SHADER_FRAGMENT:
       sb = SB4_SSBO;
       break;
@@ -404,6 +421,7 @@ tu5_emit_ssbos(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       return;
    }
 
+   const unsigned slot_base = tu5_ibo_slot_base(shader);
    uint64_t va[TU5_MAX_SSBOS];
    uint32_t size[TU5_MAX_SSBOS];
 
@@ -428,7 +446,7 @@ tu5_emit_ssbos(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 
    /* in bytes */
    OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 2 * count);
-   OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(0) |
+   OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(slot_base) |
                    CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
                    CP_LOAD_STATE4_0_STATE_BLOCK(sb) |
                    CP_LOAD_STATE4_0_NUM_UNIT(count));
@@ -441,7 +459,7 @@ tu5_emit_ssbos(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    }
 
    OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 2 * count);
-   OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(0) |
+   OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(slot_base) |
                    CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
                    CP_LOAD_STATE4_0_STATE_BLOCK(sb) |
                    CP_LOAD_STATE4_0_NUM_UNIT(count));
@@ -470,6 +488,10 @@ tu5_emit_images(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       return;
 
    switch (v->type) {
+   case MESA_SHADER_VERTEX:
+      if (!shader->const_state.a5xx.vs_ibo)
+         return;
+      FALLTHROUGH;
    case MESA_SHADER_FRAGMENT:
       sb = SB4_SSBO;
       break;
@@ -480,6 +502,7 @@ tu5_emit_images(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       return;
    }
 
+   const unsigned slot_base = tu5_ibo_slot_base(shader);
    uint32_t dims[align(MAX2(const_state->image_dims.count, 1), 4)];
 
    memset(dims, 0, sizeof(dims));
@@ -495,7 +518,7 @@ tu5_emit_images(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       /* those read as textures are in the tables of tu5_emit_textures() */
 
       OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 2);
-      OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(v->num_ssbos + i) |
+      OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(slot_base + v->num_ssbos + i) |
                       CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
                       CP_LOAD_STATE4_0_STATE_BLOCK(sb) |
                       CP_LOAD_STATE4_0_NUM_UNIT(1));
@@ -509,7 +532,7 @@ tu5_emit_images(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       OUT_RING(cs, desc[7]); /* SSBO_1_1 */
 
       OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 2);
-      OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(v->num_ssbos + i) |
+      OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(slot_base + v->num_ssbos + i) |
                       CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
                       CP_LOAD_STATE4_0_STATE_BLOCK(sb) |
                       CP_LOAD_STATE4_0_NUM_UNIT(1));
@@ -519,8 +542,9 @@ tu5_emit_images(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       OUT_RING(cs, desc[4]);
       OUT_RING(cs, desc[5] & A5XX_TEX_CONST_5_BASE_HI__MASK);
 
-      if (const_state->image_dims.mask & (1u << i)) {
-         unsigned off = const_state->image_dims.off[i];
+      /* numbered from the first slot of the shader, see tu5_ibo_base() */
+      if (const_state->image_dims.mask & (1u << (slot_base + i))) {
+         unsigned off = const_state->image_dims.off[slot_base + i];
 
          dims[off + 0] = desc[8];  /* bytes a texel */
          dims[off + 1] = desc[9];  /* bytes a row */
@@ -537,6 +561,27 @@ tu5_emit_images(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 
       tu5_emit_const(cs, v, offset * 4, dwords, dims);
    }
+}
+
+/* The storage buffers and images of a vertex shader that goes through the
+ * storage state: in the slots from TU5_VS_IBO_BASE, those of the fragment
+ * shader being under them.
+ */
+static void
+tu5_emit_vs_ibos(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                 const struct tu_shader *vs)
+{
+   if (!vs->const_state.a5xx.vs_ibo)
+      return;
+
+   const struct tu_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
+   if ((fs && fs->variant && fs->variant->num_ibos > TU5_VS_IBO_BASE) ||
+       TU5_VS_IBO_BASE + vs->variant->num_ibos > TU5_GFX_IBO_SLOTS)
+      mesa_loge("a5xx: too many storage buffers and images in the vertex "
+                "and fragment shaders");
+
+   tu5_emit_ssbos(cmd, cs, vs);
+   tu5_emit_images(cmd, cs, vs);
 }
 
 /* The constants of a shader that come from the descriptors and from the
@@ -4707,6 +4752,8 @@ tu5_binning_state(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool indexed)
    tu5_emit_vs_params(cmd, cs, prog.vs);
    tu5_emit_user_consts(cmd, cs, vs_shader);
    tu5_emit_textures(cmd, cs, vs_shader);
+   /* the stores of the vertex shader run in the binning pass too */
+   tu5_emit_vs_ibos(cmd, cs, vs_shader);
 
    OUT_PKT4(cs, REG_A5XX_RB_FS_OUTPUT_CNTL, 1);
    OUT_RING(cs, A5XX_RB_FS_OUTPUT_CNTL_MRT(0));
@@ -4777,6 +4824,7 @@ tu5_draw_state(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool indexed)
       tu5_emit_textures(cmd, cs, fs_shader);
       tu5_emit_ssbos(cmd, cs, fs_shader);
       tu5_emit_images(cmd, cs, fs_shader);
+      tu5_emit_vs_ibos(cmd, cs, vs_shader);
    }
 
    OUT_PKT4(cs, REG_A5XX_VFD_INDEX_OFFSET, 2);
