@@ -3650,7 +3650,15 @@ tu5_emit_gmem_clears(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
 /* Whether a render pass that begins draws to GMEM, tile by tile: for now,
  * not those with multisampling, input attachments, resolves, layers or
  * views, which read or write their attachments in memory.
+ *
+ * Without binning every tile runs all the draws of the render pass again,
+ * which costs more than what drawing in GMEM saves once there are many tiles:
+ * scrolling Settings, all of the screen in 68 tiles, takes the GPU 6.4 ms a
+ * frame in GMEM, 4.4 ms in memory. So GMEM only for a few tiles, unless
+ * TU_DEBUG=gmem.
  */
+#define TU5_GMEM_MAX_TILES 4
+
 bool
 tu5_use_gmem(struct tu_cmd_buffer *cmd)
 {
@@ -3661,6 +3669,16 @@ tu5_use_gmem(struct tu_cmd_buffer *cmd)
       return false;
    if (cmd->state.gmem_layout != TU_GMEM_LAYOUT_FULL ||
        !cmd->state.tiling->possible)
+      return false;
+
+   const VkRect2D *ra = &cmd->state.render_area;
+   const VkExtent2D tile0 = cmd->state.tiling->tile0;
+   uint32_t tiles =
+      (DIV_ROUND_UP(ra->offset.x + ra->extent.width, tile0.width) -
+       ra->offset.x / tile0.width) *
+      (DIV_ROUND_UP(ra->offset.y + ra->extent.height, tile0.height) -
+       ra->offset.y / tile0.height);
+   if (tiles > TU5_GMEM_MAX_TILES && !TU_DEBUG(GMEM))
       return false;
    if (fb->layers > 1 || pass->num_views)
       return false;
