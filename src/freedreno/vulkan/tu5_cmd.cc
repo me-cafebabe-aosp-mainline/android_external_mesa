@@ -1021,6 +1021,7 @@ tu5_dispatch(struct tu_cmd_buffer *cmd, const uint32_t *blocks,
    }
 
    /* What was written is to be seen by what comes after */
+   tu5_event_write(cmd, cs, CACHE_FLUSH_TS, true);
    tu5_cache_flush(cs);
 }
 
@@ -1226,6 +1227,11 @@ tu5_emit_flushes(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t flushes)
       tu5_event_write(cmd, cs, PC_CCU_INVALIDATE_COLOR, false);
    if (flushes & TU_CMD_FLAG_CCU_INVALIDATE_DEPTH)
       tu5_event_write(cmd, cs, PC_CCU_INVALIDATE_DEPTH, false);
+   /* What the shaders wrote through UCHE goes out to memory with
+    * CACHE_FLUSH_TS: UCHE_CACHE_INVALIDATE drops it.
+    */
+   if (flushes & TU_CMD_FLAG_CACHE_CLEAN)
+      tu5_event_write(cmd, cs, CACHE_FLUSH_TS, true);
    if (flushes & (TU_CMD_FLAG_CACHE_CLEAN | TU_CMD_FLAG_CACHE_INVALIDATE))
       tu5_cache_flush(cs);
    else if (flushes & TU_CMD_FLAG_WAIT_FOR_IDLE)
