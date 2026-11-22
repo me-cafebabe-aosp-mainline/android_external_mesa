@@ -3958,7 +3958,7 @@ tu_resolve_sysmem(struct tu_cmd_buffer *cmd,
            vk_format_is_depth_or_stencil(dst->image->vk.format)));
 
    if (tu_is_a5xx(cmd->device)) {
-      tu5_resolve_sysmem(cmd, cs, src, dst, layers, rect);
+      tu5_resolve_sysmem(cmd, cs, src, dst, layer_mask, layers, rect);
       return;
    }
 

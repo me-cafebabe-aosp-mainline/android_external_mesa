@@ -697,6 +697,81 @@ tu5_always_on_counter_reg(void)
    return REG_A5XX_RBBM_ALWAYSON_COUNTER_LO;
 }
 
+static void tu5_emit_mrt(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                         uint32_t layer);
+static void tu5_emit_zs(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                        uint32_t layer);
+
+/* Multiview: the views are drawn one after the other. The views of the
+ * subpass, or the one view there is without multiview.
+ */
+uint32_t
+tu5_views(const struct tu_cmd_buffer *cmd)
+{
+   uint32_t mask = cmd->state.subpass->multiview_mask;
+
+   return mask ? mask : 1;
+}
+
+/* Before the draw of a view: the targets are its layer of the attachments,
+ * and the shaders are given its index.
+ */
+void
+tu5_bind_view(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t view)
+{
+   if (!cmd->state.subpass->multiview_mask)
+      return;
+
+   if (cmd->state.attachments) {
+      tu5_emit_zs(cmd, cs, view);
+      tu5_emit_mrt(cmd, cs, view);
+   } else {
+      /* A secondary command buffer that does not know the framebuffer:
+       * the primary one wrote where the views draw, see
+       * tu5_write_view_bases().
+       */
+      const struct tu_subpass *subpass = cmd->state.subpass;
+      uint64_t bases = global_iova_arr(cmd, a5xx_view_bases, view * 10);
+
+      tu_cs_emit_wfi(cs);
+      for (unsigned i = 0; i < subpass->color_count; i++) {
+         if (subpass->color_attachments[i].attachment == VK_ATTACHMENT_UNUSED)
+            continue;
+         OUT_PKT7(cs, CP_MEM_TO_REG, 3);
+         OUT_RING(cs, CP_MEM_TO_REG_0_REG(REG_A5XX_RB_MRT_BASE_LO(i)) |
+                         CP_MEM_TO_REG_0_CNT(2));
+         tu_cs_emit_qw(cs, bases + i * sizeof(uint64_t));
+      }
+
+      uint32_t a = subpass->depth_stencil_attachment.attachment;
+
+      if (a != VK_ATTACHMENT_UNUSED) {
+         OUT_PKT7(cs, CP_MEM_TO_REG, 3);
+         OUT_RING(cs, CP_MEM_TO_REG_0_REG(REG_A5XX_RB_DEPTH_BUFFER_BASE_LO) |
+                         CP_MEM_TO_REG_0_CNT(2));
+         tu_cs_emit_qw(cs, bases + 8 * sizeof(uint64_t));
+
+         if (cmd->state.pass->attachments[a].format ==
+             VK_FORMAT_D32_SFLOAT_S8_UINT) {
+            OUT_PKT7(cs, CP_MEM_TO_REG, 3);
+            OUT_RING(cs, CP_MEM_TO_REG_0_REG(REG_A5XX_RB_STENCIL_BASE_LO) |
+                            CP_MEM_TO_REG_0_CNT(2));
+            tu_cs_emit_qw(cs, bases + 9 * sizeof(uint64_t));
+         }
+      }
+   }
+
+   for (unsigned stage = MESA_SHADER_VERTEX; stage <= MESA_SHADER_FRAGMENT;
+        stage += MESA_SHADER_FRAGMENT - MESA_SHADER_VERTEX) {
+      const struct tu_shader *shader = cmd->state.shaders[stage];
+      uint32_t loc = shader->const_state.a5xx.view_loc;
+      const uint32_t consts[4] = { view };
+
+      if (loc != ~0u && loc < shader->variant->constlen * 4)
+         tu5_emit_const(cs, shader->variant, loc, 4, consts);
+   }
+}
+
 /* vkCmdDrawIndirect(), vkCmdDrawIndexedIndirect(): after the state of the
  * draw, a draw for each of the structures of the buffer. What the vertex
  * shader reads of them as constants is copied to where these are loaded from.
@@ -2157,7 +2232,7 @@ tu5_emit_blit_src(struct tu_cs *cs, const struct tu5_surf *surf, bool linear)
 
 /* The colour targets of the subpass */
 static void
-tu5_emit_mrt(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+tu5_emit_mrt(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t layer)
 {
    const struct tu_subpass *subpass = cmd->state.subpass;
    uint32_t components = 0;
@@ -2172,7 +2247,7 @@ tu5_emit_mrt(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
             tu5_image_surf(iview->image, 0,
                            vk_format_to_pipe_format(iview->vk.format),
                            iview->vk.base_mip_level,
-                           iview->vk.base_array_layer);
+                           iview->vk.base_array_layer + layer);
 
          tu5_emit_mrt_surf(cs, i, &surf);
          components |= 0xf << (i * 4);
@@ -2256,7 +2331,7 @@ tu5_emit_zs_surface(struct tu_cs *cs, const struct tu_image *image,
 }
 
 static void
-tu5_emit_zs(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+tu5_emit_zs(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t layer)
 {
    uint32_t a = cmd->state.subpass->depth_stencil_attachment.attachment;
 
@@ -2264,7 +2339,7 @@ tu5_emit_zs(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
       const struct tu_image_view *iview = cmd->state.attachments[a];
 
       tu5_emit_zs_surface(cs, iview->image, iview->vk.base_mip_level,
-                          iview->vk.base_array_layer);
+                          iview->vk.base_array_layer + layer);
    } else {
       tu5_emit_zs_surface(cs, NULL, 0, 0);
    }
@@ -2602,7 +2677,11 @@ tu5_emit_load_clears(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
                                                  : VK_IMAGE_ASPECT_DEPTH_BIT;
       }
 
-      for (uint32_t layer = 0; layer < fb->layers; layer++) {
+      /* the layers of the framebuffer, or those of the views */
+      uint32_t layers = pass->num_views ? att->clear_views
+                                        : BITFIELD_MASK(fb->layers);
+
+      u_foreach_bit (layer, layers) {
          tu5_bind_target(cs, iview->image, format, iview->vk.base_mip_level,
                          iview->vk.base_array_layer + layer);
          tu5_clear_rect(cmd, cs, zs ? -1 : 0, aspects,
@@ -3184,9 +3263,13 @@ tu5_resolve_image(struct tu_cmd_buffer *cmd, struct tu_image *src_image,
 void
 tu5_resolve_sysmem(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                    const struct tu_image_view *src_view,
-                   const struct tu_image_view *dst_view, uint32_t layers,
-                   const VkRect2D *rect)
+                   const struct tu_image_view *dst_view, uint32_t layer_mask,
+                   uint32_t layers, const VkRect2D *rect)
 {
+   /* the layers of the framebuffer, or those of the views */
+   if (!layer_mask)
+      layer_mask = BITFIELD_MASK(layers);
+
    enum pipe_format src_format = vk_format_to_pipe_format(src_view->vk.format);
    enum pipe_format dst_format = vk_format_to_pipe_format(dst_view->vk.format);
 
@@ -3195,7 +3278,7 @@ tu5_resolve_sysmem(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       return;
    }
 
-   for (uint32_t i = 0; i < layers; i++) {
+   u_foreach_bit (i, layer_mask) {
       struct tu5_surf src =
          tu5_image_surf(src_view->image, 0, src_format,
                         src_view->vk.base_mip_level,
@@ -3311,11 +3394,17 @@ tu5_clear_attachments(struct tu_cmd_buffer *cmd, uint32_t attachment_count,
          cmd->state.pass->attachments[a].format);
       uint32_t width = fb ? fb->width : 16384;
       uint32_t height = fb ? fb->height : 16384;
-      bool rebound = false;
+      /* with multiview, the layer of the view drawn last is what is bound */
+      bool rebound = subpass->multiview_mask != 0;
 
       for (uint32_t r = 0; r < rect_count; r++) {
-         for (uint32_t l = 0; l < rects[r].layerCount; l++) {
-            uint32_t layer = rects[r].baseArrayLayer + l;
+         /* with multiview, the layers of the views */
+         uint32_t layers = subpass->multiview_mask
+                              ? subpass->multiview_mask
+                              : BITFIELD_MASK(rects[r].layerCount)
+                                   << rects[r].baseArrayLayer;
+
+         u_foreach_bit (layer, layers) {
 
             if (!iview && layer)
                continue;
@@ -3363,8 +3452,8 @@ tu5_emit_subpass_begin(struct tu_cmd_buffer *cmd)
 
    tu5_emit_load_clears(cmd, cs);
 
-   tu5_emit_zs(cmd, cs);
-   tu5_emit_mrt(cmd, cs);
+   tu5_emit_zs(cmd, cs, 0);
+   tu5_emit_mrt(cmd, cs, 0);
    tu5_emit_msaa(cs, cmd->state.subpass->samples);
 
    OUT_PKT4(cs, REG_A5XX_RB_RENDER_CNTL, 1);
@@ -3403,7 +3492,8 @@ tu5_cmd_render(struct tu_cmd_buffer *cmd)
          uint32_t src = tu_subpass_get_attachment_to_resolve(subpass, i);
 
          tu5_resolve_sysmem(cmd, cs, cmd->state.attachments[src],
-                            cmd->state.attachments[a], fb->layers,
+                            cmd->state.attachments[a],
+                            subpass->multiview_mask, fb->layers,
                             &cmd->state.render_area);
       }
    }
@@ -3835,4 +3925,57 @@ tu5_draw_state(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool indexed)
    (void)dyn;
 
    return VK_SUCCESS;
+}
+
+/* Before the commands of a secondary command buffer, with multiview: where
+ * each view draws, for tu5_bind_view().
+ */
+void
+tu5_write_view_bases(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+{
+   const struct tu_subpass *subpass = cmd->state.subpass;
+
+   if (!subpass || !subpass->multiview_mask || !cmd->state.attachments)
+      return;
+
+   u_foreach_bit (view, subpass->multiview_mask) {
+      uint64_t bases[10] = {};
+
+      for (unsigned i = 0; i < subpass->color_count; i++) {
+         uint32_t a = subpass->color_attachments[i].attachment;
+
+         if (a == VK_ATTACHMENT_UNUSED)
+            continue;
+
+         const struct tu_image_view *iview = cmd->state.attachments[a];
+
+         bases[i] = tu5_image_surf(iview->image, 0,
+                                   vk_format_to_pipe_format(iview->vk.format),
+                                   iview->vk.base_mip_level,
+                                   iview->vk.base_array_layer + view).iova;
+      }
+
+      uint32_t a = subpass->depth_stencil_attachment.attachment;
+
+      if (a != VK_ATTACHMENT_UNUSED) {
+         const struct tu_image_view *iview = cmd->state.attachments[a];
+         const struct tu_image *image = iview->image;
+         uint32_t level = iview->vk.base_mip_level;
+         uint32_t layer = iview->vk.base_array_layer + view;
+
+         bases[8] = image->iova +
+                    fdl_surface_offset(&image->layout[0], level, layer);
+         if (image->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+            bases[9] = image->iova +
+                       fdl_surface_offset(&image->layout[1], level, layer);
+         }
+      }
+
+      OUT_PKT7(cs, CP_MEM_WRITE, 2 + 20);
+      tu_cs_emit_qw(cs, global_iova_arr(cmd, a5xx_view_bases, view * 10));
+      for (unsigned i = 0; i < 10; i++)
+         tu_cs_emit_qw(cs, bases[i]);
+   }
+
+   OUT_PKT7(cs, CP_WAIT_MEM_WRITES, 0);
 }

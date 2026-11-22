@@ -437,8 +437,10 @@ get_device_extensions(const struct tu_physical_device *device,
          .KHR_maintenance1 = true,
          .KHR_maintenance2 = true,
          .KHR_maintenance3 = true,
+         .KHR_multiview = true,
          .KHR_relaxed_block_layout = true,
          .KHR_sampler_mirror_clamp_to_edge = true,
+         .KHR_shader_draw_parameters = true,
          .KHR_storage_buffer_storage_class = true,
          .KHR_swapchain = all.KHR_swapchain,
          .EXT_queue_family_foreign = true,
@@ -972,6 +974,8 @@ tu_get_features(struct tu_physical_device *pdevice,
       features->fragmentStoresAndAtomics = true;
       features->multiDrawIndirect = true;
       features->occlusionQueryPrecise = true;
+      features->multiview = true;
+      features->shaderDrawParameters = true;
    }
 }
 
@@ -1004,9 +1008,16 @@ tu_get_physical_device_properties_1_1(struct tu_physical_device *pdevice,
 
    p->subgroupQuadOperationsInAllStages = false;
 
+   /* Adreno 5xx: what the compiler has for it */
+   if (pdevice->info->chip == 5)
+      p->subgroupSupportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT;
+
    p->pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_ALL_CLIP_PLANES;
    p->maxMultiviewViewCount =
       tu_has_multiview(pdevice) ? MAX_VIEWS : 1;
+   /* Adreno 5xx draws the views one after the other */
+   if (pdevice->info->chip == 5)
+      p->maxMultiviewViewCount = MAX_VIEWPORTS;
    p->maxMultiviewInstanceIndex = INT_MAX;
    p->protectedNoFault = false;
    /* Our largest descriptors are 2 texture descriptors, or a texture and
@@ -1350,6 +1361,9 @@ tu_get_properties(struct tu_physical_device *pdevice,
          ((pdevice->info->chip >= 7) ? TU_API_VERSION :
             VK_MAKE_VERSION(1, 3, VK_HEADER_VERSION))
          : VK_MAKE_VERSION(1, 0, VK_HEADER_VERSION);
+   /* Adreno 5xx: what was made to work, see tu_get_features() */
+   if (pdevice->info->chip == 5)
+      props->apiVersion = VK_MAKE_VERSION(1, 1, VK_HEADER_VERSION);
    /* Adreno 5xx: a shader numbers what it uses, see struct tu5_desc_map.
     * TODO: storage buffers and storage images
     */

@@ -48,6 +48,11 @@ bool tu5_format_tileable(enum pipe_format format);
 void tu5_pack_border_color(void *entry, const VkClearColorValue *val,
                            bool is_int);
 
+/* Multiview */
+uint32_t tu5_views(const struct tu_cmd_buffer *cmd);
+void tu5_bind_view(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t view);
+void tu5_write_view_bases(struct tu_cmd_buffer *cmd, struct tu_cs *cs);
+
 /* Queries */
 void tu5_emit_sample_count_addr(struct tu_cs *cs, uint64_t iova);
 uint32_t tu5_always_on_counter_reg(void);
@@ -92,8 +97,8 @@ void tu5_resolve_image(struct tu_cmd_buffer *cmd, struct tu_image *src,
                        struct tu_image *dst, const VkImageResolve2 *info);
 void tu5_resolve_sysmem(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                         const struct tu_image_view *src,
-                        const struct tu_image_view *dst, uint32_t layers,
-                        const VkRect2D *rect);
+                        const struct tu_image_view *dst, uint32_t layer_mask,
+                        uint32_t layers, const VkRect2D *rect);
 void tu5_copy_buffer(struct tu_cmd_buffer *cmd, uint64_t dst_va,
                      uint64_t src_va, uint64_t size);
 void tu5_fill_buffer(struct tu_cmd_buffer *cmd, uint64_t dst_va, uint64_t size,

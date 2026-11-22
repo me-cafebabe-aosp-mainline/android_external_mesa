@@ -83,6 +83,11 @@ struct tu5_desc_map
    struct tu5_desc_ref ssbo[TU5_MAX_SSBOS];
    struct tu5_desc_ref image[TU5_MAX_IMAGES];
 
+   /* Where the index of the view is among the constants, in dwords, or ~0:
+    * the views are drawn one after the other, each with its own.
+    */
+   uint32_t view_loc;
+
    /* The numbers the bindings were given */
    uint8_t num_bindings;
    struct {

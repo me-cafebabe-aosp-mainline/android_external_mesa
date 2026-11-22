@@ -226,6 +226,12 @@ struct tu6_global
    uint32_t _pad2;
    uint64_t predicate;
 
+   /* Adreno 5xx, multiview: where each view draws, for the secondary command
+    * buffers, which need not know the framebuffer. For each view, the colour
+    * targets, then the depth and the stencil buffers. See tu5_bind_view().
+    */
+   uint64_t a5xx_view_bases[16 * 10];
+
    /* scratch space for VPC_SO[i].FLUSH_BASE_LO/HI, start on 32 byte boundary. */
    struct {
       uint32_t offset;
