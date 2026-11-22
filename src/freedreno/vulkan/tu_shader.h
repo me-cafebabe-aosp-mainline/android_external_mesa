@@ -44,8 +44,49 @@ struct tu_push_constant_range
    enum ir3_push_consts_type type;
 };
 
+/* Adreno 5xx has no bindless descriptors: a shader numbers the textures,
+ * the samplers and the uniform buffers it uses, and these are where the
+ * descriptor of each number is, to be written out with the draws.
+ */
+#define TU5_MAX_TEXTURES 16
+#define TU5_MAX_SAMPLERS 16
+#define TU5_MAX_UBOS     32
+
+enum tu5_desc_kind {
+   TU5_DESC_TEXTURE,
+   TU5_DESC_SAMPLER,
+   TU5_DESC_UBO,
+   TU5_DESC_KINDS,
+};
+
+struct tu5_desc_ref
+{
+   uint8_t set;
+   /* in the dynamic descriptors of the command buffer, not in the set */
+   bool dynamic;
+   /* of the descriptor, in dwords */
+   uint32_t offset;
+};
+
+struct tu5_desc_map
+{
+   uint8_t count[TU5_DESC_KINDS];
+   struct tu5_desc_ref tex[TU5_MAX_TEXTURES];
+   struct tu5_desc_ref samp[TU5_MAX_SAMPLERS];
+   struct tu5_desc_ref ubo[TU5_MAX_UBOS];
+
+   /* The numbers the bindings were given */
+   uint8_t num_bindings;
+   struct {
+      uint8_t set, kind, base;
+      uint32_t binding;
+   } bindings[TU5_MAX_TEXTURES + TU5_MAX_SAMPLERS + TU5_MAX_UBOS];
+};
+
 struct tu_const_state
 {
+   struct tu5_desc_map a5xx;
+
    struct tu_push_constant_range push_consts;
    uint32_t dynamic_offset_loc;
    unsigned num_inline_ubos;

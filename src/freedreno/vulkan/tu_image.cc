@@ -26,6 +26,7 @@
 #include "tu_cs.h"
 #include "tu_descriptor_set.h"
 #include "tu_device.h"
+#include "tu5.h"
 #include "tu_formats.h"
 #include "tu_lrz.h"
 #include "tu_rmv.h"
@@ -280,6 +281,13 @@ tu_image_view_init(struct tu_device *device,
    }
 
    TU_CALLX(device, fdl6_view_init)(&iview->view, layouts, &args, device->use_z24uint_s8uint);
+
+   if (tu_is_a5xx(device)) {
+      tu5_image_view_descriptor(iview->view.descriptor, image,
+                                tu6_plane_index(image->vk.format, aspect_mask),
+                                args.format, range, pCreateInfo->viewType,
+                                args.swiz);
+   }
 
    if (image->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
       VkImageAspectFlags other_aspect =

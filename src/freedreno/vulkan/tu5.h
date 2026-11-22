@@ -31,6 +31,13 @@ void tu5_clear_image(struct tu_cmd_buffer *cmd, struct tu_image *image,
                      const VkClearValue *value, uint32_t range_count,
                      const VkImageSubresourceRange *ranges);
 
+/* The descriptor of an image view */
+void tu5_image_view_descriptor(uint32_t *descriptor,
+                               const struct tu_image *image, unsigned plane,
+                               enum pipe_format format,
+                               const VkImageSubresourceRange *range,
+                               VkImageViewType type, const unsigned char *swiz);
+
 /* Copies and blits */
 void tu5_copy_buffer_to_image(struct tu_cmd_buffer *cmd, struct tu_buffer *src,
                               struct tu_image *dst,

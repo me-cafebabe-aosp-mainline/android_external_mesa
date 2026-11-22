@@ -323,6 +323,77 @@ lower_load_push_constant(struct tu_device *dev,
    nir_def_replace(&instr->def, load);
 }
 
+/* The first of the numbers of a binding in a shader for Adreno 5xx, one for
+ * each element of the binding, given when first asked for.
+ */
+static unsigned
+tu5_desc_base(struct tu_shader *shader,
+              const struct tu_pipeline_layout *layout, unsigned set,
+              unsigned binding, enum tu5_desc_kind kind)
+{
+   struct tu5_desc_map *map = &shader->const_state.a5xx;
+   const struct tu_descriptor_set_binding_layout *binding_layout =
+      &layout->set[set].layout->binding[binding];
+
+   for (unsigned i = 0; i < map->num_bindings; i++) {
+      if (map->bindings[i].set == set && map->bindings[i].binding == binding &&
+          map->bindings[i].kind == kind)
+         return map->bindings[i].base;
+   }
+
+   struct tu5_desc_ref *refs = kind == TU5_DESC_TEXTURE ? map->tex :
+                               kind == TU5_DESC_SAMPLER ? map->samp : map->ubo;
+   unsigned max = kind == TU5_DESC_TEXTURE ? TU5_MAX_TEXTURES :
+                  kind == TU5_DESC_SAMPLER ? TU5_MAX_SAMPLERS : TU5_MAX_UBOS;
+   unsigned base = map->count[kind];
+   unsigned count = binding_layout->array_size;
+
+   if (base + count > max) {
+      mesa_loge("a5xx: too many descriptors of kind %u in a shader", kind);
+      return 0;
+   }
+
+   bool dynamic =
+      binding_layout->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+   uint32_t offset = binding_layout->offset;
+
+   if (dynamic) {
+      offset = binding_layout->dynamic_offset_offset;
+      for (unsigned i = 0; i < set; i++) {
+         if (shader->dynamic_descriptor_sizes[i] < 0) {
+            /* TODO: sets the sizes of which are known at link time */
+            mesa_loge("a5xx: dynamic buffers with independent sets");
+            break;
+         }
+         offset += shader->dynamic_descriptor_sizes[i];
+      }
+   }
+
+   /* The sampler comes after the image, see
+    * write_combined_image_sampler_descriptor().
+    */
+   if (kind == TU5_DESC_SAMPLER &&
+       binding_layout->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+      offset += A6XX_TEX_CONST_DWORDS * 4;
+
+   for (unsigned i = 0; i < count; i++) {
+      refs[base + i] = (struct tu5_desc_ref) {
+         .set = (uint8_t)set,
+         .dynamic = dynamic,
+         .offset = (offset + i * binding_layout->size) / 4,
+      };
+   }
+   map->count[kind] += count;
+
+   map->bindings[map->num_bindings].set = set;
+   map->bindings[map->num_bindings].kind = kind;
+   map->bindings[map->num_bindings].base = base;
+   map->bindings[map->num_bindings].binding = binding;
+   map->num_bindings++;
+
+   return base;
+}
+
 static void
 lower_vulkan_resource_index(struct tu_device *dev, nir_builder *b,
                             nir_intrinsic_instr *instr,
@@ -343,6 +414,28 @@ lower_vulkan_resource_index(struct tu_device *dev, nir_builder *b,
       return;
 
    shader->active_desc_sets |= 1u << set;
+
+   if (tu_is_a5xx(dev)) {
+      /* The number of the buffer in the shader, in the place of the index
+       * of the descriptor.
+       *
+       * TODO: storage buffers
+       */
+      unsigned first = 0;
+
+      if (binding_layout->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+          binding_layout->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
+         first = tu5_desc_base(shader, layout, set, binding, TU5_DESC_UBO);
+      else
+         mesa_loge("a5xx: storage buffers not implemented");
+
+      nir_def *def = nir_vec3(b, nir_imm_int(b, 0),
+                              nir_iadd_imm(b, vulkan_idx, first),
+                              nir_imm_int(b, 0));
+
+      nir_def_replace(&instr->def, def);
+      return;
+   }
 
    if (vk_descriptor_type_is_dynamic(binding_layout->type)) {
       int offset = 0;
@@ -450,6 +543,12 @@ lower_ssbo_ubo_intrinsic(struct tu_device *dev,
    nir_scalar scalar_idx = nir_scalar_resolved(intrin->src[buffer_src].ssa, 0);
    nir_def *descriptor_idx = nir_channel(b, intrin->src[buffer_src].ssa, 1);
 
+   if (tu_is_a5xx(dev)) {
+      /* The buffers are numbered, see lower_vulkan_resource_index() */
+      nir_src_rewrite(&intrin->src[buffer_src], descriptor_idx);
+      return true;
+   }
+
    if (intrin->intrinsic == nir_intrinsic_load_ubo &&
        dev->instance->drirc.misc.allow_oob_indirect_ubo_loads) {
       nir_scalar offset = nir_scalar_resolved(intrin->src[1].ssa, 0);
@@ -532,6 +631,23 @@ build_bindless(struct tu_device *dev, nir_builder *b,
    unsigned binding = var->data.binding;
    const struct tu_descriptor_set_binding_layout *bind_layout =
       &layout->set[set].layout->binding[binding];
+
+   if (tu_is_a5xx(dev)) {
+      /* The number of the texture or of the sampler in the shader. The input
+       * attachments are textures like the others, there being no tiles.
+       */
+      unsigned first =
+         tu5_desc_base(shader, layout, set, binding,
+                       is_sampler ? TU5_DESC_SAMPLER : TU5_DESC_TEXTURE);
+
+      shader->active_desc_sets |= 1u << set;
+
+      if (deref->deref_type == nir_deref_type_var)
+         return nir_imm_int(b, first);
+
+      assert(deref->deref_type == nir_deref_type_array);
+      return nir_iadd_imm(b, deref->arr.index.ssa, first);
+   }
 
    /* input attachments use non bindless workaround */
    if (bind_layout->type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT &&
@@ -991,7 +1107,9 @@ lower_tex_impl(nir_builder *b, nir_tex_instr *tex, struct tu_device *dev,
                                          read_only_input_attachments,
                                          dynamic_renderpass);
       nir_src_rewrite(&tex->src[sampler_src_idx].src, bindless);
-      tex->src[sampler_src_idx].src_type = ref ? nir_tex_src_sampler_2_handle : nir_tex_src_sampler_handle;
+      tex->src[sampler_src_idx].src_type =
+         ref ? nir_tex_src_sampler_2_handle :
+         tu_is_a5xx(dev) ? nir_tex_src_sampler_offset : nir_tex_src_sampler_handle;
    }
 
    int tex_src_idx = nir_tex_instr_src_index(tex, ref ? nir_tex_src_texture_2_deref : nir_tex_src_texture_deref);
@@ -1397,6 +1515,10 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
                                             lower_instr,
                                             nir_metadata_none,
                                             &params);
+
+   /* The pointers to the uniform buffers are constants of the shader */
+   if (tu_is_a5xx(dev))
+      shader->info.num_ubos = const_state->a5xx.count[TU5_DESC_UBO];
 
    /* Remove now-unused variables so that when we gather the shader info later
     * they won't be counted.

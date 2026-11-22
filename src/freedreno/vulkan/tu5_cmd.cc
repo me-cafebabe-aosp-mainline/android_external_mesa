@@ -231,6 +231,231 @@ tu5_emit_vs_params(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    tu5_emit_const(cs, v, offset * 4, 4, params);
 }
 
+/* Where a descriptor a shader uses is, or NULL with no set bound */
+static const uint32_t *
+tu5_descriptor(struct tu_cmd_buffer *cmd, const struct tu5_desc_ref *ref)
+{
+   struct tu_descriptor_state *descriptors =
+      tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+
+   if (ref->dynamic)
+      return &descriptors->dynamic_descriptors[ref->offset];
+
+   const struct tu_descriptor_set *set = descriptors->sets[ref->set];
+
+   return set ? set->mapped_ptr + ref->offset : NULL;
+}
+
+static uint64_t
+tu5_ubo_address(struct tu_cmd_buffer *cmd, const struct tu5_desc_ref *ref)
+{
+   const uint32_t *desc = tu5_descriptor(cmd, ref);
+
+   /* see write_ubo_descriptor_addr() */
+   return desc ? desc[0] | ((uint64_t)(desc[1] & 0x1ffff) << 32) : 0;
+}
+
+/* The textures and the samplers of a shader */
+static void
+tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                  const struct tu_shader *shader)
+{
+   const struct tu5_desc_map *map = &shader->const_state.a5xx;
+   bool vs = shader->variant->type == MESA_SHADER_VERTEX;
+   enum a4xx_state_block sb = vs ? SB4_VS_TEX : SB4_FS_TEX;
+   unsigned num_tex = map->count[TU5_DESC_TEXTURE];
+   unsigned num_samp = map->count[TU5_DESC_SAMPLER];
+
+   /* What is fetched without a sampler names the first one */
+   if (num_tex && !num_samp)
+      num_samp = 1;
+
+   if (num_samp) {
+      OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 4 * num_samp);
+      OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(0) |
+                      CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                      CP_LOAD_STATE4_0_STATE_BLOCK(sb) |
+                      CP_LOAD_STATE4_0_NUM_UNIT(num_samp));
+      OUT_RING(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_SHADER) |
+                      CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
+      OUT_RING(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+      for (unsigned i = 0; i < num_samp; i++) {
+         const uint32_t *desc = i < map->count[TU5_DESC_SAMPLER]
+                                   ? tu5_descriptor(cmd, &map->samp[i]) : NULL;
+
+         /* The same as those of Adreno 6xx but for the border colour.
+          * TODO: border colours
+          */
+         OUT_RING(cs, desc ? desc[0] : 0);
+         OUT_RING(cs, desc ? desc[1] : 0);
+         OUT_RING(cs, 0x00000000);
+         OUT_RING(cs, 0x00000000);
+      }
+   }
+
+   if (num_tex) {
+      OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 12 * num_tex);
+      OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(0) |
+                      CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                      CP_LOAD_STATE4_0_STATE_BLOCK(sb) |
+                      CP_LOAD_STATE4_0_NUM_UNIT(num_tex));
+      OUT_RING(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
+                      CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
+      OUT_RING(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+      for (unsigned i = 0; i < num_tex; i++) {
+         const uint32_t *desc = tu5_descriptor(cmd, &map->tex[i]);
+
+         /* see tu5_image_view_descriptor() */
+         for (unsigned j = 0; j < 12; j++)
+            OUT_RING(cs, desc ? desc[j] : 0);
+      }
+   }
+
+   OUT_PKT4(cs, vs ? REG_A5XX_TPL1_VS_TEX_COUNT : REG_A5XX_TPL1_FS_TEX_COUNT, 1);
+   OUT_RING(cs, num_tex);
+}
+
+/* The constants of a shader that come from the descriptors and from the
+ * push constants.
+ */
+static void
+tu5_emit_user_consts(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                     const struct tu_shader *shader)
+{
+   const struct ir3_shader_variant *v = shader->variant;
+   const struct ir3_const_state *const_state = ir3_const_state(v);
+   const struct tu5_desc_map *map = &shader->const_state.a5xx;
+   const struct tu_push_constant_range *push = &shader->const_state.push_consts;
+
+   if (push->type == IR3_PUSH_CONSTS_PER_STAGE && push->dwords &&
+       push->lo < v->constlen * 4) {
+      uint32_t dwords = MIN2(push->dwords, v->constlen * 4 - push->lo);
+
+      tu5_emit_const(cs, v, push->lo, dwords, &cmd->push_constants[push->lo]);
+   }
+
+   /* The ranges of the uniform buffers read as constants */
+   const struct ir3_ubo_analysis_state *state = &const_state->ubo_state;
+
+   for (unsigned i = 0; i < state->num_enabled; i++) {
+      const struct ir3_ubo_range *range = &state->range[i];
+      uint32_t offset = range->offset;
+      uint32_t size = range->end - range->start;
+
+      if (offset >= v->constlen * 16)
+         continue;
+      size = MIN2(size, v->constlen * 16 - offset);
+
+      if (range->ubo.bindless || range->ubo.block >= map->count[TU5_DESC_UBO])
+         continue;
+
+      uint64_t va = tu5_ubo_address(cmd, &map->ubo[range->ubo.block]);
+
+      if (!va)
+         continue;
+      va += range->start;
+
+      OUT_PKT7(cs, CP_LOAD_STATE4, 3);
+      OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(offset / 16) |
+                      CP_LOAD_STATE4_0_STATE_SRC(SS4_INDIRECT) |
+                      CP_LOAD_STATE4_0_STATE_BLOCK(tu5_stage2shadersb(v->type)) |
+                      CP_LOAD_STATE4_0_NUM_UNIT(size / 16));
+      OUT_RING(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) | (uint32_t)va);
+      OUT_RING(cs, (uint32_t)(va >> 32));
+   }
+
+   /* The addresses of the uniform buffers, and of the constant data of the
+    * shader, which is read the same way.
+    */
+   uint32_t ptrs = const_state->offsets.ubo;
+
+   if (const_state->num_ubos && ptrs < v->constlen) {
+      uint32_t num = const_state->num_ubos;
+      uint32_t anum = align(num, 2);
+
+      OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 2 * anum);
+      OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(ptrs) |
+                      CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                      CP_LOAD_STATE4_0_STATE_BLOCK(tu5_stage2shadersb(v->type)) |
+                      CP_LOAD_STATE4_0_NUM_UNIT(anum / 2));
+      OUT_RING(cs, CP_LOAD_STATE4_1_EXT_SRC_ADDR(0) |
+                      CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS));
+      OUT_RING(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+      for (uint32_t i = 0; i < anum; i++) {
+         uint64_t va = 0;
+
+         if (i < num && (int)i == const_state->consts_ubo.idx)
+            va = shader->binary_iova + v->info.constant_data_offset;
+         else if (i < map->count[TU5_DESC_UBO])
+            va = tu5_ubo_address(cmd, &map->ubo[i]);
+
+         tu_cs_emit_qw(cs, va);
+      }
+   }
+}
+
+/* The descriptor of an image view, for write_image_descriptor() */
+void
+tu5_image_view_descriptor(uint32_t *descriptor, const struct tu_image *image,
+                          unsigned plane, enum pipe_format format,
+                          const VkImageSubresourceRange *range,
+                          VkImageViewType type, const unsigned char *swiz)
+{
+   const struct fdl_layout *layout = &image->layout[plane];
+   uint32_t level = range->baseMipLevel;
+   uint32_t levels = vk_image_subresource_level_count(&image->vk, range);
+   uint32_t layers = vk_image_subresource_layer_count(&image->vk, range);
+   uint64_t iova =
+      image->iova + fdl_surface_offset(layout, level, range->baseArrayLayer);
+   enum a5xx_tex_type tex_type;
+   uint32_t depth = layers;
+
+   switch (type) {
+   case VK_IMAGE_VIEW_TYPE_1D:
+   case VK_IMAGE_VIEW_TYPE_1D_ARRAY:
+      tex_type = A5XX_TEX_1D;
+      break;
+   case VK_IMAGE_VIEW_TYPE_CUBE:
+   case VK_IMAGE_VIEW_TYPE_CUBE_ARRAY:
+      tex_type = A5XX_TEX_CUBE;
+      depth = layers / 6;
+      break;
+   case VK_IMAGE_VIEW_TYPE_3D:
+      tex_type = A5XX_TEX_3D;
+      depth = u_minify(layout->depth0, level);
+      break;
+   default:
+      tex_type = A5XX_TEX_2D;
+      break;
+   }
+
+   memset(descriptor, 0, A6XX_TEX_CONST_DWORDS * sizeof(uint32_t));
+
+   descriptor[0] =
+      A5XX_TEX_CONST_0_TILE_MODE((enum a5xx_tile_mode)fdl_tile_mode(layout, level)) |
+      A5XX_TEX_CONST_0_FMT(fd5_pipe2tex(format)) |
+      A5XX_TEX_CONST_0_SAMPLES(tu_msaa_samples(layout->nr_samples)) |
+      A5XX_TEX_CONST_0_MIPLVLS(levels - 1) |
+      fd5_tex_swiz(format, swiz[0], swiz[1], swiz[2], swiz[3]) |
+      COND(format == PIPE_FORMAT_X24S8_UINT, A5XX_TEX_CONST_0_SWAP(XYZW)) |
+      COND(util_format_is_srgb(format), A5XX_TEX_CONST_0_SRGB);
+   descriptor[1] = A5XX_TEX_CONST_1_WIDTH(u_minify(layout->width0, level)) |
+                   A5XX_TEX_CONST_1_HEIGHT(u_minify(layout->height0, level));
+   descriptor[2] = A5XX_TEX_CONST_2_PITCHALIGN(layout->pitchalign - 6) |
+                   A5XX_TEX_CONST_2_PITCH(fdl_pitch(layout, level)) |
+                   A5XX_TEX_CONST_2_TYPE(tex_type);
+   if (type == VK_IMAGE_VIEW_TYPE_3D) {
+      descriptor[3] =
+         A5XX_TEX_CONST_3_MIN_LAYERSZ(
+            layout->slices[layout->mip_levels - 1].size0) |
+         A5XX_TEX_CONST_3_ARRAY_PITCH(layout->slices[level].size0);
+   } else {
+      descriptor[3] = A5XX_TEX_CONST_3_ARRAY_PITCH(layout->layer_size);
+   }
+   descriptor[4] = (uint32_t)iova;
+   descriptor[5] = (uint32_t)(iova >> 32) | A5XX_TEX_CONST_5_DEPTH(depth);
+}
+
 void
 tu5_emit_flushes(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t flushes)
 {
@@ -2566,15 +2791,15 @@ tu5_draw_state(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool indexed)
    tu5_emit_vs_params(cmd, cs, prog.vs);
    tu5_emit_immediates(cs, prog.fs);
 
+   tu5_emit_user_consts(cmd, cs, vs_shader);
+   tu5_emit_user_consts(cmd, cs, fs_shader);
+   tu5_emit_textures(cmd, cs, vs_shader);
+   tu5_emit_textures(cmd, cs, fs_shader);
+
    OUT_PKT4(cs, REG_A5XX_VFD_INDEX_OFFSET, 2);
    OUT_RING(cs, cmd->state.last_vs_params.vertex_offset);
    OUT_RING(cs, cmd->state.last_vs_params.first_instance);
 
-   /* TODO: textures, and with them the border colors */
-   OUT_PKT4(cs, REG_A5XX_TPL1_VS_TEX_COUNT, 1);
-   OUT_RING(cs, 0);
-   OUT_PKT4(cs, REG_A5XX_TPL1_FS_TEX_COUNT, 1);
-   OUT_RING(cs, 0);
    OUT_PKT4(cs, REG_A5XX_TPL1_CS_TEX_COUNT, 1);
    OUT_RING(cs, 0);
 
