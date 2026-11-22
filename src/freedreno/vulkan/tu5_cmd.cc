@@ -271,81 +271,89 @@ tu5_ubo_address(struct tu_cmd_buffer *cmd, const struct tu_shader *shader,
    return desc[0] | ((uint64_t)(desc[1] & 0x1ffff) << 32);
 }
 
+/* The sampler and the texture states of a stage are read by the hardware
+ * from tables in memory, which TPL1_xS_TEX_SAMP and TPL1_xS_TEX_CONST point
+ * to, a sampler taking 4 dwords and a texture 16: so there can be more than
+ * the 16 that CP_LOAD_STATE4 has room for, which the textures past those
+ * would overwrite. Found by trying: once these point somewhere, what
+ * CP_LOAD_STATE4 loads is not read.
+ *
+ * Allocates the tables for the caller to fill.
+ */
+static bool
+tu5_emit_tex_tables(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                    gl_shader_stage stage, uint32_t num_samp, uint32_t num_tex,
+                    uint32_t **samp_map, uint32_t **tex_map)
+{
+   struct tu_cs_memory samp_mem, tex_mem;
+
+   if (tu_cs_alloc(&cmd->sub_cs, DIV_ROUND_UP(MAX2(num_samp, 1) * 4, 16), 16,
+                   &samp_mem) != VK_SUCCESS ||
+       tu_cs_alloc(&cmd->sub_cs, MAX2(num_tex, 1), 16, &tex_mem) != VK_SUCCESS) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return false;
+   }
+
+   memset(samp_mem.map, 0, DIV_ROUND_UP(MAX2(num_samp, 1) * 4, 16) * 64);
+   memset(tex_mem.map, 0, MAX2(num_tex, 1) * 64);
+
+   const bool vs = stage == MESA_SHADER_VERTEX;
+   const bool fs = stage == MESA_SHADER_FRAGMENT;
+
+   OUT_PKT4(cs, vs ? REG_A5XX_TPL1_VS_TEX_SAMP_LO :
+                fs ? REG_A5XX_TPL1_FS_TEX_SAMP_LO : REG_A5XX_TPL1_CS_TEX_SAMP_LO,
+            2);
+   tu_cs_emit_qw(cs, samp_mem.iova);
+   OUT_PKT4(cs, vs ? REG_A5XX_TPL1_VS_TEX_CONST_LO :
+                fs ? REG_A5XX_TPL1_FS_TEX_CONST_LO : REG_A5XX_TPL1_CS_TEX_CONST_LO,
+            2);
+   tu_cs_emit_qw(cs, tex_mem.iova);
+
+   OUT_PKT4(cs, vs ? REG_A5XX_TPL1_VS_TEX_COUNT :
+                fs ? REG_A5XX_TPL1_FS_TEX_COUNT : REG_A5XX_TPL1_CS_TEX_COUNT, 1);
+   OUT_RING(cs, num_tex);
+
+   *samp_map = samp_mem.map;
+   *tex_map = tex_mem.map;
+   return true;
+}
+
 /* The textures and the samplers of a shader */
 static void
 tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                   const struct tu_shader *shader)
 {
    const struct tu5_desc_map *map = &shader->const_state.a5xx;
-   gl_shader_stage stage = shader->variant->type;
-   enum a4xx_state_block sb = stage == MESA_SHADER_VERTEX ? SB4_VS_TEX :
-                              stage == MESA_SHADER_FRAGMENT ? SB4_FS_TEX :
-                                                              SB4_CS_TEX;
    unsigned num_tex = map->count[TU5_DESC_TEXTURE];
    unsigned num_samp = map->count[TU5_DESC_SAMPLER];
+   uint32_t *samp_map, *tex_map;
 
-   /* What is fetched without a sampler names the first one */
-   if (num_tex && !num_samp)
-      num_samp = 1;
+   if (!tu5_emit_tex_tables(cmd, cs, shader->variant->type, num_samp, num_tex,
+                            &samp_map, &tex_map))
+      return;
 
-   if (num_samp) {
-      /* a packet for all, there being at most 16 a stage */
-      const unsigned chunk = 64;
-      for (unsigned i = 0; i < num_samp; i++) {
-         if (i % chunk == 0) {
-            unsigned n = MIN2(chunk, num_samp - i);
-            OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 4 * n);
-            OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(i) |
-                            CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
-                            CP_LOAD_STATE4_0_STATE_BLOCK(sb) |
-                            CP_LOAD_STATE4_0_NUM_UNIT(n));
-            OUT_RING(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_SHADER) |
-                            CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
-            OUT_RING(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
-         }
-         const uint32_t *desc = i < map->count[TU5_DESC_SAMPLER]
-                                   ? tu5_descriptor(cmd, shader, &map->samp[i]) : NULL;
+   for (unsigned i = 0; i < num_samp; i++) {
+      const uint32_t *desc = tu5_descriptor(cmd, shader, &map->samp[i]);
 
-         /* The same as those of Adreno 6xx, of which the third one has the
-          * border colour alone here: its number among those of the device.
-          */
-         OUT_RING(cs, desc ? desc[0] : 0);
-         OUT_RING(cs, desc ? desc[1] : 0);
-         OUT_RING(cs, desc ? desc[2] & A5XX_TEX_SAMP_2_BCOLOR_OFFSET__MASK : 0);
-         OUT_RING(cs, 0x00000000);
-      }
+      /* The same as those of Adreno 6xx, of which the third one has the
+       * border colour alone here: its number among those of the device.
+       */
+      if (!desc)
+         continue;
+      samp_map[i * 4 + 0] = desc[0];
+      samp_map[i * 4 + 1] = desc[1];
+      samp_map[i * 4 + 2] = desc[2] & A5XX_TEX_SAMP_2_BCOLOR_OFFSET__MASK;
    }
 
-   if (num_tex) {
-      const unsigned chunk = 64;
-      for (unsigned i = 0; i < num_tex; i++) {
-         if (i % chunk == 0) {
-            unsigned n = MIN2(chunk, num_tex - i);
-            OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 12 * n);
-            OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(i) |
-                            CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
-                            CP_LOAD_STATE4_0_STATE_BLOCK(sb) |
-                            CP_LOAD_STATE4_0_NUM_UNIT(n));
-            OUT_RING(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
-                            CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
-            OUT_RING(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
-         }
-         const uint32_t *desc = tu5_descriptor(cmd, shader, &map->tex[i]);
+   for (unsigned i = 0; i < num_tex; i++) {
+      const uint32_t *desc = tu5_descriptor(cmd, shader, &map->tex[i]);
 
-         /* see tu5_image_view_descriptor(): the first six, what follows
-          * them in the descriptor being for the storage images
-          */
-         for (unsigned j = 0; j < 6; j++)
-            OUT_RING(cs, desc ? desc[j] : 0);
-         for (unsigned j = 6; j < 12; j++)
-            OUT_RING(cs, 0x00000000);
-      }
+      /* see tu5_image_view_descriptor(): the first six, what follows them in
+       * the descriptor being for the storage images
+       */
+      if (desc)
+         memcpy(&tex_map[i * 16], desc, 6 * sizeof(uint32_t));
    }
-
-   OUT_PKT4(cs, stage == MESA_SHADER_VERTEX ? REG_A5XX_TPL1_VS_TEX_COUNT :
-                stage == MESA_SHADER_FRAGMENT ? REG_A5XX_TPL1_FS_TEX_COUNT :
-                                                REG_A5XX_TPL1_CS_TEX_COUNT, 1);
-   OUT_RING(cs, num_tex);
 }
 
 /* The storage buffers of a fragment or of a compute shader */
@@ -430,10 +438,8 @@ tu5_emit_images(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    const struct ir3_shader_variant *v = shader->variant;
    const struct ir3_const_state *const_state = ir3_const_state(v);
    const struct tu5_desc_map *map = &shader->const_state.a5xx;
-   const struct ir3_ibo_mapping *m = &v->image_mapping;
    unsigned count = map->count[TU5_DESC_IMAGE];
-   enum a4xx_state_block sb, texsb;
-   uint32_t texcount_reg;
+   enum a4xx_state_block sb;
 
    if (!count)
       return;
@@ -441,20 +447,15 @@ tu5_emit_images(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    switch (v->type) {
    case MESA_SHADER_FRAGMENT:
       sb = SB4_SSBO;
-      texsb = SB4_FS_TEX;
-      texcount_reg = REG_A5XX_TPL1_FS_TEX_COUNT;
       break;
    case MESA_SHADER_COMPUTE:
       sb = SB4_CS_SSBO;
-      texsb = SB4_CS_TEX;
-      texcount_reg = REG_A5XX_TPL1_CS_TEX_COUNT;
       break;
    default:
       return;
    }
 
    uint32_t dims[align(MAX2(const_state->image_dims.count, 1), 4)];
-   uint32_t num_tex = map->count[TU5_DESC_TEXTURE];
 
    memset(dims, 0, sizeof(dims));
 
@@ -466,24 +467,9 @@ tu5_emit_images(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       if (!desc)
          desc = none;
 
-      if (m->image_to_tex[i] != IBO_INVALID) {
-         unsigned slot = m->tex_base + m->image_to_tex[i];
-
-         OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 12);
-         OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(slot) |
-                         CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
-                         CP_LOAD_STATE4_0_STATE_BLOCK(texsb) |
-                         CP_LOAD_STATE4_0_NUM_UNIT(1));
-         OUT_RING(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
-                         CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
-         OUT_RING(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
-         for (unsigned j = 0; j < 6; j++)
-            OUT_RING(cs, desc[j]);
-         for (unsigned j = 6; j < 12; j++)
-            OUT_RING(cs, 0x00000000);
-
-         num_tex = MAX2(num_tex, slot + 1);
-      }
+      /* these are read as they are written, see emit_intrinsic_load_image():
+       * no texture
+       */
 
       OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 2);
       OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(v->num_ssbos + i) |
@@ -516,9 +502,6 @@ tu5_emit_images(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       }
    }
 
-   /* after tu5_emit_textures() */
-   OUT_PKT4(cs, texcount_reg, 1);
-   OUT_RING(cs, num_tex);
 
    uint32_t offset = const_state->offsets.image_dims;
 
@@ -2194,66 +2177,47 @@ tu5_emit_mrt_surf(struct tu_cs *cs, unsigned i, const struct tu5_surf *surf)
 
 /* A surface as the one 2D texture of the blits, sampled by texel */
 static void
-tu5_emit_blit_src(struct tu_cs *cs, const struct tu5_surf *surf, bool linear)
+tu5_emit_blit_src(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                  const struct tu5_surf *surf, bool linear)
 {
    enum a5xx_tex_filter filter = linear ? A5XX_TEX_LINEAR : A5XX_TEX_NEAREST;
+   uint32_t *samp, *tex;
 
-   OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 4);
-   OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(0) |
-                   CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
-                   CP_LOAD_STATE4_0_STATE_BLOCK(SB4_FS_TEX) |
-                   CP_LOAD_STATE4_0_NUM_UNIT(1));
-   OUT_RING(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_SHADER) |
-                   CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
-   OUT_RING(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
-   OUT_RING(cs, A5XX_TEX_SAMP_0_XY_MAG(filter) | A5XX_TEX_SAMP_0_XY_MIN(filter) |
-                   A5XX_TEX_SAMP_0_WRAP_S(A5XX_TEX_CLAMP_TO_EDGE) |
-                   A5XX_TEX_SAMP_0_WRAP_T(A5XX_TEX_CLAMP_TO_EDGE) |
-                   A5XX_TEX_SAMP_0_WRAP_R(A5XX_TEX_CLAMP_TO_EDGE));
-   OUT_RING(cs, A5XX_TEX_SAMP_1_UNNORM_COORDS |
-                   A5XX_TEX_SAMP_1_CUBEMAPSEAMLESSFILTOFF |
-                   A5XX_TEX_SAMP_1_MIN_LOD(0.0f) | A5XX_TEX_SAMP_1_MAX_LOD(0.125f));
-   OUT_RING(cs, 0x00000000);
-   OUT_RING(cs, 0x00000000);
+   if (!tu5_emit_tex_tables(cmd, cs, MESA_SHADER_FRAGMENT, 1, 1, &samp, &tex))
+      return;
 
-   OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 12);
-   OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(0) |
-                   CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
-                   CP_LOAD_STATE4_0_STATE_BLOCK(SB4_FS_TEX) |
-                   CP_LOAD_STATE4_0_NUM_UNIT(1));
-   OUT_RING(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
-                   CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
-   OUT_RING(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
-   OUT_RING(cs, A5XX_TEX_CONST_0_TILE_MODE(surf->tile_mode) |
-                   A5XX_TEX_CONST_0_FMT(fd5_pipe2tex(surf->format)) |
-                   A5XX_TEX_CONST_0_SAMPLES(tu_msaa_samples(surf->samples)) |
-                   (surf->swiz
-                       ? fd5_tex_swiz(surf->format, surf->swiz[0], surf->swiz[1],
-                                      surf->swiz[2], surf->swiz[3])
-                       : fd5_tex_swiz(surf->format, PIPE_SWIZZLE_X,
-                                      PIPE_SWIZZLE_Y, PIPE_SWIZZLE_Z,
-                                      PIPE_SWIZZLE_W)) |
-                   COND(util_format_is_srgb(surf->format),
-                        A5XX_TEX_CONST_0_SRGB));
-   OUT_RING(cs, A5XX_TEX_CONST_1_WIDTH(surf->width) |
-                   A5XX_TEX_CONST_1_HEIGHT(surf->height));
-   OUT_RING(cs, A5XX_TEX_CONST_2_PITCHALIGN(0) |
-                   A5XX_TEX_CONST_2_PITCH(surf->pitch) |
-                   A5XX_TEX_CONST_2_TYPE(surf->depth ? A5XX_TEX_3D
-                                                     : A5XX_TEX_2D));
+   samp[0] = A5XX_TEX_SAMP_0_XY_MAG(filter) | A5XX_TEX_SAMP_0_XY_MIN(filter) |
+             A5XX_TEX_SAMP_0_WRAP_S(A5XX_TEX_CLAMP_TO_EDGE) |
+             A5XX_TEX_SAMP_0_WRAP_T(A5XX_TEX_CLAMP_TO_EDGE) |
+             A5XX_TEX_SAMP_0_WRAP_R(A5XX_TEX_CLAMP_TO_EDGE);
+   samp[1] = A5XX_TEX_SAMP_1_UNNORM_COORDS |
+             A5XX_TEX_SAMP_1_CUBEMAPSEAMLESSFILTOFF |
+             A5XX_TEX_SAMP_1_MIN_LOD(0.0f) | A5XX_TEX_SAMP_1_MAX_LOD(0.125f);
+
+   tex[0] = A5XX_TEX_CONST_0_TILE_MODE(surf->tile_mode) |
+            A5XX_TEX_CONST_0_FMT(fd5_pipe2tex(surf->format)) |
+            A5XX_TEX_CONST_0_SAMPLES(tu_msaa_samples(surf->samples)) |
+            (surf->swiz
+                ? fd5_tex_swiz(surf->format, surf->swiz[0], surf->swiz[1],
+                               surf->swiz[2], surf->swiz[3])
+                : fd5_tex_swiz(surf->format, PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y,
+                               PIPE_SWIZZLE_Z, PIPE_SWIZZLE_W)) |
+            COND(util_format_is_srgb(surf->format), A5XX_TEX_CONST_0_SRGB);
+   tex[1] = A5XX_TEX_CONST_1_WIDTH(surf->width) |
+            A5XX_TEX_CONST_1_HEIGHT(surf->height);
+   tex[2] = A5XX_TEX_CONST_2_PITCHALIGN(0) |
+            A5XX_TEX_CONST_2_PITCH(surf->pitch) |
+            A5XX_TEX_CONST_2_TYPE(surf->depth ? A5XX_TEX_3D : A5XX_TEX_2D);
    /* a level that is tiled although small is so for being of an image that
     * is tiled at every level
     */
-   OUT_RING(cs, A5XX_TEX_CONST_3_ARRAY_PITCH(surf->layer_size) |
-                   COND(surf->depth,
-                        A5XX_TEX_CONST_3_MIN_LAYERSZ(surf->min_layer_size)) |
-                   COND(surf->tile_mode != TILE5_LINEAR,
-                        A5XX_TEX_CONST_3_TILE_ALL));
-   OUT_RING(cs, (uint32_t)surf->iova);
-   OUT_RING(cs, (uint32_t)(surf->iova >> 32) |
-                   A5XX_TEX_CONST_5_DEPTH(surf->depth ? surf->depth : 1));
-   for (unsigned i = 6; i < 12; i++)
-      OUT_RING(cs, 0x00000000);
+   tex[3] = A5XX_TEX_CONST_3_ARRAY_PITCH(surf->layer_size) |
+            COND(surf->depth,
+                 A5XX_TEX_CONST_3_MIN_LAYERSZ(surf->min_layer_size)) |
+            COND(surf->tile_mode != TILE5_LINEAR, A5XX_TEX_CONST_3_TILE_ALL);
+   tex[4] = (uint32_t)surf->iova;
+   tex[5] = (uint32_t)(surf->iova >> 32) |
+            A5XX_TEX_CONST_5_DEPTH(surf->depth ? surf->depth : 1);
 }
 
 /* The colour targets of the subpass */
@@ -2588,7 +2552,7 @@ tu5_draw_rect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    tu5_emit_immediates(cs, prog.fs);
 
    if (d->src)
-      tu5_emit_blit_src(cs, d->src, d->src_linear);
+      tu5_emit_blit_src(cmd, cs, d->src, d->src_linear);
 
    OUT_PKT4(cs, REG_A5XX_TPL1_VS_TEX_COUNT, 1);
    OUT_RING(cs, 0);
