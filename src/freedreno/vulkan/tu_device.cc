@@ -1012,6 +1012,11 @@ tu_get_features(struct tu_physical_device *pdevice,
       features->sampleRateShading = true;
       features->dualSrcBlend = true;
       features->alphaToOne = true;
+      features->shaderUniformBufferArrayDynamicIndexing = true;
+      features->shaderSampledImageArrayDynamicIndexing = true;
+      features->shaderStorageBufferArrayDynamicIndexing = true;
+      features->shaderStorageImageArrayDynamicIndexing = true;
+      features->shaderInt16 = true;
    }
 }
 
