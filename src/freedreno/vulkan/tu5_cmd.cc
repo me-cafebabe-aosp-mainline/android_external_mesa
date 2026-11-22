@@ -3929,7 +3929,13 @@ tu5_emit_blend(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 
    OUT_PKT4(cs, REG_A5XX_RB_FS_OUTPUT_CNTL, 1);
    OUT_RING(cs, A5XX_RB_FS_OUTPUT_CNTL_MRT(nr) |
-                   COND(fp->writes_pos, A5XX_RB_FS_OUTPUT_CNTL_FRAG_WRITES_Z));
+                   COND(fp->writes_pos, A5XX_RB_FS_OUTPUT_CNTL_FRAG_WRITES_Z) |
+                   /* found by trying: next to FRAG_WRITES_Z, as on Adreno
+                    * 6xx, the bit for the sample mask the shader writes
+                    */
+                   COND(ir3_find_output_regid(fp, FRAG_RESULT_SAMPLE_MASK) !=
+                           regid(63, 0),
+                        0x40));
 
    OUT_PKT4(cs, REG_A5XX_SP_FS_OUTPUT_CNTL, 1);
    OUT_RING(cs, A5XX_SP_FS_OUTPUT_CNTL_MRT(nr) |
