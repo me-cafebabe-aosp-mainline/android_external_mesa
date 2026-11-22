@@ -51,6 +51,8 @@ enum global_shader {
    GLOBAL_SH_FS_BLIT,
    GLOBAL_SH_FS_BLIT_ZSCALE,
    GLOBAL_SH_FS_COPY_MS,
+   /* a5xx: the rectangle of clears and blits as a triangle strip, see tu5.h */
+   GLOBAL_SH_VS_RECT5,
    GLOBAL_SH_FS_CLEAR0,
    GLOBAL_SH_FS_CLEAR_MAX = GLOBAL_SH_FS_CLEAR0 + MAX_RTS,
    GLOBAL_SH_COUNT,

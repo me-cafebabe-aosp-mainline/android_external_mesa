@@ -26,6 +26,17 @@ void tu5_emit_subpass_begin(struct tu_cmd_buffer *cmd);
 /* The render pass: its draw stream, in system memory */
 void tu5_cmd_render(struct tu_cmd_buffer *cmd);
 
+/* vkCmdClearColorImage() and vkCmdClearDepthStencilImage() */
+void tu5_clear_image(struct tu_cmd_buffer *cmd, struct tu_image *image,
+                     const VkClearValue *value, uint32_t range_count,
+                     const VkImageSubresourceRange *ranges);
+
+/* vkCmdClearAttachments() */
+void tu5_clear_attachments(struct tu_cmd_buffer *cmd,
+                           uint32_t attachment_count,
+                           const VkClearAttachment *attachments,
+                           uint32_t rect_count, const VkClearRect *rects);
+
 /* All the state of a draw */
 VkResult tu5_draw_state(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                         bool indexed);

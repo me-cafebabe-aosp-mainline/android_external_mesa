@@ -120,19 +120,51 @@ tu5_emit_shader(struct tu_cs *cs, const struct ir3_shader_variant *so,
    OUT_RING(cs, iova >> 32);
 }
 
+/* A shader as the hardware gets it: where its instructions are, and its
+ * private memory if it has any.
+ */
+struct tu5_shader {
+   const struct ir3_shader_variant *v;
+   uint64_t iova;
+   uint64_t pvtmem_iova;
+   uint32_t pvtmem_per_fiber_size;
+   uint32_t pvtmem_per_sp_size;
+};
+
+static struct tu5_shader
+tu5_shader_from(const struct tu_shader *shader)
+{
+   return (struct tu5_shader) {
+      .v = shader->variant,
+      .iova = shader->binary_iova,
+      .pvtmem_iova = shader->pvtmem.iova,
+      .pvtmem_per_fiber_size = shader->pvtmem.per_fiber_size,
+      .pvtmem_per_sp_size = shader->pvtmem.per_sp_size,
+   };
+}
+
+static struct tu5_shader
+tu5_global_shader(const struct tu_device *dev, enum global_shader id)
+{
+   return (struct tu5_shader) {
+      .v = dev->global_shader_variants[id],
+      .iova = dev->global_shader_va[id],
+   };
+}
+
 static void
-tu5_emit_shader_obj(struct tu_cs *cs, const struct tu_shader *shader,
+tu5_emit_shader_obj(struct tu_cs *cs, const struct tu5_shader *shader,
                     uint32_t shader_obj_reg)
 {
    OUT_PKT4(cs, shader_obj_reg, 6);
-   tu_cs_emit_qw(cs, shader->binary_iova); /* SP_VS_OBJ_START_LO/HI */
+   tu_cs_emit_qw(cs, shader->iova); /* SP_VS_OBJ_START_LO/HI */
    OUT_RING(cs, A5XX_SP_VS_PVT_MEM_PARAM_MEMSIZEPERITEM(
-                   shader->pvtmem.per_fiber_size) |
+                   shader->pvtmem_per_fiber_size) |
                    A5XX_SP_VS_PVT_MEM_PARAM_HWSTACKOFFSET(
-                      shader->pvtmem.per_sp_size));
-   tu_cs_emit_qw(cs, shader->pvtmem.iova); /* SP_xS_PVT_MEM_ADDR */
+                      shader->pvtmem_per_sp_size));
+   tu_cs_emit_qw(cs, shader->pvtmem_iova); /* SP_xS_PVT_MEM_ADDR */
    OUT_RING(cs,
-            A5XX_SP_VS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(shader->pvtmem.per_sp_size));
+            A5XX_SP_VS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(shader->pvtmem_per_sp_size));
 }
 
 /* regid:      base const register
@@ -219,7 +251,7 @@ tu5_emit_flushes(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t flushes)
 
 struct tu5_program {
    const struct ir3_shader_variant *vs, *fs;
-   const struct tu_shader *vs_shader, *fs_shader;
+   struct tu5_shader vs_shader, fs_shader;
    bool binning_pass;
    bool rasterflat;
    unsigned max_loc;
@@ -345,6 +377,8 @@ tu5_program_emit(struct tu_cs *ring, struct tu5_program *emit)
    clip1_regid = ir3_find_output_regid(s[VS].v, VARYING_SLOT_CLIP_DIST1);
    vertex_regid =
       ir3_find_sysval_regid(s[VS].v, SYSTEM_VALUE_VERTEX_ID_ZERO_BASE);
+   if (!VALIDREG(vertex_regid))
+      vertex_regid = ir3_find_sysval_regid(s[VS].v, SYSTEM_VALUE_VERTEX_ID);
    instance_regid = ir3_find_sysval_regid(s[VS].v, SYSTEM_VALUE_INSTANCE_ID);
 
    if (s[FS].v->color0_mrt) {
@@ -562,10 +596,10 @@ tu5_program_emit(struct tu_cs *ring, struct tu5_program *emit)
       OUT_RING(ring, reg);
    }
 
-   tu5_emit_shader_obj(ring, emit->vs_shader, REG_A5XX_SP_VS_OBJ_START_LO);
+   tu5_emit_shader_obj(ring, &emit->vs_shader, REG_A5XX_SP_VS_OBJ_START_LO);
 
    if (s[VS].instrlen)
-      tu5_emit_shader(ring, s[VS].v, emit->vs_shader->binary_iova);
+      tu5_emit_shader(ring, s[VS].v, emit->vs_shader.iova);
 
    // TODO depending on other bits in this reg (if any) set somewhere else?
    OUT_PKT4(ring, REG_A5XX_PC_PRIM_VTX_CNTL, 1);
@@ -586,7 +620,7 @@ tu5_program_emit(struct tu_cs *ring, struct tu5_program *emit)
       OUT_RING(ring, 0x00000000); /* SP_FS_OBJ_START_LO */
       OUT_RING(ring, 0x00000000); /* SP_FS_OBJ_START_HI */
    } else {
-      tu5_emit_shader_obj(ring, emit->fs_shader, REG_A5XX_SP_FS_OBJ_START_LO);
+      tu5_emit_shader_obj(ring, &emit->fs_shader, REG_A5XX_SP_FS_OBJ_START_LO);
    }
 
    OUT_PKT4(ring, REG_A5XX_HLSQ_CONTROL_0_REG, 5);
@@ -787,7 +821,7 @@ tu5_program_emit(struct tu_cs *ring, struct tu5_program *emit)
 
    if (!emit->binning_pass)
       if (s[FS].instrlen)
-         tu5_emit_shader(ring, s[FS].v, emit->fs_shader->binary_iova);
+         tu5_emit_shader(ring, s[FS].v, emit->fs_shader.iova);
 
    OUT_PKT4(ring, REG_A5XX_VFD_CONTROL_1, 5);
    OUT_RING(ring, A5XX_VFD_CONTROL_1_REGID4VTX(vertex_regid) |
@@ -1030,6 +1064,58 @@ tu5_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *ring)
    OUT_RING(ring, 0x00000000);
 }
 
+/* One colour target: a level and a layer of an image, or none */
+static void
+tu5_emit_mrt_surface(struct tu_cs *cs, unsigned i, const struct tu_image *image,
+                     enum pipe_format pformat, uint32_t level, uint32_t layer)
+{
+   enum a5xx_color_fmt format = (enum a5xx_color_fmt)0;
+   enum a5xx_tile_mode tile_mode = TILE5_LINEAR;
+   enum a3xx_color_swap swap = WZYX;
+   bool srgb = false, sint = false, uint = false;
+   uint32_t stride = 0;
+   uint32_t size = 0;
+   uint64_t base = 0;
+
+   if (image) {
+      const struct fdl_layout *layout = &image->layout[0];
+
+      format = fd5_pipe2color(pformat);
+      swap = fd5_pipe2swap(pformat);
+      srgb = util_format_is_srgb(pformat);
+      sint = util_format_is_pure_sint(pformat);
+      uint = util_format_is_pure_uint(pformat);
+
+      stride = fdl_pitch(layout, level);
+      size = fdl_layer_stride(layout, level);
+      tile_mode = (enum a5xx_tile_mode)fdl_tile_mode(layout, level);
+      base = image->iova + fdl_surface_offset(layout, level, layer);
+   }
+
+   OUT_PKT4(cs, REG_A5XX_RB_MRT_BUF_INFO(i), 5);
+   OUT_RING(cs, A5XX_RB_MRT_BUF_INFO_COLOR_FORMAT(format) |
+                   A5XX_RB_MRT_BUF_INFO_COLOR_TILE_MODE(tile_mode) |
+                   A5XX_RB_MRT_BUF_INFO_COLOR_SWAP(swap) |
+                   COND(srgb, A5XX_RB_MRT_BUF_INFO_COLOR_SRGB));
+   OUT_RING(cs, A5XX_RB_MRT_PITCH(stride));
+   OUT_RING(cs, A5XX_RB_MRT_ARRAY_PITCH(size));
+   tu_cs_emit_qw(cs, base); /* RB_MRT[i].BASE_LO/HI */
+
+   OUT_PKT4(cs, REG_A5XX_SP_FS_MRT_REG(i), 1);
+   OUT_RING(cs, A5XX_SP_FS_MRT_REG_COLOR_FORMAT(format) |
+                   COND(sint, A5XX_SP_FS_MRT_REG_COLOR_SINT) |
+                   COND(uint, A5XX_SP_FS_MRT_REG_COLOR_UINT) |
+                   COND(srgb, A5XX_SP_FS_MRT_REG_COLOR_SRGB));
+
+   /* no UBWC */
+   OUT_PKT4(cs, REG_A5XX_RB_MRT_FLAG_BUFFER(i), 4);
+   OUT_RING(cs, 0x00000000); /* RB_MRT_FLAG_BUFFER[i].ADDR_LO */
+   OUT_RING(cs, 0x00000000); /* RB_MRT_FLAG_BUFFER[i].ADDR_HI */
+   OUT_RING(cs, A5XX_RB_MRT_FLAG_BUFFER_PITCH(0));
+   OUT_RING(cs, A5XX_RB_MRT_FLAG_BUFFER_ARRAY_PITCH(0));
+}
+
+/* The colour targets of the subpass */
 static void
 tu5_emit_mrt(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
 {
@@ -1037,77 +1123,32 @@ tu5_emit_mrt(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
    uint32_t components = 0;
 
    for (unsigned i = 0; i < A5XX_MAX_RENDER_TARGETS; i++) {
-      enum a5xx_color_fmt format = (enum a5xx_color_fmt)0;
-      enum a5xx_tile_mode tile_mode = TILE5_LINEAR;
-      enum a3xx_color_swap swap = WZYX;
-      bool srgb = false, sint = false, uint = false;
-      uint32_t stride = 0;
-      uint32_t size = 0;
-      uint64_t base = 0;
-
       if (i < subpass->color_count &&
           subpass->color_attachments[i].attachment != VK_ATTACHMENT_UNUSED) {
          const struct tu_image_view *iview =
             cmd->state.attachments[subpass->color_attachments[i].attachment];
-         const struct tu_image *image = iview->image;
-         const struct fdl_layout *layout = &image->layout[0];
-         enum pipe_format pformat = vk_format_to_pipe_format(iview->vk.format);
-         uint32_t level = iview->vk.base_mip_level;
 
-         format = fd5_pipe2color(pformat);
-         swap = fd5_pipe2swap(pformat);
-         srgb = util_format_is_srgb(pformat);
-         sint = util_format_is_pure_sint(pformat);
-         uint = util_format_is_pure_uint(pformat);
-
-         stride = fdl_pitch(layout, level);
-         size = fdl_layer_stride(layout, level);
-         tile_mode = (enum a5xx_tile_mode)fdl_tile_mode(layout, level);
-         base = image->iova +
-                fdl_surface_offset(layout, level, iview->vk.base_array_layer);
-
+         tu5_emit_mrt_surface(cs, i, iview->image,
+                              vk_format_to_pipe_format(iview->vk.format),
+                              iview->vk.base_mip_level,
+                              iview->vk.base_array_layer);
          components |= 0xf << (i * 4);
+      } else {
+         tu5_emit_mrt_surface(cs, i, NULL, PIPE_FORMAT_NONE, 0, 0);
       }
-
-      OUT_PKT4(cs, REG_A5XX_RB_MRT_BUF_INFO(i), 5);
-      OUT_RING(cs, A5XX_RB_MRT_BUF_INFO_COLOR_FORMAT(format) |
-                      A5XX_RB_MRT_BUF_INFO_COLOR_TILE_MODE(tile_mode) |
-                      A5XX_RB_MRT_BUF_INFO_COLOR_SWAP(swap) |
-                      COND(srgb, A5XX_RB_MRT_BUF_INFO_COLOR_SRGB));
-      OUT_RING(cs, A5XX_RB_MRT_PITCH(stride));
-      OUT_RING(cs, A5XX_RB_MRT_ARRAY_PITCH(size));
-      tu_cs_emit_qw(cs, base); /* RB_MRT[i].BASE_LO/HI */
-
-      OUT_PKT4(cs, REG_A5XX_SP_FS_MRT_REG(i), 1);
-      OUT_RING(cs, A5XX_SP_FS_MRT_REG_COLOR_FORMAT(format) |
-                      COND(sint, A5XX_SP_FS_MRT_REG_COLOR_SINT) |
-                      COND(uint, A5XX_SP_FS_MRT_REG_COLOR_UINT) |
-                      COND(srgb, A5XX_SP_FS_MRT_REG_COLOR_SRGB));
-
-      /* no UBWC */
-      OUT_PKT4(cs, REG_A5XX_RB_MRT_FLAG_BUFFER(i), 4);
-      OUT_RING(cs, 0x00000000); /* RB_MRT_FLAG_BUFFER[i].ADDR_LO */
-      OUT_RING(cs, 0x00000000); /* RB_MRT_FLAG_BUFFER[i].ADDR_HI */
-      OUT_RING(cs, A5XX_RB_MRT_FLAG_BUFFER_PITCH(0));
-      OUT_RING(cs, A5XX_RB_MRT_FLAG_BUFFER_ARRAY_PITCH(0));
    }
 
    OUT_PKT4(cs, REG_A5XX_RB_RENDER_COMPONENTS, 1);
    OUT_RING(cs, components);
 }
 
+/* The depth and stencil buffer: a level and a layer of an image, or none */
 static void
-tu5_emit_zs(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+tu5_emit_zs_surface(struct tu_cs *cs, const struct tu_image *image,
+                    uint32_t level, uint32_t layer)
 {
-   const struct tu_subpass *subpass = cmd->state.subpass;
-   uint32_t a = subpass->depth_stencil_attachment.attachment;
-
-   if (a != VK_ATTACHMENT_UNUSED) {
-      const struct tu_image_view *iview = cmd->state.attachments[a];
-      const struct tu_image *image = iview->image;
+   if (image) {
       const struct fdl_layout *layout = &image->layout[0];
-      uint32_t level = iview->vk.base_mip_level;
-      uint32_t layer = iview->vk.base_array_layer;
       enum a5xx_depth_format fmt =
          fd5_pipe2depth(vk_format_to_pipe_format(image->vk.format));
 
@@ -1172,6 +1213,21 @@ tu5_emit_zs(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
 }
 
 static void
+tu5_emit_zs(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+{
+   uint32_t a = cmd->state.subpass->depth_stencil_attachment.attachment;
+
+   if (a != VK_ATTACHMENT_UNUSED) {
+      const struct tu_image_view *iview = cmd->state.attachments[a];
+
+      tu5_emit_zs_surface(cs, iview->image, iview->vk.base_mip_level,
+                          iview->vk.base_array_layer);
+   } else {
+      tu5_emit_zs_surface(cs, NULL, 0, 0);
+   }
+}
+
+static void
 tu5_emit_msaa(struct tu_cs *cs, VkSampleCountFlagBits vk_samples)
 {
    enum a3xx_msaa_samples samples = tu_msaa_samples(vk_samples);
@@ -1195,14 +1251,253 @@ tu5_emit_msaa(struct tu_cs *cs, VkSampleCountFlagBits vk_samples)
                         A5XX_GRAS_SC_DEST_MSAA_CNTL_MSAA_DISABLE));
 }
 
-void
-tu5_emit_subpass_begin(struct tu_cmd_buffer *cmd)
-{
-   struct tu_cs *cs = &cmd->draw_cs;
+/* A rectangle drawn with the internal shaders, for the clears and the blits.
+ * a5xx gets these as a triangle strip of four vertices through the usual
+ * viewport transform: see build_rect5_vs_shader().
+ */
+struct tu5_rect_draw {
+   enum global_shader fs;
 
-   tu5_emit_zs(cmd, cs);
-   tu5_emit_mrt(cmd, cs);
-   tu5_emit_msaa(cs, cmd->state.subpass->samples);
+   /* Size of the target, for the viewport */
+   uint32_t width, height;
+   /* The rectangle on the target, which is the scissor too */
+   VkRect2D rect;
+
+   /* The colour target written, or -1 */
+   int rt;
+   /* Depth written from z, stencil from stencil_ref */
+   bool depth, stencil;
+   float z;
+   uint32_t stencil_ref;
+
+   const uint32_t *fs_consts;
+   uint32_t fs_consts_dwords;
+
+   /* Texture coordinates of the corners of the rectangle, and a third one */
+   float s0, t0, s1, t1, r;
+};
+
+static void
+tu5_draw_rect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+              const struct tu5_rect_draw *d)
+{
+   struct tu5_program prog = {};
+
+   prog.vs_shader = tu5_global_shader(cmd->device, GLOBAL_SH_VS_RECT5);
+   prog.fs_shader = tu5_global_shader(cmd->device, d->fs);
+   prog.vs = prog.vs_shader.v;
+   prog.fs = prog.fs_shader.v;
+
+   /* depth and stencil */
+   OUT_PKT4(cs, REG_A5XX_RB_ALPHA_CONTROL, 1);
+   OUT_RING(cs, 0x00000000);
+
+   OUT_PKT4(cs, REG_A5XX_RB_STENCIL_CONTROL, 1);
+   OUT_RING(cs, COND(d->stencil,
+                     A5XX_RB_STENCIL_CONTROL_STENCIL_ENABLE |
+                        A5XX_RB_STENCIL_CONTROL_STENCIL_ENABLE_BF |
+                        A5XX_RB_STENCIL_CONTROL_FUNC(FUNC_ALWAYS) |
+                        A5XX_RB_STENCIL_CONTROL_FAIL(STENCIL_REPLACE) |
+                        A5XX_RB_STENCIL_CONTROL_ZPASS(STENCIL_REPLACE) |
+                        A5XX_RB_STENCIL_CONTROL_ZFAIL(STENCIL_REPLACE) |
+                        A5XX_RB_STENCIL_CONTROL_FUNC_BF(FUNC_ALWAYS) |
+                        A5XX_RB_STENCIL_CONTROL_FAIL_BF(STENCIL_REPLACE) |
+                        A5XX_RB_STENCIL_CONTROL_ZPASS_BF(STENCIL_REPLACE) |
+                        A5XX_RB_STENCIL_CONTROL_ZFAIL_BF(STENCIL_REPLACE)));
+
+   OUT_PKT4(cs, REG_A5XX_GRAS_LRZ_CNTL, 1);
+   OUT_RING(cs, 0x00000000);
+
+   OUT_PKT4(cs, REG_A5XX_RB_STENCILREFMASK, 2);
+   OUT_RING(cs, A5XX_RB_STENCILREFMASK_STENCILWRITEMASK(0xff) |
+                   A5XX_RB_STENCILREFMASK_STENCILMASK(0xff) |
+                   A5XX_RB_STENCILREFMASK_STENCILREF(d->stencil_ref));
+   OUT_RING(cs, A5XX_RB_STENCILREFMASK_BF_STENCILWRITEMASK(0xff) |
+                   A5XX_RB_STENCILREFMASK_BF_STENCILMASK(0xff) |
+                   A5XX_RB_STENCILREFMASK_BF_STENCILREF(d->stencil_ref));
+
+   OUT_PKT4(cs, REG_A5XX_RB_DEPTH_CNTL, 1);
+   OUT_RING(cs, COND(d->depth, A5XX_RB_DEPTH_CNTL_ZFUNC(FUNC_ALWAYS) |
+                                  A5XX_RB_DEPTH_CNTL_Z_TEST_ENABLE |
+                                  A5XX_RB_DEPTH_CNTL_Z_WRITE_ENABLE));
+
+   OUT_PKT4(cs, REG_A5XX_RB_DEPTH_PLANE_CNTL, 1);
+   OUT_RING(cs, 0x00000000);
+
+   OUT_PKT4(cs, REG_A5XX_GRAS_SU_DEPTH_PLANE_CNTL, 1);
+   OUT_RING(cs, 0x00000000);
+
+   /* scissor and viewport */
+   uint32_t minx = d->rect.offset.x, miny = d->rect.offset.y;
+   uint32_t maxx = minx + d->rect.extent.width - 1;
+   uint32_t maxy = miny + d->rect.extent.height - 1;
+
+   OUT_PKT4(cs, REG_A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0, 2);
+   OUT_RING(cs, A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0_X(minx) |
+                   A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0_Y(miny));
+   OUT_RING(cs, A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0_X(maxx) |
+                   A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0_Y(maxy));
+
+   OUT_PKT4(cs, REG_A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0, 2);
+   OUT_RING(cs, A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_X(minx) |
+                   A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_Y(miny));
+   OUT_RING(cs, A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_X(maxx) |
+                   A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_Y(maxy));
+
+   tu_cs_emit_wfi(cs);
+   OUT_PKT4(cs, REG_A5XX_GRAS_CL_VPORT_XOFFSET_0, 6);
+   OUT_RING(cs, A5XX_GRAS_CL_VPORT_XOFFSET_0(d->width / 2.0f));
+   OUT_RING(cs, A5XX_GRAS_CL_VPORT_XSCALE_0(d->width / 2.0f));
+   OUT_RING(cs, A5XX_GRAS_CL_VPORT_YOFFSET_0(d->height / 2.0f));
+   OUT_RING(cs, A5XX_GRAS_CL_VPORT_YSCALE_0(d->height / 2.0f));
+   OUT_RING(cs, A5XX_GRAS_CL_VPORT_ZOFFSET_0(0.0f));
+   OUT_RING(cs, A5XX_GRAS_CL_VPORT_ZSCALE_0(1.0f));
+
+   tu5_program_emit(cs, &prog);
+
+   /* rasterizer */
+   OUT_PKT4(cs, REG_A5XX_GRAS_SU_CNTL, 1);
+   OUT_RING(cs, 0x00000000);
+
+   OUT_PKT4(cs, REG_A5XX_GRAS_SU_POLY_OFFSET_SCALE, 3);
+   OUT_RING(cs, 0x00000000);
+   OUT_RING(cs, 0x00000000);
+   OUT_RING(cs, 0x00000000);
+
+   OUT_PKT4(cs, REG_A5XX_PC_RASTER_CNTL, 1);
+   OUT_RING(cs, A5XX_PC_RASTER_CNTL_POLYMODE_FRONT_PTYPE(PC_DRAW_TRIANGLES) |
+                   A5XX_PC_RASTER_CNTL_POLYMODE_BACK_PTYPE(PC_DRAW_TRIANGLES));
+
+   OUT_PKT4(cs, REG_A5XX_GRAS_CL_CNTL, 1);
+   OUT_RING(cs, A5XX_GRAS_CL_CNTL_ZERO_GB_SCALE_Z);
+
+   OUT_PKT4(cs, REG_A5XX_PC_PRIMITIVE_CNTL, 1);
+   OUT_RING(cs, A5XX_PC_PRIMITIVE_CNTL_STRIDE_IN_VPC(prog.max_loc));
+
+   /* The colour target written, with the first output of the shader */
+   for (unsigned i = 0; i < A5XX_MAX_RENDER_TARGETS; i++) {
+      OUT_PKT4(cs, REG_A5XX_RB_MRT_CONTROL(i), 1);
+      OUT_RING(cs, COND((int)i == d->rt,
+                        A5XX_RB_MRT_CONTROL_ROP_CODE(ROP_COPY) |
+                           A5XX_RB_MRT_CONTROL_COMPONENT_ENABLE(0xf)));
+
+      OUT_PKT4(cs, REG_A5XX_RB_MRT_BLEND_CONTROL(i), 1);
+      OUT_RING(cs, 0x00000000);
+   }
+
+   if (d->rt > 0) {
+      uint32_t regid = ir3_find_output_regid(prog.fs, FRAG_RESULT_DATA0);
+
+      OUT_PKT4(cs, REG_A5XX_SP_FS_OUTPUT_REG(d->rt), 1);
+      OUT_RING(cs, A5XX_SP_FS_OUTPUT_REG_REGID(regid) |
+                      COND(regid & HALF_REG_ID,
+                           A5XX_SP_FS_OUTPUT_REG_HALF_PRECISION));
+   }
+
+   OUT_PKT4(cs, REG_A5XX_SP_BLEND_CNTL, 1);
+   OUT_RING(cs, A5XX_SP_BLEND_CNTL_UNK8);
+
+   OUT_PKT4(cs, REG_A5XX_RB_BLEND_CNTL, 1);
+   OUT_RING(cs, A5XX_RB_BLEND_CNTL_INDEPENDENT_BLEND |
+                   A5XX_RB_BLEND_CNTL_SAMPLE_MASK(0xffff));
+
+   OUT_PKT4(cs, REG_A5XX_RB_FS_OUTPUT_CNTL, 1);
+   OUT_RING(cs, A5XX_RB_FS_OUTPUT_CNTL_MRT(d->rt + 1));
+
+   OUT_PKT4(cs, REG_A5XX_SP_FS_OUTPUT_CNTL, 1);
+   OUT_RING(cs, A5XX_SP_FS_OUTPUT_CNTL_MRT(d->rt + 1) |
+                   A5XX_SP_FS_OUTPUT_CNTL_DEPTH_REGID(regid(63, 0)) |
+                   A5XX_SP_FS_OUTPUT_CNTL_SAMPLEMASK_REGID(regid(63, 0)));
+
+   /* no vertex buffers: the vertices are made from the constants */
+   OUT_PKT4(cs, REG_A5XX_VFD_CONTROL_0, 1);
+   OUT_RING(cs, A5XX_VFD_CONTROL_0_VTXCNT(0));
+
+   OUT_PKT4(cs, REG_A5XX_VFD_INDEX_OFFSET, 2);
+   OUT_RING(cs, 0);
+   OUT_RING(cs, 0);
+
+   const float vs_consts[12] = {
+      2.0f * d->rect.offset.x / d->width - 1.0f,
+      2.0f * d->rect.offset.y / d->height - 1.0f,
+      2.0f * (d->rect.offset.x + d->rect.extent.width) / d->width - 1.0f,
+      2.0f * (d->rect.offset.y + d->rect.extent.height) / d->height - 1.0f,
+      d->s0, d->t0, d->s1, d->t1,
+      d->z, d->r, 0.0f, 0.0f,
+   };
+   tu5_emit_const(cs, prog.vs, 0, 12, (const uint32_t *)vs_consts);
+   tu5_emit_immediates(cs, prog.vs);
+
+   if (d->fs_consts_dwords)
+      tu5_emit_const(cs, prog.fs, 0, d->fs_consts_dwords, d->fs_consts);
+   tu5_emit_immediates(cs, prog.fs);
+
+   OUT_PKT4(cs, REG_A5XX_TPL1_VS_TEX_COUNT, 1);
+   OUT_RING(cs, 0);
+   OUT_PKT4(cs, REG_A5XX_TPL1_FS_TEX_COUNT, 1);
+   OUT_RING(cs, 0);
+
+   OUT_PKT7(cs, CP_DRAW_INDX_OFFSET, 3);
+   OUT_RING(cs, CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(DI_PT_TRISTRIP) |
+                   CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_AUTO_INDEX) |
+                   CP_DRAW_INDX_OFFSET_0_INDEX_SIZE(INDEX4_SIZE_32_BIT) |
+                   CP_DRAW_INDX_OFFSET_0_VIS_CULL(IGNORE_VISIBILITY));
+   OUT_RING(cs, 1); /* NumInstances */
+   OUT_RING(cs, 4); /* NumIndices */
+
+   /* All of the draw state was written over */
+   cmd->state.dirty |= TU_CMD_DIRTY_DRAW_STATE;
+}
+
+/* Clear a rectangle of the targets bound: a colour one, or depth and stencil */
+static void
+tu5_clear_rect(struct tu_cmd_buffer *cmd, struct tu_cs *cs, int rt,
+               VkImageAspectFlags aspects, const VkClearValue *value,
+               VkRect2D rect, uint32_t width, uint32_t height)
+{
+   struct tu5_rect_draw d = {
+      .fs = rt >= 0 ? (enum global_shader)(GLOBAL_SH_FS_CLEAR0 + 1)
+                    : GLOBAL_SH_FS_CLEAR0,
+      .width = width,
+      .height = height,
+      .rect = rect,
+      .rt = rt,
+   };
+
+   if (!rect.extent.width || !rect.extent.height)
+      return;
+
+   if (rt >= 0) {
+      d.fs_consts = value->color.uint32;
+      d.fs_consts_dwords = 4;
+   } else {
+      d.depth = aspects & VK_IMAGE_ASPECT_DEPTH_BIT;
+      d.stencil = aspects & VK_IMAGE_ASPECT_STENCIL_BIT;
+      d.z = value->depthStencil.depth;
+      d.stencil_ref = value->depthStencil.stencil & 0xff;
+   }
+
+   tu5_draw_rect(cmd, cs, &d);
+}
+
+/* Bind a level and a layer of an image as the one target, for the clears and
+ * the blits into it.
+ */
+static void
+tu5_bind_target(struct tu_cs *cs, const struct tu_image *image,
+                enum pipe_format format, uint32_t level, uint32_t layer)
+{
+   bool zs = util_format_is_depth_or_stencil(format);
+
+   tu5_emit_zs_surface(cs, zs ? image : NULL, level, layer);
+   tu5_emit_mrt_surface(cs, 0, zs ? NULL : image, format, level, layer);
+   for (unsigned i = 1; i < A5XX_MAX_RENDER_TARGETS; i++)
+      tu5_emit_mrt_surface(cs, i, NULL, PIPE_FORMAT_NONE, 0, 0);
+
+   OUT_PKT4(cs, REG_A5XX_RB_RENDER_COMPONENTS, 1);
+   OUT_RING(cs, zs ? 0x0 : 0xf);
+
+   tu5_emit_msaa(cs, (VkSampleCountFlagBits)image->vk.samples);
 
    OUT_PKT4(cs, REG_A5XX_RB_RENDER_CNTL, 1);
    OUT_RING(cs, 0x00000008);
@@ -1211,15 +1506,40 @@ tu5_emit_subpass_begin(struct tu_cmd_buffer *cmd)
    OUT_RING(cs, 0x00000008);
 }
 
-/* TODO: tiled rendering through GMEM. Everything is drawn straight into the
- * attachments for now.
- */
-void
-tu5_cmd_render(struct tu_cmd_buffer *cmd)
+/* The clears of the attachments that the subpass that starts uses first */
+static void
+tu5_emit_load_clears(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+{
+   const struct tu_render_pass *pass = cmd->state.pass;
+   const struct tu_framebuffer *fb = cmd->state.framebuffer;
+   uint32_t subpass_idx = cmd->state.subpass - pass->subpasses;
+
+   for (uint32_t a = 0; a < pass->attachment_count; a++) {
+      const struct tu_render_pass_attachment *att = &pass->attachments[a];
+
+      if (!att->clear_mask || att->first_subpass_idx != subpass_idx)
+         continue;
+
+      const struct tu_image_view *iview = cmd->state.attachments[a];
+      enum pipe_format format = vk_format_to_pipe_format(iview->vk.format);
+      bool zs = util_format_is_depth_or_stencil(format);
+
+      for (uint32_t layer = 0; layer < fb->layers; layer++) {
+         tu5_bind_target(cs, iview->image, format, iview->vk.base_mip_level,
+                         iview->vk.base_array_layer + layer);
+         tu5_clear_rect(cmd, cs, zs ? -1 : 0, att->clear_mask,
+                        &cmd->state.clear_values[a], cmd->state.render_area,
+                        iview->vk.extent.width, iview->vk.extent.height);
+      }
+   }
+}
+
+/* What comes before and after drawing straight into the images */
+static void
+tu5_sysmem_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t width,
+                 uint32_t height)
 {
    const struct fd_dev_info *info = cmd->device->physical_device->info;
-   const struct tu_framebuffer *fb = cmd->state.framebuffer;
-   struct tu_cs *cs = &cmd->cs;
 
    tu5_set_render_mode(cs, BYPASS);
    tu5_cache_flush(cs);
@@ -1249,22 +1569,24 @@ tu5_cmd_render(struct tu_cmd_buffer *cmd)
    OUT_PKT4(cs, REG_A5XX_GRAS_SC_WINDOW_SCISSOR_TL, 2);
    OUT_RING(cs, A5XX_GRAS_SC_WINDOW_SCISSOR_TL_X(0) |
                    A5XX_GRAS_SC_WINDOW_SCISSOR_TL_Y(0));
-   OUT_RING(cs, A5XX_GRAS_SC_WINDOW_SCISSOR_BR_X(fb->width - 1) |
-                   A5XX_GRAS_SC_WINDOW_SCISSOR_BR_Y(fb->height - 1));
+   OUT_RING(cs, A5XX_GRAS_SC_WINDOW_SCISSOR_BR_X(width - 1) |
+                   A5XX_GRAS_SC_WINDOW_SCISSOR_BR_Y(height - 1));
 
    OUT_PKT4(cs, REG_A5XX_RB_RESOLVE_CNTL_1, 2);
    OUT_RING(cs, A5XX_RB_RESOLVE_CNTL_1_X(0) | A5XX_RB_RESOLVE_CNTL_1_Y(0));
-   OUT_RING(cs, A5XX_RB_RESOLVE_CNTL_2_X(fb->width - 1) |
-                   A5XX_RB_RESOLVE_CNTL_2_Y(fb->height - 1));
+   OUT_RING(cs, A5XX_RB_RESOLVE_CNTL_2_X(width - 1) |
+                   A5XX_RB_RESOLVE_CNTL_2_Y(height - 1));
 
    OUT_PKT4(cs, REG_A5XX_RB_WINDOW_OFFSET, 1);
    OUT_RING(cs, A5XX_RB_WINDOW_OFFSET_X(0) | A5XX_RB_WINDOW_OFFSET_Y(0));
 
    OUT_PKT7(cs, CP_SET_VISIBILITY_OVERRIDE, 1);
    OUT_RING(cs, 0x1);
+}
 
-   tu_cs_emit_call(cs, &cmd->draw_cs);
-
+static void
+tu5_sysmem_end(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+{
    OUT_PKT7(cs, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
    OUT_RING(cs, 0x0);
 
@@ -1272,6 +1594,108 @@ tu5_cmd_render(struct tu_cmd_buffer *cmd)
 
    tu5_event_write(cmd, cs, PC_CCU_FLUSH_COLOR_TS, true);
    tu5_event_write(cmd, cs, PC_CCU_FLUSH_DEPTH_TS, true);
+}
+
+void
+tu5_clear_image(struct tu_cmd_buffer *cmd, struct tu_image *image,
+                const VkClearValue *value, uint32_t range_count,
+                const VkImageSubresourceRange *ranges)
+{
+   struct tu_cs *cs = &cmd->cs;
+   enum pipe_format format = vk_format_to_pipe_format(image->vk.format);
+   bool zs = util_format_is_depth_or_stencil(format);
+
+   for (uint32_t i = 0; i < range_count; i++) {
+      const VkImageSubresourceRange *range = &ranges[i];
+      uint32_t level_count = vk_image_subresource_level_count(&image->vk, range);
+      uint32_t layer_count = vk_image_subresource_layer_count(&image->vk, range);
+
+      for (uint32_t l = 0; l < level_count; l++) {
+         uint32_t level = range->baseMipLevel + l;
+         uint32_t width = u_minify(image->vk.extent.width, level);
+         uint32_t height = u_minify(image->vk.extent.height, level);
+         uint32_t layers = image->vk.image_type == VK_IMAGE_TYPE_3D
+                              ? u_minify(image->vk.extent.depth, level)
+                              : layer_count;
+         VkRect2D rect = { { 0, 0 }, { width, height } };
+
+         tu5_sysmem_begin(cmd, cs, width, height);
+         for (uint32_t layer = 0; layer < layers; layer++) {
+            tu5_bind_target(cs, image, format, level,
+                            range->baseArrayLayer + layer);
+            tu5_clear_rect(cmd, cs, zs ? -1 : 0, range->aspectMask, value,
+                           rect, width, height);
+         }
+         tu5_sysmem_end(cmd, cs);
+      }
+   }
+}
+
+/* vkCmdClearAttachments(), in the draw stream of the render pass */
+void
+tu5_clear_attachments(struct tu_cmd_buffer *cmd, uint32_t attachment_count,
+                      const VkClearAttachment *attachments,
+                      uint32_t rect_count, const VkClearRect *rects)
+{
+   const struct tu_subpass *subpass = cmd->state.subpass;
+   const struct tu_framebuffer *fb = cmd->state.framebuffer;
+   struct tu_cs *cs = &cmd->draw_cs;
+
+   for (uint32_t i = 0; i < attachment_count; i++) {
+      const VkClearAttachment *att = &attachments[i];
+      int rt = -1;
+
+      if (att->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
+         if (att->colorAttachment >= subpass->color_count ||
+             subpass->color_attachments[att->colorAttachment].attachment ==
+                VK_ATTACHMENT_UNUSED)
+            continue;
+         rt = att->colorAttachment;
+      } else if (subpass->depth_stencil_attachment.attachment ==
+                 VK_ATTACHMENT_UNUSED) {
+         continue;
+      }
+
+      /* TODO: the layers past the first one of layered framebuffers */
+      for (uint32_t r = 0; r < rect_count; r++) {
+         if (rects[r].baseArrayLayer != 0)
+            continue;
+         tu5_clear_rect(cmd, cs, rt, att->aspectMask, &att->clearValue,
+                        rects[r].rect, fb->width, fb->height);
+      }
+   }
+}
+
+void
+tu5_emit_subpass_begin(struct tu_cmd_buffer *cmd)
+{
+   struct tu_cs *cs = &cmd->draw_cs;
+
+   tu5_emit_load_clears(cmd, cs);
+
+   tu5_emit_zs(cmd, cs);
+   tu5_emit_mrt(cmd, cs);
+   tu5_emit_msaa(cs, cmd->state.subpass->samples);
+
+   OUT_PKT4(cs, REG_A5XX_RB_RENDER_CNTL, 1);
+   OUT_RING(cs, 0x00000008);
+
+   OUT_PKT4(cs, REG_A5XX_GRAS_SC_CNTL, 1);
+   OUT_RING(cs, 0x00000008);
+}
+
+/* TODO: tiled rendering through GMEM. Everything is drawn straight into the
+ * attachments for now.
+ */
+void
+tu5_cmd_render(struct tu_cmd_buffer *cmd)
+{
+   const struct tu_framebuffer *fb = cmd->state.framebuffer;
+   struct tu_cs *cs = &cmd->cs;
+
+   tu5_sysmem_begin(cmd, cs, fb->width, fb->height);
+   tu_cs_emit_call(cs, &cmd->draw_cs);
+   tu5_sysmem_end(cmd, cs);
 }
 
 static void
@@ -1650,8 +2074,8 @@ tu5_draw_state(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool indexed)
    struct tu5_program prog = {
       .vs = vs_shader->variant,
       .fs = fs_shader->variant,
-      .vs_shader = vs_shader,
-      .fs_shader = fs_shader,
+      .vs_shader = tu5_shader_from(vs_shader),
+      .fs_shader = tu5_shader_from(fs_shader),
    };
 
    tu5_emit_depth_stencil(cmd, cs, prog.fs);
