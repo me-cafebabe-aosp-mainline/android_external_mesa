@@ -418,6 +418,13 @@ tu5_format_texture_supported(enum pipe_format format)
 bool
 tu5_format_color_supported(enum pipe_format format)
 {
+   /* Drawing to sRGB with one or two components hangs or fails on Adreno
+    * 505.
+    */
+   if (util_format_is_srgb(format) &&
+       util_format_get_nr_components(format) < 3)
+      return false;
+
    return fd5_pipe2color(format) != RB5_NONE &&
           fd5_pipe2tex(format) != TFMT5_NONE &&
           !util_format_is_depth_or_stencil(format);
