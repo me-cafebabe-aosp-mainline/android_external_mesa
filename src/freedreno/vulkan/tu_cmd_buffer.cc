@@ -9,6 +9,8 @@
 
 #include "tu_cmd_buffer.h"
 
+#include "tu5.h"
+
 #include "vk_common_entrypoints.h"
 #include "vk_log.h"
 #include "vk_render_pass.h"
@@ -356,6 +358,11 @@ tu6_emit_flushes(struct tu_cmd_buffer *cmd_buffer,
 {
    BITMASK_ENUM(tu_cmd_flush_bits) flushes = cache->flush_bits;
    cache->flush_bits = 0;
+
+   if (tu_is_a5xx(cmd_buffer->device)) {
+      tu5_emit_flushes(cmd_buffer, cs, flushes);
+      return;
+   }
 
    if (TU_DEBUG(FLUSHALL))
       flushes |= TU_CMD_FLAG_ALL_CLEAN | TU_CMD_FLAG_ALL_INVALIDATE;
@@ -2408,6 +2415,11 @@ tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
    struct tu_device *dev = cmd->device;
    const struct tu_physical_device *phys_dev = dev->physical_device;
 
+   if (tu_is_a5xx(dev)) {
+      tu5_init_hw(cmd, cs);
+      return;
+   }
+
    if (CHIP == A6XX) {
       tu_emit_event_write<CHIP>(cmd, cs, FD_CACHE_INVALIDATE);
    } else {
@@ -2939,6 +2951,10 @@ static void
 tu_set_input_attachments(struct tu_cmd_buffer *cmd, const struct tu_subpass *subpass)
 {
    struct tu_cs *cs = &cmd->draw_cs;
+
+   /* TODO: input attachments on a5xx */
+   if (tu_is_a5xx(cmd->device))
+      return;
 
    tu_cs_emit_pkt7(cs, CP_SET_DRAW_STATE, 6);
    tu_cs_emit_draw_state(cs, TU_DRAW_STATE_INPUT_ATTACHMENTS_GMEM,
@@ -4052,6 +4068,12 @@ void
 tu_cmd_render(struct tu_cmd_buffer *cmd_buffer,
               const VkOffset2D *fdm_offsets)
 {
+   if (tu_is_a5xx(cmd_buffer->device)) {
+      tu5_cmd_render(cmd_buffer);
+      tu_disable_draw_states(cmd_buffer, &cmd_buffer->cs);
+      return;
+   }
+
    if (cmd_buffer->state.rp.has_tess)
       tu6_lazy_emit_tessfactor_addr<CHIP>(cmd_buffer);
 
@@ -5567,7 +5589,8 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
    /* note: this also avoids emitting draw states before renderpass clears,
     * which may use the 3D clear path (for MSAA cases)
     */
-   if (!(cmd->state.dirty & TU_CMD_DIRTY_DRAW_STATE)) {
+   if (!(cmd->state.dirty & TU_CMD_DIRTY_DRAW_STATE) &&
+       !tu_is_a5xx(cmd->device)) {
       struct tu_cs *cs = &cmd->draw_cs;
 
       tu_cs_emit_pkt7(cs, CP_SET_DRAW_STATE, 3 * (10 + util_bitcount(set_state_mask)));
@@ -6917,6 +6940,14 @@ static void
 tu_emit_subpass_begin(struct tu_cmd_buffer *cmd)
 {
    struct tu_resolve_group resolve_group = {};
+
+   if (tu_is_a5xx(cmd->device)) {
+      tu5_emit_subpass_begin(cmd);
+      tu_set_input_attachments(cmd, cmd->state.subpass);
+      vk_cmd_set_cb_attachment_count(&cmd->vk, cmd->state.subpass->color_count);
+      cmd->state.dirty |= TU_CMD_DIRTY_SUBPASS;
+      return;
+   }
 
    tu_emit_subpass_custom_resolve<CHIP>(cmd);
    tu_emit_subpass_begin_gmem<CHIP>(cmd, &resolve_group);
@@ -8411,6 +8442,9 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
                 /* note: draw_count is 0 for indirect */
                 uint32_t draw_count)
 {
+   if (tu_is_a5xx(cmd->device))
+      return tu5_draw_state(cmd, cs, indexed);
+
    const struct tu_program_state *program = &cmd->state.program;
    struct tu_render_pass_state *rp = &cmd->state.rp;
 
@@ -8803,6 +8837,14 @@ tu6_emit_vs_params(struct tu_cmd_buffer *cmd,
                    uint32_t vertex_offset,
                    uint32_t first_instance)
 {
+   if (tu_is_a5xx(cmd->device)) {
+      /* Written out with the rest of the state of the draw */
+      cmd->state.last_vs_params.vertex_offset = vertex_offset;
+      cmd->state.last_vs_params.first_instance = first_instance;
+      cmd->state.last_vs_params.draw_id = draw_id;
+      return;
+   }
+
    uint32_t offset = vs_params_offset(cmd);
 
    /* Beside re-emitting params when they are changed, we should re-emit

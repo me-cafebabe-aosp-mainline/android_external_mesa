@@ -332,6 +332,10 @@ template <chip CHIP>
 void
 tu_lrz_begin_resumed_renderpass(struct tu_cmd_buffer *cmd)
 {
+   /* TODO: LRZ on a5xx */
+   if (tu_is_a5xx(cmd->device))
+      return;
+
     /* Track LRZ valid state */
    memset(&cmd->state.lrz, 0, sizeof(cmd->state.lrz));
 
@@ -372,6 +376,10 @@ template <chip CHIP>
 void
 tu_lrz_begin_renderpass(struct tu_cmd_buffer *cmd)
 {
+   /* TODO: LRZ on a5xx */
+   if (tu_is_a5xx(cmd->device))
+      return;
+
    const struct tu_render_pass *pass = cmd->state.pass;
 
    cmd->state.rp.lrz_disable_reason = NULL;
@@ -456,6 +464,10 @@ TU_GENX(tu_lrz_begin_renderpass);
 void
 tu_lrz_begin_secondary_cmdbuf(struct tu_cmd_buffer *cmd)
 {
+   /* TODO: LRZ on a5xx */
+   if (tu_is_a5xx(cmd->device))
+      return;
+
    memset(&cmd->state.lrz, 0, sizeof(cmd->state.lrz));
 
    uint32_t a = cmd->state.subpass->depth_stencil_attachment.attachment;
@@ -520,6 +532,10 @@ template <chip CHIP>
 void
 tu_lrz_tiling_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
 {
+   /* TODO: LRZ on a5xx */
+   if (tu_is_a5xx(cmd->device))
+      return;
+
    /* TODO: If lrz was never valid for the entire renderpass, we could exit
     * early here. Sometimes we know this ahead of time and null out
     * image_view, but with LOAD_OP_DONT_CARE this only happens if there were
@@ -700,6 +716,10 @@ template <chip CHIP>
 void
 tu_lrz_before_tile(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
 {
+   /* TODO: LRZ on a5xx */
+   if (tu_is_a5xx(cmd->device))
+      return;
+
    struct tu_lrz_state *lrz = &cmd->state.lrz;
 
    if (!lrz->image_view) {
@@ -809,6 +829,10 @@ template <chip CHIP>
 void
 tu_lrz_tiling_end(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
 {
+   /* TODO: LRZ on a5xx */
+   if (tu_is_a5xx(cmd->device))
+      return;
+
    if (cmd->state.lrz.fast_clear || cmd->state.lrz.gpu_dir_tracking) {
       tu6_emit_lrz_buffer<CHIP>(cs, cmd->state.lrz.image_view->image);
 
@@ -860,6 +884,10 @@ template <chip CHIP>
 void
 tu_lrz_sysmem_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
 {
+   /* TODO: LRZ on a5xx */
+   if (tu_is_a5xx(cmd->device))
+      return;
+
    if (cmd->device->physical_device->info->props.has_lrz_feedback) {
       tu_lrz_tiling_begin<CHIP>(cmd, cs);
       return;
@@ -905,6 +933,10 @@ template <chip CHIP>
 void
 tu_lrz_sysmem_end(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
 {
+   /* TODO: LRZ on a5xx */
+   if (tu_is_a5xx(cmd->device))
+      return;
+
    if (cmd->device->physical_device->info->props.has_lrz_feedback) {
       tu_lrz_tiling_end<CHIP>(cmd, cs);
       return;
@@ -988,6 +1020,10 @@ tu_lrz_clear_depth_image(struct tu_cmd_buffer *cmd,
                          uint32_t rangeCount,
                          const VkImageSubresourceRange *pRanges)
 {
+   /* TODO: LRZ on a5xx */
+   if (tu_is_a5xx(cmd->device))
+      return;
+
    if (!rangeCount || !image->lrz_layout.lrz_total_size ||
        !cmd->device->physical_device->info->props.has_lrz_dir_tracking)
       return;
@@ -1041,6 +1077,10 @@ void
 tu_lrz_disable_during_renderpass(struct tu_cmd_buffer *cmd,
                                  const char *reason)
 {
+   /* TODO: LRZ on a5xx */
+   if (tu_is_a5xx(cmd->device))
+      return;
+
    assert(cmd->state.pass);
 
    tu_lrz_disable_reason(cmd, reason);

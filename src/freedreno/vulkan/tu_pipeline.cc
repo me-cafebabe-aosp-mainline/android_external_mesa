@@ -3917,6 +3917,13 @@ static void
 tu_pipeline_builder_emit_state(struct tu_pipeline_builder *builder,
                                struct tu_pipeline *pipeline)
 {
+   /* The static state is not precompiled into draw states on a5xx: it stays
+    * in the pipeline's dynamic state, and goes to the command buffer's with
+    * the bind.
+    */
+   if (tu_is_a5xx(builder->device))
+      return;
+
    struct tu_cs cs;
    BITSET_DECLARE(keep, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX) = {};
    BITSET_DECLARE(remove, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX) = {};
@@ -4617,6 +4624,7 @@ tu_pipeline_builder_build(struct tu_pipeline_builder *builder,
          tu_pipeline_to_graphics(*pipeline);
       gfx_pipeline->dynamic_state.ms.sample_locations =
          &gfx_pipeline->sample_locations;
+      gfx_pipeline->dynamic_state.vi = &gfx_pipeline->vertex_input;
       vk_dynamic_graphics_state_fill(&gfx_pipeline->dynamic_state,
                                      &builder->graphics_state);
       gfx_pipeline->feedback_loops =

@@ -70,6 +70,16 @@ struct tu_shader
    struct tu_cs cs;
    struct tu_bo *pvtmem_bo;
 
+   /* Where the instructions and the private memory of the variant are, for
+    * the Adrenos that have these written out with each draw (a5xx).
+    */
+   uint64_t binary_iova;
+   struct {
+      uint64_t iova;
+      uint32_t per_fiber_size;
+      uint32_t per_sp_size;
+   } pvtmem;
+
    struct tu_draw_state state;
    struct tu_draw_state safe_const_state;
    struct tu_draw_state binning_state;

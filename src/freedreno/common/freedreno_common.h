@@ -35,6 +35,7 @@
    ({                                                                        \
       decltype(&thing<A6XX>) genX_thing;                                     \
       switch (info->chip) {                                                  \
+      case 5: /* turnip branches off for a5xx inside the A6XX variants */    \
       case 6:                                                                \
          genX_thing = &thing<A6XX>;                                          \
          break;                                                              \

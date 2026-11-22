@@ -2994,6 +2994,11 @@ tu_upload_shader(struct tu_device *dev,
 
    uint64_t iova = tu_upload_variant(&shader->cs, v);
    uint64_t binning_iova = tu_upload_variant(&shader->cs, binning);
+
+   shader->binary_iova = iova;
+   shader->pvtmem.iova = pvtmem_config.iova;
+   shader->pvtmem.per_fiber_size = pvtmem_config.per_fiber_size;
+   shader->pvtmem.per_sp_size = pvtmem_config.per_sp_size;
    uint64_t safe_const_iova = tu_upload_variant(&shader->cs, safe_const);
    uint64_t safe_const_binning_iova = tu_upload_variant(&shader->cs, safe_const_binning);
 
