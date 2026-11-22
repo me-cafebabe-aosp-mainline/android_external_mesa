@@ -4312,6 +4312,16 @@ tu5_emit_viewport_scissor(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
    OUT_RING(cs, A5XX_GRAS_CL_VPORT_YSCALE_0(vp->height / 2.0f));
    OUT_RING(cs, A5XX_GRAS_CL_VPORT_ZOFFSET_0(zoffset));
    OUT_RING(cs, A5XX_GRAS_CL_VPORT_ZSCALE_0(zscale));
+
+   /* the range of the depth clamp */
+   float zmin = MIN2(vp->minDepth, vp->maxDepth);
+   float zmax = MAX2(vp->minDepth, vp->maxDepth);
+   OUT_PKT4(cs, REG_A5XX_GRAS_CL_Z_CLAMP_MIN, 2);
+   OUT_RING(cs, A5XX_GRAS_CL_Z_CLAMP_MIN(zmin));
+   OUT_RING(cs, A5XX_GRAS_CL_Z_CLAMP_MAX(zmax));
+   OUT_PKT4(cs, REG_A5XX_RB_Z_CLAMP_MIN, 2);
+   OUT_RING(cs, A5XX_RB_Z_CLAMP_MIN(zmin));
+   OUT_RING(cs, A5XX_RB_Z_CLAMP_MAX(zmax));
 }
 
 static void
@@ -4363,9 +4373,14 @@ tu5_emit_rasterizer(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                         A5XX_PC_RASTER_CNTL_POLYMODE_ENABLE));
 
    /* The clip space z of Vulkan is [0, w] */
+   bool depth_clip = vk_rasterization_state_depth_clip_enable(&dyn->rs);
    OUT_PKT4(cs, REG_A5XX_GRAS_CL_CNTL, 1);
    OUT_RING(cs, COND(!dyn->vp.depth_clip_negative_one_to_one,
-                     A5XX_GRAS_CL_CNTL_ZERO_GB_SCALE_Z));
+                     A5XX_GRAS_CL_CNTL_ZERO_GB_SCALE_Z) |
+                   COND(!depth_clip, A5XX_GRAS_CL_CNTL_ZNEAR_CLIP_DISABLE |
+                                        A5XX_GRAS_CL_CNTL_ZFAR_CLIP_DISABLE) |
+                   COND(dyn->rs.depth_clamp_enable,
+                        A5XX_GRAS_CL_CNTL_Z_CLAMP_ENABLE));
 
    OUT_PKT4(cs, REG_A5XX_PC_PRIMITIVE_CNTL, 1);
    OUT_RING(cs,
@@ -4452,7 +4467,9 @@ tu5_emit_depth_stencil(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                    COND(depth_test, A5XX_RB_DEPTH_CNTL_Z_TEST_ENABLE |
                                        A5XX_RB_DEPTH_CNTL_Z_READ_ENABLE) |
                    COND(depth_test && dyn->ds.depth.write_enable,
-                        A5XX_RB_DEPTH_CNTL_Z_WRITE_ENABLE));
+                        A5XX_RB_DEPTH_CNTL_Z_WRITE_ENABLE) |
+                   COND(dyn->rs.depth_clamp_enable,
+                        A5XX_RB_DEPTH_CNTL_Z_CLAMP_ENABLE));
 
    OUT_PKT4(cs, REG_A5XX_RB_DEPTH_PLANE_CNTL, 1);
    OUT_RING(cs, COND(fragz, A5XX_RB_DEPTH_PLANE_CNTL_FRAG_WRITES_Z) |
