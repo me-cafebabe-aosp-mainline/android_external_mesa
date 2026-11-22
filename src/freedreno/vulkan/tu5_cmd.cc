@@ -2019,6 +2019,9 @@ struct tu5_rect_draw {
 
    /* The components not to write, of the colour target */
    uint32_t keep_mask;
+
+   /* The samples to write, all of them if none */
+   uint32_t sample_mask;
 };
 
 static void
@@ -2144,7 +2147,8 @@ tu5_draw_rect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 
    OUT_PKT4(cs, REG_A5XX_RB_BLEND_CNTL, 1);
    OUT_RING(cs, A5XX_RB_BLEND_CNTL_INDEPENDENT_BLEND |
-                   A5XX_RB_BLEND_CNTL_SAMPLE_MASK(0xffff));
+                   A5XX_RB_BLEND_CNTL_SAMPLE_MASK(
+                      d->sample_mask ? d->sample_mask : 0xffff));
 
    OUT_PKT4(cs, REG_A5XX_RB_FS_OUTPUT_CNTL, 1);
    OUT_RING(cs, A5XX_RB_FS_OUTPUT_CNTL_MRT(d->rt + 1));
@@ -2407,10 +2411,13 @@ static void
 tu5_blit_rect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
               const struct tu5_surf *dst, VkRect2D dst_rect,
               const struct tu5_surf *src, float s0, float t0, float s1,
-              float t1, bool linear, uint32_t keep_mask)
+              float t1, bool linear, uint32_t keep_mask,
+              enum global_shader fs = GLOBAL_SH_FS_BLIT, int sample = -1)
 {
+   /* A sample of the source into the same of the destination */
+   const uint32_t consts[4] = { (uint32_t)MAX2(sample, 0) };
    struct tu5_rect_draw d = {
-      .fs = GLOBAL_SH_FS_BLIT,
+      .fs = fs,
       .width = dst->width,
       .height = dst->height,
       .rect = dst_rect,
@@ -2426,6 +2433,12 @@ tu5_blit_rect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 
    if (!dst_rect.extent.width || !dst_rect.extent.height)
       return;
+
+   if (sample >= 0) {
+      d.fs_consts = consts;
+      d.fs_consts_dwords = 4;
+      d.sample_mask = 1u << sample;
+   }
 
    tu5_bind_surf(cs, dst, NULL, 0, 0);
    tu5_draw_rect(cmd, cs, &d);
@@ -2616,9 +2629,8 @@ tu5_copy_image(struct tu_cmd_buffer *cmd, struct tu_image *src_image,
            vk_image_subresource_layer_count(&src_image->vk,
                                             &info->srcSubresource));
 
-   /* TODO: between compressed and other formats, and multisampled images */
-   if (src_format == PIPE_FORMAT_NONE || src_format != dst_format ||
-       src_image->vk.samples != VK_SAMPLE_COUNT_1_BIT) {
+   /* TODO: between compressed and other formats */
+   if (src_format == PIPE_FORMAT_NONE || src_format != dst_format) {
       mesa_logw("a5xx: copy from %s to %s not implemented",
                 util_format_name(vk_format_to_pipe_format(src_image->vk.format)),
                 util_format_name(vk_format_to_pipe_format(dst_image->vk.format)));
@@ -2635,6 +2647,18 @@ tu5_copy_image(struct tu_cmd_buffer *cmd, struct tu_image *src_image,
          (dst_3d ? info->dstOffset.z : info->dstSubresource.baseArrayLayer) + i);
       VkRect2D rect = { { info->dstOffset.x, info->dstOffset.y },
                         { info->extent.width, info->extent.height } };
+
+      if (src.samples > 1) {
+         /* sample by sample */
+         for (uint32_t s = 0; s < src.samples; s++) {
+            tu5_blit_rect(cmd, cs, &dst, rect, &src, info->srcOffset.x,
+                          info->srcOffset.y,
+                          info->srcOffset.x + info->extent.width,
+                          info->srcOffset.y + info->extent.height, false,
+                          dst_keep, GLOBAL_SH_FS_COPY_MS5, s);
+         }
+         continue;
+      }
 
       tu5_blit_rect(cmd, cs, &dst, rect, &src, info->srcOffset.x,
                     info->srcOffset.y, info->srcOffset.x + info->extent.width,
@@ -2693,6 +2717,84 @@ tu5_blit_image(struct tu_cmd_buffer *cmd, struct tu_image *src_image,
                     filter == VK_FILTER_LINEAR, 0);
    }
    tu5_sysmem_end(cmd, cs);
+}
+
+/* The resolves: what is not filtered, the integers, takes the first sample */
+static enum global_shader
+tu5_resolve_fs(enum pipe_format format, uint32_t samples)
+{
+   if (samples == 1 || util_format_is_pure_integer(format) ||
+       util_format_is_depth_or_stencil(format))
+      return GLOBAL_SH_FS_RESOLVE5_1;
+
+   return samples == 2 ? GLOBAL_SH_FS_RESOLVE5_2 : GLOBAL_SH_FS_RESOLVE5_4;
+}
+
+/* vkCmdResolveImage() */
+void
+tu5_resolve_image(struct tu_cmd_buffer *cmd, struct tu_image *src_image,
+                  struct tu_image *dst_image, const VkImageResolve2 *info)
+{
+   struct tu_cs *cs = &cmd->cs;
+   enum pipe_format src_format = vk_format_to_pipe_format(src_image->vk.format);
+   enum pipe_format dst_format = vk_format_to_pipe_format(dst_image->vk.format);
+   uint32_t layers = MAX2(info->extent.depth,
+                          vk_image_subresource_layer_count(&dst_image->vk,
+                                                           &info->dstSubresource));
+   VkRect2D rect = { { info->dstOffset.x, info->dstOffset.y },
+                     { info->extent.width, info->extent.height } };
+
+   tu5_blit_begin(cmd, cs);
+   for (uint32_t i = 0; i < layers; i++) {
+      struct tu5_surf src =
+         tu5_image_surf(src_image, 0, src_format, info->srcSubresource.mipLevel,
+                        info->srcSubresource.baseArrayLayer + i);
+      struct tu5_surf dst =
+         tu5_image_surf(dst_image, 0, dst_format, info->dstSubresource.mipLevel,
+                        info->dstSubresource.baseArrayLayer + i);
+
+      tu5_blit_rect(cmd, cs, &dst, rect, &src, info->srcOffset.x,
+                    info->srcOffset.y, info->srcOffset.x + info->extent.width,
+                    info->srcOffset.y + info->extent.height, false, 0,
+                    tu5_resolve_fs(src_format, src.samples));
+   }
+   tu5_sysmem_end(cmd, cs);
+}
+
+/* The resolve of an attachment into another at the end of a subpass, in the
+ * draw stream of the render pass.
+ *
+ * TODO: depth and stencil
+ */
+void
+tu5_resolve_sysmem(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                   const struct tu_image_view *src_view,
+                   const struct tu_image_view *dst_view, uint32_t layers,
+                   const VkRect2D *rect)
+{
+   enum pipe_format src_format = vk_format_to_pipe_format(src_view->vk.format);
+   enum pipe_format dst_format = vk_format_to_pipe_format(dst_view->vk.format);
+
+   if (util_format_is_depth_or_stencil(dst_format)) {
+      mesa_logw("a5xx: resolve of depth and stencil not implemented");
+      return;
+   }
+
+   for (uint32_t i = 0; i < layers; i++) {
+      struct tu5_surf src =
+         tu5_image_surf(src_view->image, 0, src_format,
+                        src_view->vk.base_mip_level,
+                        src_view->vk.base_array_layer + i);
+      struct tu5_surf dst =
+         tu5_image_surf(dst_view->image, 0, dst_format,
+                        dst_view->vk.base_mip_level,
+                        dst_view->vk.base_array_layer + i);
+
+      tu5_blit_rect(cmd, cs, &dst, *rect, &src, rect->offset.x, rect->offset.y,
+                    rect->offset.x + rect->extent.width,
+                    rect->offset.y + rect->extent.height, false, 0,
+                    tu5_resolve_fs(src_format, src.samples));
+   }
 }
 
 /* Buffers are copied as rows of bytes, each from the 64 bytes before it */

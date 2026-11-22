@@ -72,6 +72,12 @@ void tu5_copy_image(struct tu_cmd_buffer *cmd, struct tu_image *src,
 void tu5_blit_image(struct tu_cmd_buffer *cmd, struct tu_image *src,
                     struct tu_image *dst, const VkImageBlit2 *info,
                     VkFilter filter);
+void tu5_resolve_image(struct tu_cmd_buffer *cmd, struct tu_image *src,
+                       struct tu_image *dst, const VkImageResolve2 *info);
+void tu5_resolve_sysmem(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                        const struct tu_image_view *src,
+                        const struct tu_image_view *dst, uint32_t layers,
+                        const VkRect2D *rect);
 void tu5_copy_buffer(struct tu_cmd_buffer *cmd, uint64_t dst_va,
                      uint64_t src_va, uint64_t size);
 void tu5_fill_buffer(struct tu_cmd_buffer *cmd, uint64_t dst_va, uint64_t size,

@@ -53,6 +53,12 @@ enum global_shader {
    GLOBAL_SH_FS_COPY_MS,
    /* a5xx: the rectangle of clears and blits as a triangle strip, see tu5.h */
    GLOBAL_SH_VS_RECT5,
+   /* Adreno 5xx: the first sample, the mean of two, the mean of four */
+   GLOBAL_SH_FS_RESOLVE5_1,
+   GLOBAL_SH_FS_RESOLVE5_2,
+   GLOBAL_SH_FS_RESOLVE5_4,
+   /* Adreno 5xx: the sample a constant says */
+   GLOBAL_SH_FS_COPY_MS5,
    GLOBAL_SH_FS_CLEAR0,
    GLOBAL_SH_FS_CLEAR_MAX = GLOBAL_SH_FS_CLEAR0 + MAX_RTS,
    GLOBAL_SH_COUNT,

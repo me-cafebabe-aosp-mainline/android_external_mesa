@@ -840,6 +840,67 @@ build_clear_vs_shader(void)
  *   c1: s0, t0, s1, t1 of the texture coordinates
  *   c2: z of the position, third texture coordinate
  */
+/* Adreno 5xx: the resolves, each texel the mean of the first samples of
+ * that of the source.
+ */
+static nir_shader *
+build_resolve5_fs_shader(unsigned samples)
+{
+   nir_builder _b =
+      nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, NULL,
+                                     "resolve fs");
+   nir_builder *b = &_b;
+   b->shader->info.internal = true;
+
+   nir_variable *out_color =
+      nir_variable_create(b->shader, nir_var_shader_out, glsl_vec4_type(),
+                          "color0");
+   out_color->data.location = FRAG_RESULT_DATA0;
+
+   nir_variable *in_coords =
+      nir_variable_create(b->shader, nir_var_shader_in, glsl_vec_type(2),
+                          "coords");
+   in_coords->data.location = VARYING_SLOT_VAR0;
+
+   b->shader->info.num_textures = 1;
+   BITSET_SET(b->shader->info.textures_used, 0);
+   BITSET_SET(b->shader->info.textures_used_by_txf, 0);
+
+   nir_def *coord = nir_f2i32(b, nir_load_var(b, in_coords));
+   nir_def *sum = NULL;
+
+   /* No samples: the one a constant says */
+   unsigned fetches = MAX2(samples, 1);
+
+   for (unsigned i = 0; i < fetches; i++) {
+      nir_tex_instr *tex = nir_tex_instr_create(b->shader, 2);
+      tex->op = nir_texop_txf_ms;
+      /* With one sample the bits are copied: the type does not matter */
+      tex->dest_type = samples <= 1 ? nir_type_int32 : nir_type_float32;
+      tex->is_array = false;
+      tex->is_shadow = false;
+      tex->sampler_dim = GLSL_SAMPLER_DIM_MS;
+      tex->texture_index = 0;
+      tex->sampler_index = 0;
+      tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
+      tex->coord_components = 2;
+      tex->src[1] = nir_tex_src_for_ssa(
+         nir_tex_src_ms_index,
+         samples ? nir_imm_int(b, i) : nir_channel(b, load_const(b, 0, 4), 0));
+      nir_def_init(&tex->instr, &tex->def, 4, 32);
+      nir_builder_instr_insert(b, &tex->instr);
+
+      sum = sum ? nir_fadd(b, sum, &tex->def) : &tex->def;
+   }
+
+   if (samples > 1)
+      sum = nir_fmul_imm(b, sum, 1.0 / samples);
+
+   nir_store_var(b, out_color, sum, 0xf);
+
+   return b->shader;
+}
+
 static nir_shader *
 build_rect5_vs_shader(void)
 {
@@ -1032,6 +1093,14 @@ tu_init_clear_blit_shaders(struct tu_device *dev)
    compile_shader(dev, build_ms_copy_fs_shader(), 0, &offset, GLOBAL_SH_FS_COPY_MS);
    if (tu_is_a5xx(dev))
       compile_shader(dev, build_rect5_vs_shader(), 3, &offset, GLOBAL_SH_VS_RECT5);
+      compile_shader(dev, build_resolve5_fs_shader(1), 1, &offset,
+                     GLOBAL_SH_FS_RESOLVE5_1);
+      compile_shader(dev, build_resolve5_fs_shader(2), 1, &offset,
+                     GLOBAL_SH_FS_RESOLVE5_2);
+      compile_shader(dev, build_resolve5_fs_shader(4), 1, &offset,
+                     GLOBAL_SH_FS_RESOLVE5_4);
+      compile_shader(dev, build_resolve5_fs_shader(0), 1, &offset,
+                     GLOBAL_SH_FS_COPY_MS5);
 
    for (uint32_t num_rts = 0; num_rts <= MAX_RTS; num_rts++) {
       compile_shader(dev, build_clear_fs_shader(num_rts), num_rts, &offset,
@@ -3769,6 +3838,13 @@ tu_CmdResolveImage2(VkCommandBuffer commandBuffer,
 
    trace_start_resolve_image(&cmd->trace, &cmd->cs, cmd, src_image->vk.format,
                              dst_image->vk.format);
+   if (tu_is_a5xx(cmd->device)) {
+      for (uint32_t i = 0; i < pResolveImageInfo->regionCount; ++i) {
+         tu5_resolve_image(cmd, src_image, dst_image,
+                           &pResolveImageInfo->pRegions[i]);
+      }
+      return;
+   }
 
    enum pipe_format src_format =
       vk_format_to_pipe_format(src_image->vk.format);
@@ -3880,6 +3956,11 @@ tu_resolve_sysmem(struct tu_cmd_buffer *cmd,
    assert(src->vk.format == dst->vk.format ||
           (vk_format_is_depth_or_stencil(src->image->vk.format) &&
            vk_format_is_depth_or_stencil(dst->image->vk.format)));
+
+   if (tu_is_a5xx(cmd->device)) {
+      tu5_resolve_sysmem(cmd, cs, src, dst, layers, rect);
+      return;
+   }
 
    bool src_separate_ds = src->image->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT;
    bool dst_separate_ds = dst->image->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT;
