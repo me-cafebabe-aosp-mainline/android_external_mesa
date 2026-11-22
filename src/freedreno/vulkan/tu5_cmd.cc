@@ -824,6 +824,12 @@ tu5_draw_indirect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
          tu_cs_emit_qw(cs, first + sizeof(uint32_t));
          tu_cs_emit_wfi(cs);
 
+         /* CP_LOAD_STATE4 reads them through UCHE, which the writes of the
+          * CP above went around: without this every draw read what UCHE held
+          * of them from before (the index of the first draw, or 0).
+          */
+         tu5_cache_flush(cs);
+
          OUT_PKT7(cs, CP_LOAD_STATE4, 3);
          OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(param) |
                          CP_LOAD_STATE4_0_STATE_SRC(SS4_INDIRECT) |
