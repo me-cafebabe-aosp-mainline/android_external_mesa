@@ -2021,6 +2021,20 @@ tu_physical_device_init(struct tu_physical_device *device,
     */
    char buf[VK_UUID_SIZE * 2 + 1];
    mesa_bytes_to_hex(buf, device->cache_uuid, VK_UUID_SIZE);
+#if DETECT_OS_ANDROID
+   /* Android keeps what the GL drivers compile with EGL_ANDROID_blob_cache,
+    * and Mesa makes no cache of its own there (disk_cache_create() gives a
+    * disabled one), but nothing keeps the pipelines of a Vulkan driver: HWUI
+    * stores the VkPipelineCache of an app only after its first frames, so the
+    * app compiles the pipelines it makes later again each time it starts.
+    * Keep them in the cache directory of the app, which ActivityThread gives
+    * as TMPDIR.
+    */
+   if (getenv("TMPDIR"))
+      device->vk.disk_cache =
+         disk_cache_create_in_dir(device->name, buf, 0, getenv("TMPDIR"));
+   else
+#endif
    device->vk.disk_cache = disk_cache_create(device->name, buf, 0);
 
    device->vk.pipeline_cache_import_ops = cache_import_ops;
