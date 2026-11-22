@@ -343,10 +343,12 @@ tu5_desc_base(struct tu_shader *shader,
 
    struct tu5_desc_ref *refs = kind == TU5_DESC_TEXTURE ? map->tex :
                                kind == TU5_DESC_SAMPLER ? map->samp :
-                               kind == TU5_DESC_UBO ? map->ubo : map->ssbo;
+                               kind == TU5_DESC_UBO ? map->ubo :
+                               kind == TU5_DESC_SSBO ? map->ssbo : map->image;
    unsigned max = kind == TU5_DESC_TEXTURE ? TU5_MAX_TEXTURES :
                   kind == TU5_DESC_SAMPLER ? TU5_MAX_SAMPLERS :
-                  kind == TU5_DESC_UBO ? TU5_MAX_UBOS : TU5_MAX_SSBOS;
+                  kind == TU5_DESC_UBO ? TU5_MAX_UBOS :
+                  kind == TU5_DESC_SSBO ? TU5_MAX_SSBOS : TU5_MAX_IMAGES;
    unsigned base = map->count[kind];
    unsigned count = binding_layout->array_size;
 
@@ -802,6 +804,21 @@ lower_image_deref(struct tu_device *dev, nir_builder *b,
                   const struct tu_pipeline_layout *layout)
 {
    nir_deref_instr *deref = nir_src_as_deref(instr->src[0]);
+
+   if (tu_is_a5xx(dev)) {
+      /* The number of the image in the shader, which is to be constant */
+      nir_variable *var = nir_deref_instr_get_variable(deref);
+      unsigned first = tu5_desc_base(shader, layout, var->data.descriptor_set,
+                                     var->data.binding, TU5_DESC_IMAGE);
+      nir_def *index = deref->deref_type == nir_deref_type_var
+                          ? nir_imm_int(b, first)
+                          : nir_iadd_imm(b, deref->arr.index.ssa, first);
+
+      shader->active_desc_sets |= 1u << var->data.descriptor_set;
+      nir_rewrite_image_intrinsic(instr, index, false);
+      return;
+   }
+
    nir_def *bindless = build_bindless(dev, b, deref, 0, shader, layout, 0, false);
    nir_rewrite_image_intrinsic(instr, bindless,
                                nir_image_intrinsic_type_bindless);
@@ -1525,6 +1542,16 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
    if (tu_is_a5xx(dev)) {
       shader->info.num_ubos = const_state->a5xx.count[TU5_DESC_UBO];
       shader->info.num_ssbos = const_state->a5xx.count[TU5_DESC_SSBO];
+      shader->info.num_images = const_state->a5xx.count[TU5_DESC_IMAGE];
+
+      /* The variables of the textures are kept, for the compiler to count
+       * them and to number what it reads the images through after them.
+       */
+      if (progress)
+         nir_opt_dce(shader);
+      nir_remove_dead_variables(shader, nir_var_mem_ubo | nir_var_mem_ssbo,
+                                NULL);
+      return progress;
    }
 
    /* Remove now-unused variables so that when we gather the shader info later

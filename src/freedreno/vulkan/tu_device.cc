@@ -1354,7 +1354,7 @@ tu_get_properties(struct tu_physical_device *pdevice,
       props->maxPerStageDescriptorSampledImages = TU5_MAX_TEXTURES;
       props->maxPerStageDescriptorUniformBuffers = TU5_MAX_UBOS - 2;
       props->maxPerStageDescriptorStorageBuffers = TU5_MAX_SSBOS;
-      props->maxPerStageDescriptorStorageImages = 0;
+      props->maxPerStageDescriptorStorageImages = TU5_MAX_IMAGES;
       props->maxPerStageResources =
          TU5_MAX_SAMPLERS + TU5_MAX_TEXTURES + TU5_MAX_UBOS - 2 + MAX_RTS;
       props->maxDescriptorSetSamplers = 2 * TU5_MAX_SAMPLERS;
@@ -1365,7 +1365,12 @@ tu_get_properties(struct tu_physical_device *pdevice,
       props->maxDescriptorSetStorageBuffers = 2 * TU5_MAX_SSBOS;
       props->maxDescriptorSetStorageBuffersDynamic =
          MIN2(MAX_DYNAMIC_STORAGE_BUFFERS, TU5_MAX_SSBOS);
-      props->maxDescriptorSetStorageImages = 0;
+      props->maxDescriptorSetStorageImages = 2 * TU5_MAX_IMAGES;
+      props->maxComputeSharedMemorySize = 16384;
+      props->maxComputeWorkGroupInvocations = 1024;
+      props->maxComputeWorkGroupSize[0] = 1024;
+      props->maxComputeWorkGroupSize[1] = 1024;
+      props->maxComputeWorkGroupSize[2] = 64;
       props->maxVertexInputAttributes = 16;
       props->maxVertexInputBindings = 16;
       props->maxViewports = 1;

@@ -325,6 +325,12 @@ ir3_compiler_create(struct fd_device *dev, const struct fd_dev_id *dev_id,
       compiler->max_const_frag = 512;
       compiler->max_const_compute = 512;
 
+      /* On Adreno 505 a compute shader of more than 256 vec4 of constants
+       * computes nothing.
+       */
+      if (compiler->gen == 5)
+         compiler->max_const_compute = 256;
+
       /* Note: this will have to change if/when we support tess+GS on
        * earlier gen's.
        */

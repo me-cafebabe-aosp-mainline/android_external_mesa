@@ -394,6 +394,117 @@ tu5_emit_ssbos(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       tu_cs_emit_qw(cs, va[i]);
 }
 
+/* The storage images of a fragment or of a compute shader: these are written
+ * as storage buffers are, after them, and read as textures, after the
+ * textures. Their sizes are constants of the shader.
+ */
+static void
+tu5_emit_images(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                const struct tu_shader *shader)
+{
+   const struct ir3_shader_variant *v = shader->variant;
+   const struct ir3_const_state *const_state = ir3_const_state(v);
+   const struct tu5_desc_map *map = &shader->const_state.a5xx;
+   const struct ir3_ibo_mapping *m = &v->image_mapping;
+   unsigned count = map->count[TU5_DESC_IMAGE];
+   enum a4xx_state_block sb, texsb;
+   uint32_t texcount_reg;
+
+   if (!count)
+      return;
+
+   switch (v->type) {
+   case MESA_SHADER_FRAGMENT:
+      sb = SB4_SSBO;
+      texsb = SB4_FS_TEX;
+      texcount_reg = REG_A5XX_TPL1_FS_TEX_COUNT;
+      break;
+   case MESA_SHADER_COMPUTE:
+      sb = SB4_CS_SSBO;
+      texsb = SB4_CS_TEX;
+      texcount_reg = REG_A5XX_TPL1_CS_TEX_COUNT;
+      break;
+   default:
+      return;
+   }
+
+   uint32_t dims[align(MAX2(const_state->image_dims.count, 1), 4)];
+   uint32_t num_tex = map->count[TU5_DESC_TEXTURE];
+
+   memset(dims, 0, sizeof(dims));
+
+   for (unsigned i = 0; i < count; i++) {
+      static const uint32_t none[A6XX_TEX_CONST_DWORDS] = {};
+      const uint32_t *desc = tu5_descriptor(cmd, shader, &map->image[i]);
+
+      /* see tu5_image_view_storage_descriptor() */
+      if (!desc)
+         desc = none;
+
+      if (m->image_to_tex[i] != IBO_INVALID) {
+         unsigned slot = m->tex_base + m->image_to_tex[i];
+
+         OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 12);
+         OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(slot) |
+                         CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                         CP_LOAD_STATE4_0_STATE_BLOCK(texsb) |
+                         CP_LOAD_STATE4_0_NUM_UNIT(1));
+         OUT_RING(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
+                         CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
+         OUT_RING(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+         for (unsigned j = 0; j < 6; j++)
+            OUT_RING(cs, desc[j]);
+         for (unsigned j = 6; j < 12; j++)
+            OUT_RING(cs, 0x00000000);
+
+         num_tex = MAX2(num_tex, slot + 1);
+      }
+
+      OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 2);
+      OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(v->num_ssbos + i) |
+                      CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                      CP_LOAD_STATE4_0_STATE_BLOCK(sb) |
+                      CP_LOAD_STATE4_0_NUM_UNIT(1));
+      OUT_RING(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
+                      CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
+      OUT_RING(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+      OUT_RING(cs, desc[6]); /* SSBO_1_0 */
+      OUT_RING(cs, desc[7]); /* SSBO_1_1 */
+
+      OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 2);
+      OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(v->num_ssbos + i) |
+                      CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                      CP_LOAD_STATE4_0_STATE_BLOCK(sb) |
+                      CP_LOAD_STATE4_0_NUM_UNIT(1));
+      OUT_RING(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_UBO) |
+                      CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
+      OUT_RING(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+      OUT_RING(cs, desc[4]);
+      OUT_RING(cs, desc[5] & A5XX_TEX_CONST_5_BASE_HI__MASK);
+
+      if (const_state->image_dims.mask & (1u << i)) {
+         unsigned off = const_state->image_dims.off[i];
+
+         dims[off + 0] = desc[8];  /* bytes a texel */
+         dims[off + 1] = desc[9];  /* bytes a row */
+         dims[off + 2] = desc[10]; /* bytes a layer */
+      }
+   }
+
+   /* after tu5_emit_textures() */
+   OUT_PKT4(cs, texcount_reg, 1);
+   OUT_RING(cs, num_tex);
+
+   uint32_t offset = const_state->offsets.image_dims;
+
+   if (const_state->image_dims.count && offset < v->constlen) {
+      uint32_t dwords = MIN2((uint32_t)ARRAY_SIZE(dims),
+                             (v->constlen - offset) * 4);
+
+      tu5_emit_const(cs, v, offset * 4, dwords, dims);
+   }
+}
+
 /* The constants of a shader that come from the descriptors and from the
  * push constants.
  */
@@ -548,6 +659,7 @@ tu5_dispatch(struct tu_cmd_buffer *cmd, const uint32_t *blocks,
    tu5_emit_user_consts(cmd, cs, shader);
    tu5_emit_textures(cmd, cs, shader);
    tu5_emit_ssbos(cmd, cs, shader);
+   tu5_emit_images(cmd, cs, shader);
 
    /* The parameters of the dispatch the shader reads as constants */
    uint32_t offset = const_state->offsets.driver_param;
@@ -701,6 +813,46 @@ tu5_image_view_descriptor(uint32_t *descriptor, const struct tu_image *image,
    }
    descriptor[4] = (uint32_t)iova;
    descriptor[5] = (uint32_t)(iova >> 32) | A5XX_TEX_CONST_5_DEPTH(depth);
+}
+
+/* The descriptor of an image view as a storage image: that of a texture,
+ * then what tu5_emit_images() takes.
+ */
+void
+tu5_image_view_storage_descriptor(uint32_t *descriptor,
+                                  const struct tu_image *image, unsigned plane,
+                                  enum pipe_format format,
+                                  const VkImageSubresourceRange *range,
+                                  VkImageViewType type)
+{
+   static const unsigned char swiz[4] = { PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y,
+                                          PIPE_SWIZZLE_Z, PIPE_SWIZZLE_W };
+   const struct fdl_layout *layout = &image->layout[plane];
+   uint32_t level = range->baseMipLevel;
+   uint32_t layers = vk_image_subresource_layer_count(&image->vk, range);
+   uint32_t width = u_minify(layout->width0, level);
+   uint32_t height = u_minify(layout->height0, level);
+   uint32_t depth = layers;
+   uint32_t layer_size = layout->layer_size;
+
+   /* The faces of a cube are the layers of an array */
+   if (type == VK_IMAGE_VIEW_TYPE_CUBE || type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY)
+      type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+
+   tu5_image_view_descriptor(descriptor, image, plane, format, range, type,
+                             swiz);
+
+   if (type == VK_IMAGE_VIEW_TYPE_3D) {
+      depth = u_minify(layout->depth0, level);
+      layer_size = layout->slices[level].size0;
+   }
+
+   descriptor[6] = A5XX_SSBO_1_0_FMT(fd5_pipe2tex(format)) |
+                   A5XX_SSBO_1_0_WIDTH(width);
+   descriptor[7] = A5XX_SSBO_1_1_HEIGHT(height) | A5XX_SSBO_1_1_DEPTH(depth);
+   descriptor[8] = util_format_get_blocksize(format);
+   descriptor[9] = fdl_pitch(layout, level);
+   descriptor[10] = layer_size;
 }
 
 void
@@ -3052,6 +3204,7 @@ tu5_draw_state(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool indexed)
    tu5_emit_textures(cmd, cs, vs_shader);
    tu5_emit_textures(cmd, cs, fs_shader);
    tu5_emit_ssbos(cmd, cs, fs_shader);
+   tu5_emit_images(cmd, cs, fs_shader);
 
    OUT_PKT4(cs, REG_A5XX_VFD_INDEX_OFFSET, 2);
    OUT_RING(cs, cmd->state.last_vs_params.vertex_offset);

@@ -287,6 +287,10 @@ tu_image_view_init(struct tu_device *device,
                                 tu6_plane_index(image->vk.format, aspect_mask),
                                 args.format, range, pCreateInfo->viewType,
                                 args.swiz);
+      tu5_image_view_storage_descriptor(
+         iview->view.storage_descriptor, image,
+         tu6_plane_index(image->vk.format, aspect_mask), args.format, range,
+         pCreateInfo->viewType);
    }
 
    if (image->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
@@ -871,6 +875,12 @@ tu_android_get_wsi_memory(struct tu_device *dev,
 {
    VK_FROM_HANDLE(tu_image, img, bind_info->image);
    VkResult result;
+
+   /* Adreno 5xx: the shaders find the texels of the storage images by
+    * themselves, row after row.
+    */
+   if (tu_is_a5xx(device) && (pCreateInfo->usage & VK_IMAGE_USAGE_STORAGE_BIT))
+      image->force_linear_tile = true;
 
    assert(img->vk.android_deferred_create_info);
 
