@@ -2660,6 +2660,14 @@ tu5_clear_image(struct tu_cmd_buffer *cmd, struct tu_image *image,
    bool zs = util_format_is_depth_or_stencil(format);
    VkClearValue packed = {};
 
+   /* Stencil alone is not an attachment: it is cleared as bytes */
+   if (format == PIPE_FORMAT_S8_UINT) {
+      packed.color.uint32[0] = value->depthStencil.stencil & 0xff;
+      format = PIPE_FORMAT_R8_UINT;
+      value = &packed;
+      zs = false;
+   }
+
    /* What cannot be drawn to is cleared as the unsigned integers of its
     * size, to the bits of the colour.
     */
@@ -3443,8 +3451,14 @@ tu5_emit_viewport_scissor(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
    uint32_t minx = sc->offset.x, miny = sc->offset.y;
    uint32_t maxx = minx + sc->extent.width, maxy = miny + sc->extent.height;
 
-   /* An empty scissor: top left past bottom right */
-   if (maxx == minx || maxy == miny) {
+   /* An empty scissor: top left past bottom right. And so when no sample is
+    * to be written, which a sample mask of zero does not get.
+    */
+   const uint32_t samples = cmd->state.subpass->samples;
+   const bool no_samples =
+      !(dyn->ms.sample_mask & BITFIELD_MASK(MAX2(samples, 1)));
+
+   if (maxx == minx || maxy == miny || no_samples) {
       minx = miny = 1;
       maxx = maxy = 1;
    }
@@ -3740,7 +3754,8 @@ tu5_emit_blend(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    OUT_PKT4(cs, REG_A5XX_SP_FS_OUTPUT_CNTL, 1);
    OUT_RING(cs, A5XX_SP_FS_OUTPUT_CNTL_MRT(nr) |
                    A5XX_SP_FS_OUTPUT_CNTL_DEPTH_REGID(posz_regid) |
-                   A5XX_SP_FS_OUTPUT_CNTL_SAMPLEMASK_REGID(regid(63, 0)));
+                   A5XX_SP_FS_OUTPUT_CNTL_SAMPLEMASK_REGID(
+                      ir3_find_output_regid(fp, FRAG_RESULT_SAMPLE_MASK)));
 }
 
 /* TODO: only what changed. Everything is written out for each draw for now,

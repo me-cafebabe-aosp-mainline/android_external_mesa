@@ -412,6 +412,12 @@ tu5_format_vtx_supported(enum pipe_format format)
 bool
 tu5_format_texture_supported(enum pipe_format format)
 {
+   /* The scaled formats are for the vertices: as textures they would be
+    * read as the integers they are stored as.
+    */
+   if (util_format_is_scaled(format))
+      return false;
+
    return fd5_pipe2tex(format) != TFMT5_NONE;
 }
 
