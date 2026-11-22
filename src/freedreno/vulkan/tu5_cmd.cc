@@ -1642,7 +1642,7 @@ tu5_program_emit(struct tu_cs *ring, struct tu5_program *emit)
          A5XX_HLSQ_CONTROL_3_REG_IJ_LINEAR_PIXEL(ij_regid[IJ_LINEAR_PIXEL]) |
          A5XX_HLSQ_CONTROL_3_REG_IJ_PERSP_CENTROID(
             ij_regid[IJ_PERSP_CENTROID]) |
-         A5XX_HLSQ_CONTROL_3_REG_IJ_PERSP_CENTROID(
+         A5XX_HLSQ_CONTROL_3_REG_IJ_LINEAR_CENTROID(
             ij_regid[IJ_LINEAR_CENTROID]));
    OUT_RING(
       ring,
@@ -1719,8 +1719,15 @@ tu5_program_emit(struct tu_cs *ring, struct tu5_program *emit)
             CONDREG(samp_mask_regid, A5XX_RB_RENDER_CONTROL1_SAMPLEMASK) |
                COND(s[FS].v->frag_face, A5XX_RB_RENDER_CONTROL1_FACENESS) |
                CONDREG(samp_id_regid, A5XX_RB_RENDER_CONTROL1_SAMPLEID) |
-               COND(s[FS].v->per_samp || s[FS].v->key.sample_shading,
-                    A5XX_RB_RENDER_CONTROL1_PER_SAMP_MODE(0x3)));
+               /* as the stock driver has it: for the barycentrics at the
+                * samples, and the sample rate shading
+                */
+               COND(VALIDREG(ij_regid[IJ_PERSP_SAMPLE]) ||
+                       VALIDREG(ij_regid[IJ_LINEAR_SAMPLE]) ||
+                       s[FS].v->key.sample_shading,
+                    A5XX_RB_RENDER_CONTROL1_PER_SAMP_MODE(0x3)) |
+               CONDREG(ij_regid[IJ_PERSP_CENTER_RHW],
+                       A5XX_RB_RENDER_CONTROL1_CENTERRHW));
 
    OUT_PKT4(ring, REG_A5XX_SP_FS_OUTPUT_REG(0), 8);
    for (i = 0; i < 8; i++) {
@@ -4497,6 +4504,19 @@ tu5_emit_blend(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    enum a3xx_rop_code rop = ROP_COPY;
    uint32_t mrt_blend = 0;
    unsigned nr = dyn->rs.rasterizer_discard_enable ? 0 : subpass->color_count;
+   /* dual source blending: the second source is the output of the second
+    * render target
+    */
+   bool dual_src = fp->dual_src_blend && nr;
+   if (dual_src)
+      nr = MAX2(nr, 2);
+   /* the alpha to coverage takes the alpha of the first output, which is
+    * there without a color attachment too
+    */
+   if (dyn->ms.alpha_to_coverage_enable && !nr &&
+       !dyn->rs.rasterizer_discard_enable &&
+       ir3_find_output_regid(fp, FRAG_RESULT_DATA0) != regid(63, 0))
+      nr = 1;
 
    if (dyn->cb.logic_op_enable)
       rop = tu6_rop((VkLogicOp)dyn->cb.logic_op);
@@ -4565,6 +4585,7 @@ tu5_emit_blend(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    OUT_PKT4(cs, REG_A5XX_SP_BLEND_CNTL, 1);
    OUT_RING(cs, A5XX_SP_BLEND_CNTL_ENABLE_BLEND(mrt_blend) |
                    A5XX_SP_BLEND_CNTL_UNK8 |
+                   COND(dual_src, A5XX_SP_BLEND_CNTL_DUAL_COLOR_IN_ENABLE) |
                    COND(dyn->ms.alpha_to_coverage_enable,
                         A5XX_SP_BLEND_CNTL_ALPHA_TO_COVERAGE));
 
@@ -4572,6 +4593,9 @@ tu5_emit_blend(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    OUT_RING(cs, A5XX_RB_BLEND_CNTL_ENABLE_BLEND(mrt_blend) |
                    COND(dyn->ms.alpha_to_coverage_enable,
                         A5XX_RB_BLEND_CNTL_ALPHA_TO_COVERAGE) |
+                   COND(dyn->ms.alpha_to_one_enable,
+                        A5XX_RB_BLEND_CNTL_ALPHA_TO_ONE) |
+                   COND(dual_src, A5XX_RB_BLEND_CNTL_DUAL_COLOR_IN_ENABLE) |
                    A5XX_RB_BLEND_CNTL_INDEPENDENT_BLEND |
                    A5XX_RB_BLEND_CNTL_SAMPLE_MASK(dyn->ms.sample_mask & 0xffff));
 
@@ -4598,6 +4622,7 @@ tu5_emit_blend(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 
    OUT_PKT4(cs, REG_A5XX_RB_FS_OUTPUT_CNTL, 1);
    OUT_RING(cs, A5XX_RB_FS_OUTPUT_CNTL_MRT(nr) |
+                   COND(dual_src, A5XX_RB_FS_OUTPUT_CNTL_DUAL_COLOR_IN_ENABLE) |
                    COND(fp->writes_pos, A5XX_RB_FS_OUTPUT_CNTL_FRAG_WRITES_Z) |
                    /* found by trying: next to FRAG_WRITES_Z, as on Adreno
                     * 6xx, the bit for the sample mask the shader writes
@@ -4608,6 +4633,7 @@ tu5_emit_blend(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 
    OUT_PKT4(cs, REG_A5XX_SP_FS_OUTPUT_CNTL, 1);
    OUT_RING(cs, A5XX_SP_FS_OUTPUT_CNTL_MRT(nr) |
+                   COND(dual_src, A5XX_SP_FS_OUTPUT_CNTL_DUAL_COLOR_IN_ENABLE) |
                    A5XX_SP_FS_OUTPUT_CNTL_DEPTH_REGID(posz_regid) |
                    A5XX_SP_FS_OUTPUT_CNTL_SAMPLEMASK_REGID(
                       ir3_find_output_regid(fp, FRAG_RESULT_SAMPLE_MASK)));
