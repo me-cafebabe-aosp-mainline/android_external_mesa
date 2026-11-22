@@ -1620,7 +1620,12 @@ tu5_program_emit(struct tu_cs *ring, struct tu5_program *emit)
          A5XX_SP_FS_CTRL_REG0_HALFREGFOOTPRINT(s[FS].i->max_half_reg + 1) |
          A5XX_SP_FS_CTRL_REG0_FULLREGFOOTPRINT(s[FS].i->max_reg + 1) |
          A5XX_SP_FS_CTRL_REG0_BRANCHSTACK(ir3_shader_branchstack_hw(s[FS].v)) |
-         COND(s[FS].v->need_pixlod, A5XX_SP_FS_CTRL_REG0_PIXLODENABLE));
+         COND(s[FS].v->need_pixlod, A5XX_SP_FS_CTRL_REG0_PIXLODENABLE) |
+         /* found by trying: three bits below PIXLODENABLE, as LODPIXMASK is
+          * on Adreno 6xx, the bit that has the quads run whole for the fine
+          * derivatives
+          */
+         COND(s[FS].v->need_full_quad, 0x00020000));
 
    OUT_PKT4(ring, REG_A5XX_HLSQ_UPDATE_CNTL, 1);
    OUT_RING(ring, 0x020fffff); /* XXX */
