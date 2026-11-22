@@ -423,6 +423,39 @@ tu5_format_color_supported(enum pipe_format format)
           !util_format_is_depth_or_stencil(format);
 }
 
+/* What can be tiled: as in the Gallium driver, not the compressed formats and
+ * not those of 10 bits a component. The hardware does not swap the
+ * components of what is tiled, so not the formats that need that either.
+ */
+bool
+tu5_format_tileable(enum pipe_format format)
+{
+   if (util_format_is_depth_or_stencil(format))
+      return true;
+
+   if (util_format_is_compressed(format))
+      return false;
+
+   switch (format) {
+   case PIPE_FORMAT_R10G10B10A2_SSCALED:
+   case PIPE_FORMAT_R10G10B10A2_SNORM:
+   case PIPE_FORMAT_B10G10R10A2_USCALED:
+   case PIPE_FORMAT_B10G10R10A2_SSCALED:
+   case PIPE_FORMAT_B10G10R10A2_SNORM:
+   case PIPE_FORMAT_R10G10B10A2_UNORM:
+   case PIPE_FORMAT_R10G10B10A2_USCALED:
+   case PIPE_FORMAT_B10G10R10A2_UNORM:
+   case PIPE_FORMAT_R10SG10SB10SA2U_NORM:
+   case PIPE_FORMAT_B10G10R10A2_UINT:
+   case PIPE_FORMAT_R10G10B10A2_UINT:
+      return false;
+   default:
+      break;
+   }
+
+   return fd5_pipe2color(format) != RB5_NONE && fd5_pipe2swap(format) == WZYX;
+}
+
 bool
 tu5_format_depth_supported(enum pipe_format format)
 {

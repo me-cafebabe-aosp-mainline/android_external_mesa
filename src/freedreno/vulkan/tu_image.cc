@@ -877,9 +877,13 @@ tu_android_get_wsi_memory(struct tu_device *dev,
    VkResult result;
 
    /* Adreno 5xx: the shaders find the texels of the storage images by
-    * themselves, row after row.
+    * themselves, row after row. And not all the formats can be tiled, nor
+    * can those the image may be viewed as when its format is mutable.
     */
-   if (tu_is_a5xx(device) && (pCreateInfo->usage & VK_IMAGE_USAGE_STORAGE_BIT))
+   if (tu_is_a5xx(device) &&
+       ((pCreateInfo->usage & VK_IMAGE_USAGE_STORAGE_BIT) ||
+        (pCreateInfo->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) ||
+        !tu5_format_tileable(vk_format_to_pipe_format(image->vk.format))))
       image->force_linear_tile = true;
 
    assert(img->vk.android_deferred_create_info);

@@ -552,10 +552,19 @@ tu5_emit_user_consts(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
          continue;
       size = MIN2(size, v->constlen * 16 - offset);
 
-      if (range->ubo.bindless || range->ubo.block >= map->count[TU5_DESC_UBO])
+      if (range->ubo.bindless)
          continue;
 
-      uint64_t va = tu5_ubo_address(cmd, shader, &map->ubo[range->ubo.block]);
+      uint64_t va;
+
+      if ((int)range->ubo.block == const_state->consts_ubo.idx) {
+         /* the constant data of the shader, which follows its instructions */
+         va = shader->binary_iova + v->info.constant_data_offset;
+      } else if (range->ubo.block < map->count[TU5_DESC_UBO]) {
+         va = tu5_ubo_address(cmd, shader, &map->ubo[range->ubo.block]);
+      } else {
+         continue;
+      }
 
       if (!va)
          continue;
@@ -968,8 +977,19 @@ tu5_image_view_descriptor(uint32_t *descriptor, const struct tu_image *image,
       fd5_tex_swiz(format, swiz[0], swiz[1], swiz[2], swiz[3]) |
       COND(format == PIPE_FORMAT_X24S8_UINT, A5XX_TEX_CONST_0_SWAP(XYZW)) |
       COND(util_format_is_srgb(format), A5XX_TEX_CONST_0_SRGB);
-   descriptor[1] = A5XX_TEX_CONST_1_WIDTH(u_minify(layout->width0, level)) |
-                   A5XX_TEX_CONST_1_HEIGHT(u_minify(layout->height0, level));
+   uint32_t width = u_minify(layout->width0, level);
+   uint32_t height = u_minify(layout->height0, level);
+
+   /* The blocks of a compressed image are the texels of a view of another
+    * format.
+    */
+   if (!util_format_is_compressed(format)) {
+      width = util_format_get_nblocksx(layout->format, width);
+      height = util_format_get_nblocksy(layout->format, height);
+   }
+
+   descriptor[1] = A5XX_TEX_CONST_1_WIDTH(width) |
+                   A5XX_TEX_CONST_1_HEIGHT(height);
    descriptor[2] = A5XX_TEX_CONST_2_PITCHALIGN(layout->pitchalign - 6) |
                    A5XX_TEX_CONST_2_PITCH(fdl_pitch(layout, level)) |
                    A5XX_TEX_CONST_2_TYPE(tex_type);
@@ -1037,6 +1057,11 @@ tu5_image_view_storage_descriptor(uint32_t *descriptor,
    uint32_t depth = layers;
    uint32_t layer_size = layout->layer_size;
 
+   if (!util_format_is_compressed(format)) {
+      width = util_format_get_nblocksx(layout->format, width);
+      height = util_format_get_nblocksy(layout->format, height);
+   }
+
    /* The faces of a cube are the layers of an array */
    if (type == VK_IMAGE_VIEW_TYPE_CUBE || type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY)
       type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
@@ -1055,6 +1080,14 @@ tu5_image_view_storage_descriptor(uint32_t *descriptor,
    descriptor[8] = util_format_get_blocksize(format);
    descriptor[9] = fdl_pitch(layout, level);
    descriptor[10] = layer_size;
+
+   /* The second coordinate of the 1D arrays is the layer: these are written
+    * as images of that many rows.
+    */
+   if (type == VK_IMAGE_VIEW_TYPE_1D || type == VK_IMAGE_VIEW_TYPE_1D_ARRAY) {
+      descriptor[7] = A5XX_SSBO_1_1_HEIGHT(layers) | A5XX_SSBO_1_1_DEPTH(1);
+      descriptor[9] = layer_size;
+   }
 }
 
 void
