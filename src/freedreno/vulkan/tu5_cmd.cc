@@ -3545,6 +3545,12 @@ tu5_clear_attachments(struct tu_cmd_buffer *cmd, uint32_t attachment_count,
    const struct tu_framebuffer *fb = cmd->state.framebuffer;
    struct tu_cs *cs = &cmd->draw_cs;
 
+   /* The clears are no draws for the occlusion queries: no sample counting
+    * in them (bit 0, as on a6xx)
+    */
+   OUT_PKT4(cs, REG_A5XX_RB_SAMPLE_COUNT_CONTROL, 1);
+   OUT_RING(cs, 0x1);
+
    for (uint32_t i = 0; i < attachment_count; i++) {
       const VkClearAttachment *att = &attachments[i];
       int rt = -1;
@@ -3625,7 +3631,11 @@ tu5_clear_attachments(struct tu_cmd_buffer *cmd, uint32_t attachment_count,
          }
       }
    }
+
+   OUT_PKT4(cs, REG_A5XX_RB_SAMPLE_COUNT_CONTROL, 1);
+   OUT_RING(cs, A5XX_RB_SAMPLE_COUNT_CONTROL_COPY);
 }
+
 
 /* GMEM: the clears of the attachments that the subpass that starts uses
  * first, drawn into them as they are bound, in each tile
@@ -4118,6 +4128,10 @@ tu5_emit_subpass_begin(struct tu_cmd_buffer *cmd)
 
    struct tu_cs *cs = &cmd->draw_cs;
 
+   /* the clears of the load ops are no draws for the occlusion queries */
+   OUT_PKT4(cs, REG_A5XX_RB_SAMPLE_COUNT_CONTROL, 1);
+   OUT_RING(cs, 0x1);
+
    if (cmd->state.a5xx_gmem) {
       /* the clears are into the attachments in GMEM, as they are bound */
       tu5_emit_zs(cmd, cs, 0);
@@ -4131,6 +4145,9 @@ tu5_emit_subpass_begin(struct tu_cmd_buffer *cmd)
       tu5_emit_mrt(cmd, cs, 0);
       tu5_emit_msaa(cs, cmd->state.subpass->samples);
    }
+
+   OUT_PKT4(cs, REG_A5XX_RB_SAMPLE_COUNT_CONTROL, 1);
+   OUT_RING(cs, A5XX_RB_SAMPLE_COUNT_CONTROL_COPY);
 
    OUT_PKT4(cs, REG_A5XX_RB_RENDER_CNTL, 1);
    OUT_RING(cs, 0x00000008);
