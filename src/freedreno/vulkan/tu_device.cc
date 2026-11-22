@@ -413,6 +413,35 @@ get_device_extensions(const struct tu_physical_device *device,
       .VALVE_fragment_density_map_layered = tu_is_vk_1_1(device),
       .VALVE_mutable_descriptor_type = true,
    } };
+
+   /* Adreno 5xx: those that were made to work */
+   if (device->info->chip == 5) {
+      const struct vk_device_extension_table all = *ext;
+
+      *ext = (struct vk_device_extension_table) { .table = {
+         .KHR_bind_memory2 = true,
+         .KHR_dedicated_allocation = true,
+         .KHR_descriptor_update_template = true,
+         .KHR_driver_properties = true,
+         .KHR_external_fence = true,
+         .KHR_external_fence_fd = true,
+         .KHR_external_memory = true,
+         .KHR_external_memory_fd = true,
+         .KHR_external_semaphore = true,
+         .KHR_external_semaphore_fd = true,
+         .KHR_get_memory_requirements2 = true,
+         .KHR_image_format_list = true,
+         .KHR_incremental_present = all.KHR_incremental_present,
+         .KHR_maintenance1 = true,
+         .KHR_maintenance2 = true,
+         .KHR_maintenance3 = true,
+         .KHR_relaxed_block_layout = true,
+         .KHR_sampler_mirror_clamp_to_edge = true,
+         .KHR_storage_buffer_storage_class = true,
+         .KHR_swapchain = all.KHR_swapchain,
+         .EXT_queue_family_foreign = true,
+      } };
+   }
 }
 
 static void
@@ -921,6 +950,24 @@ tu_get_features(struct tu_physical_device *pdevice,
    features->presentAtRelativeTime = true;
    features->presentAtAbsoluteTime = true;
 #endif
+
+   /* Adreno 5xx: those that were made to work */
+   if (pdevice->info->chip == 5) {
+      *features = (struct vk_features) { false };
+
+      features->robustBufferAccess = true;
+      features->fullDrawIndexUint32 = true;
+      features->imageCubeArray = true;
+      features->independentBlend = true;
+      features->depthBiasClamp = true;
+      features->fillModeNonSolid = true;
+      features->largePoints = true;
+      features->samplerAnisotropy = true;
+      features->textureCompressionETC2 = true;
+      features->textureCompressionASTC_LDR = true;
+      features->textureCompressionBC = true;
+      features->samplerMirrorClampToEdge = true;
+   }
 }
 
 static void
@@ -1298,6 +1345,36 @@ tu_get_properties(struct tu_physical_device *pdevice,
          ((pdevice->info->chip >= 7) ? TU_API_VERSION :
             VK_MAKE_VERSION(1, 3, VK_HEADER_VERSION))
          : VK_MAKE_VERSION(1, 0, VK_HEADER_VERSION);
+   /* Adreno 5xx: a shader numbers what it uses, see struct tu5_desc_map.
+    * TODO: storage buffers and storage images
+    */
+   if (pdevice->info->chip == 5) {
+      props->maxPerStageDescriptorSamplers = TU5_MAX_SAMPLERS;
+      props->maxPerStageDescriptorSampledImages = TU5_MAX_TEXTURES;
+      props->maxPerStageDescriptorUniformBuffers = TU5_MAX_UBOS - 2;
+      props->maxPerStageDescriptorStorageBuffers = 0;
+      props->maxPerStageDescriptorStorageImages = 0;
+      props->maxPerStageResources =
+         TU5_MAX_SAMPLERS + TU5_MAX_TEXTURES + TU5_MAX_UBOS - 2 + MAX_RTS;
+      props->maxDescriptorSetSamplers = 2 * TU5_MAX_SAMPLERS;
+      props->maxDescriptorSetSampledImages = 2 * TU5_MAX_TEXTURES;
+      props->maxDescriptorSetUniformBuffers = 2 * (TU5_MAX_UBOS - 2);
+      props->maxDescriptorSetUniformBuffersDynamic =
+         MIN2(MAX_DYNAMIC_UNIFORM_BUFFERS, TU5_MAX_UBOS - 2);
+      props->maxDescriptorSetStorageBuffers = 0;
+      props->maxDescriptorSetStorageBuffersDynamic = 0;
+      props->maxDescriptorSetStorageImages = 0;
+      props->maxVertexInputAttributes = 16;
+      props->maxVertexInputBindings = 16;
+      props->maxViewports = 1;
+      props->maxFragmentDualSrcAttachments = 0;
+      props->maxClipDistances = 0;
+      props->maxCullDistances = 0;
+      props->maxCombinedClipAndCullDistances = 0;
+      props->lineWidthRange[0] = props->lineWidthRange[1] = 1.0;
+      props->lineWidthGranularity = 0.0;
+   }
+
    props->driverVersion = vk_get_driver_version();
    props->vendorID = pdevice->instance->drirc.debug.force_vk_vendor != 0 ?
                      pdevice->instance->drirc.debug.force_vk_vendor : 0x5143;

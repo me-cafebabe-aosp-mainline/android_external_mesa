@@ -6,6 +6,8 @@
 
 #include "tu_formats.h"
 
+#include "tu5.h"
+
 #include "drm-uapi/drm_fourcc.h"
 
 #include "vk_acceleration_structure.h"
@@ -156,6 +158,13 @@ tu_physical_device_get_format_properties(
    }
 
    bool is_npot = !util_is_power_of_two_or_zero(desc->block.bits);
+   bool a5xx = physical_device->info->chip == 5;
+
+   if (a5xx) {
+      supported_vtx = tu5_format_vtx_supported(format);
+      supported_color = tu5_format_color_supported(format);
+      supported_tex = tu5_format_texture_supported(format);
+   }
 
    if (format == PIPE_FORMAT_NONE ||
        !(supported_vtx || supported_color || supported_tex)) {
@@ -333,7 +342,8 @@ tu_physical_device_get_format_properties(
     * DEPTH_STENCIL_ATTACHMENT_BIT for the optimal features.
     */
    linear = optimal;
-   if (tu6_pipe2depth(vk_format) != DEPTH6_NONE)
+   if (a5xx ? tu5_format_depth_supported(format)
+            : tu6_pipe2depth(vk_format) != DEPTH6_NONE)
       optimal |= VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
 
    if (!tiling_possible(vk_format) &&
@@ -372,6 +382,30 @@ tu_physical_device_get_format_properties(
       buffer |= VK_FORMAT_FEATURE_2_ACCELERATION_STRUCTURE_VERTEX_BUFFER_BIT_KHR;
 
 end:
+   /* Adreno 5xx. TODO: storage images and texel buffers, multi-planar and
+    * compressed formats in the copies
+    */
+   if (a5xx) {
+      const VkFormatFeatureFlags2 no =
+         VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+         VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT |
+         VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
+         VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT |
+         VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT |
+         VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT |
+         VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT |
+         VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT |
+         VK_FORMAT_FEATURE_2_FRAGMENT_DENSITY_MAP_BIT_EXT |
+         VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_MINMAX_BIT |
+         VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_CUBIC_BIT_EXT;
+
+      linear &= ~no;
+      optimal &= ~no;
+      buffer &= ~no;
+      if (ycbcr_info)
+         linear = optimal = buffer = 0;
+   }
+
    out_properties->linearTilingFeatures = linear;
    out_properties->optimalTilingFeatures = optimal;
    out_properties->bufferFeatures = buffer;

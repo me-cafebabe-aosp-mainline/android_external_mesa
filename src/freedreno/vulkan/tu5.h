@@ -31,6 +31,18 @@ void tu5_clear_image(struct tu_cmd_buffer *cmd, struct tu_image *image,
                      const VkClearValue *value, uint32_t range_count,
                      const VkImageSubresourceRange *ranges);
 
+/* The formats: tu5_format.c */
+#ifdef __cplusplus
+extern "C" {
+#endif
+bool tu5_format_vtx_supported(enum pipe_format format);
+bool tu5_format_texture_supported(enum pipe_format format);
+bool tu5_format_color_supported(enum pipe_format format);
+bool tu5_format_depth_supported(enum pipe_format format);
+#ifdef __cplusplus
+}
+#endif
+
 /* The descriptor of an image view */
 void tu5_image_view_descriptor(uint32_t *descriptor,
                                const struct tu_image *image, unsigned plane,

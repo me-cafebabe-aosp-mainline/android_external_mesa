@@ -402,6 +402,35 @@ tex_swiz(unsigned swiz)
    }
 }
 
+/* What tu_physical_device_get_format_properties() asks */
+bool
+tu5_format_vtx_supported(enum pipe_format format)
+{
+   return fd5_pipe2vtx(format) != VFMT5_NONE;
+}
+
+bool
+tu5_format_texture_supported(enum pipe_format format)
+{
+   return fd5_pipe2tex(format) != TFMT5_NONE;
+}
+
+bool
+tu5_format_color_supported(enum pipe_format format)
+{
+   return fd5_pipe2color(format) != RB5_NONE &&
+          fd5_pipe2tex(format) != TFMT5_NONE &&
+          !util_format_is_depth_or_stencil(format);
+}
+
+bool
+tu5_format_depth_supported(enum pipe_format format)
+{
+   return util_format_is_depth_or_stencil(format) &&
+          format != PIPE_FORMAT_S8_UINT &&
+          fd5_pipe2depth(format) != (enum a5xx_depth_format)~0;
+}
+
 uint32_t
 fd5_tex_swiz(enum pipe_format format, unsigned swizzle_r, unsigned swizzle_g,
              unsigned swizzle_b, unsigned swizzle_a)
