@@ -1712,6 +1712,8 @@ struct tu5_surf {
    uint32_t layer_size; /* bytes */
    enum a5xx_tile_mode tile_mode;
    uint32_t samples;
+   /* As a texture: the component each of its four reads, if not its own */
+   const unsigned char *swiz;
 };
 
 static struct tu5_surf
@@ -1719,12 +1721,22 @@ tu5_image_surf(const struct tu_image *image, unsigned plane,
                enum pipe_format format, uint32_t level, uint32_t layer)
 {
    const struct fdl_layout *layout = &image->layout[plane];
+   uint32_t width = u_minify(layout->width0, level);
+   uint32_t height = u_minify(layout->height0, level);
+
+   /* The blocks of a compressed image are the texels of what it is copied
+    * as, see tu5_copy_format().
+    */
+   if (!util_format_is_compressed(format)) {
+      width = util_format_get_nblocksx(layout->format, width);
+      height = util_format_get_nblocksy(layout->format, height);
+   }
 
    return (struct tu5_surf) {
       .format = format,
       .iova = image->iova + fdl_surface_offset(layout, level, layer),
-      .width = u_minify(layout->width0, level),
-      .height = u_minify(layout->height0, level),
+      .width = width,
+      .height = height,
       .pitch = fdl_pitch(layout, level),
       .layer_size = fdl_layer_stride(layout, level),
       .tile_mode = (enum a5xx_tile_mode)fdl_tile_mode(layout, level),
@@ -1834,8 +1846,12 @@ tu5_emit_blit_src(struct tu_cs *cs, const struct tu5_surf *surf, bool linear)
    OUT_RING(cs, A5XX_TEX_CONST_0_TILE_MODE(surf->tile_mode) |
                    A5XX_TEX_CONST_0_FMT(fd5_pipe2tex(surf->format)) |
                    A5XX_TEX_CONST_0_SAMPLES(tu_msaa_samples(surf->samples)) |
-                   fd5_tex_swiz(surf->format, PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y,
-                                PIPE_SWIZZLE_Z, PIPE_SWIZZLE_W) |
+                   (surf->swiz
+                       ? fd5_tex_swiz(surf->format, surf->swiz[0], surf->swiz[1],
+                                      surf->swiz[2], surf->swiz[3])
+                       : fd5_tex_swiz(surf->format, PIPE_SWIZZLE_X,
+                                      PIPE_SWIZZLE_Y, PIPE_SWIZZLE_Z,
+                                      PIPE_SWIZZLE_W)) |
                    COND(util_format_is_srgb(surf->format),
                         A5XX_TEX_CONST_0_SRGB));
    OUT_RING(cs, A5XX_TEX_CONST_1_WIDTH(surf->width) |
@@ -2495,10 +2511,6 @@ tu5_aspect_copy_format(const struct tu_image *image, VkImageAspectFlags aspect,
       return PIPE_FORMAT_R8G8B8A8_UINT;
    }
 
-   /* TODO: compressed formats, by block */
-   if (util_format_is_compressed(format))
-      return PIPE_FORMAT_NONE;
-
    return tu5_copy_format(format);
 }
 
@@ -2511,14 +2523,20 @@ static void
 tu5_copy_buffer_rect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                      const struct tu5_surf *image, uint32_t x, uint32_t y,
                      uint64_t va, uint32_t pitch, uint32_t w, uint32_t h,
-                     bool to_buffer, uint32_t keep_mask)
+                     bool to_buffer, uint32_t keep_mask,
+                     enum pipe_format format, const unsigned char *swiz)
 {
-   enum pipe_format format = image->format;
    uint32_t cpp = util_format_get_blocksize(format);
+   struct tu5_surf image_src = *image;
+
+   /* what is read, of the image or of the buffer */
+   image_src.swiz = swiz;
+   image = &image_src;
 
    if (!(va & 63) && !(pitch & 63)) {
       struct tu5_surf buf = tu5_buffer_surf(format, va, w, h, pitch);
 
+      buf.swiz = swiz;
       if (to_buffer) {
          tu5_blit_rect(cmd, cs, &buf, (VkRect2D) { { 0, 0 }, { w, h } }, image,
                        x, y, x + w, y + h, false, 0);
@@ -2536,6 +2554,7 @@ tu5_copy_buffer_rect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
          tu5_buffer_surf(format, row_va & ~63ull, bx + w, 1,
                          align((bx + w) * cpp, 64));
 
+      buf.swiz = swiz;
       if (to_buffer) {
          tu5_blit_rect(cmd, cs, &buf, (VkRect2D) { { (int32_t)bx, 0 }, { w, 1 } },
                        image, x, y + row, x + w, y + row + 1, false, 0);
@@ -2562,23 +2581,36 @@ tu5_copy_buffer_image(struct tu_cmd_buffer *cmd, struct tu_buffer *buffer,
    enum pipe_format format =
       tu5_aspect_copy_format(image, sub->aspectMask, &plane, &keep_mask);
 
-   /* TODO: the stencil of packed depth and stencil, a byte a texel in the
-    * buffer
-    */
-   if (format == PIPE_FORMAT_NONE ||
-       (keep_mask == 0x7 && sub->aspectMask == VK_IMAGE_ASPECT_STENCIL_BIT)) {
+   if (format == PIPE_FORMAT_NONE) {
       mesa_logw("a5xx: copy between a buffer and %s not implemented",
                 util_format_name(vk_format_to_pipe_format(image->vk.format)));
       return;
    }
 
-   uint32_t cpp = util_format_get_blocksize(format);
+   /* The stencil of packed depth and stencil is a byte a texel in the
+    * buffer, and the last of the four of a texel of the image.
+    */
+   static const unsigned char all_x[4] = { PIPE_SWIZZLE_X, PIPE_SWIZZLE_X,
+                                           PIPE_SWIZZLE_X, PIPE_SWIZZLE_X };
+   static const unsigned char all_w[4] = { PIPE_SWIZZLE_W, PIPE_SWIZZLE_W,
+                                           PIPE_SWIZZLE_W, PIPE_SWIZZLE_W };
+   bool packed_stencil =
+      keep_mask == 0x7 && sub->aspectMask == VK_IMAGE_ASPECT_STENCIL_BIT;
+   enum pipe_format buf_format = packed_stencil ? PIPE_FORMAT_R8_UINT : format;
+   const unsigned char *swiz =
+      !packed_stencil ? NULL : to_buffer ? all_w : all_x;
+
+   /* in blocks, for the compressed formats */
+   enum pipe_format image_format = image->layout[plane].format;
+   uint32_t bw = util_format_get_blockwidth(image_format);
+   uint32_t bh = util_format_get_blockheight(image_format);
+   uint32_t cpp = util_format_get_blocksize(buf_format);
    uint32_t row_length = info->bufferRowLength ? info->bufferRowLength
                                                : info->imageExtent.width;
    uint32_t image_height = info->bufferImageHeight ? info->bufferImageHeight
                                                    : info->imageExtent.height;
-   uint32_t pitch = row_length * cpp;
-   uint64_t layer_size = (uint64_t)image_height * pitch;
+   uint32_t pitch = DIV_ROUND_UP(row_length, bw) * cpp;
+   uint64_t layer_size = (uint64_t)DIV_ROUND_UP(image_height, bh) * pitch;
 
    tu5_blit_begin(cmd, cs);
    for (uint32_t i = 0; i < layers; i++) {
@@ -2586,11 +2618,12 @@ tu5_copy_buffer_image(struct tu_cmd_buffer *cmd, struct tu_buffer *buffer,
       struct tu5_surf surf =
          tu5_image_surf(image, plane, format, sub->mipLevel, layer);
 
-      tu5_copy_buffer_rect(cmd, cs, &surf, info->imageOffset.x,
-                           info->imageOffset.y,
+      tu5_copy_buffer_rect(cmd, cs, &surf, info->imageOffset.x / bw,
+                           info->imageOffset.y / bh,
                            buffer->iova + info->bufferOffset + layer_size * i,
-                           pitch, info->imageExtent.width,
-                           info->imageExtent.height, to_buffer, keep_mask);
+                           pitch, DIV_ROUND_UP(info->imageExtent.width, bw),
+                           DIV_ROUND_UP(info->imageExtent.height, bh),
+                           to_buffer, keep_mask, buf_format, swiz);
    }
    tu5_sysmem_end(cmd, cs);
 }
@@ -2629,7 +2662,6 @@ tu5_copy_image(struct tu_cmd_buffer *cmd, struct tu_image *src_image,
            vk_image_subresource_layer_count(&src_image->vk,
                                             &info->srcSubresource));
 
-   /* TODO: between compressed and other formats */
    if (src_format == PIPE_FORMAT_NONE || src_format != dst_format) {
       mesa_logw("a5xx: copy from %s to %s not implemented",
                 util_format_name(vk_format_to_pipe_format(src_image->vk.format)),
@@ -2645,24 +2677,33 @@ tu5_copy_image(struct tu_cmd_buffer *cmd, struct tu_image *src_image,
       struct tu5_surf dst = tu5_image_surf(
          dst_image, dst_plane, dst_format, info->dstSubresource.mipLevel,
          (dst_3d ? info->dstOffset.z : info->dstSubresource.baseArrayLayer) + i);
-      VkRect2D rect = { { info->dstOffset.x, info->dstOffset.y },
-                        { info->extent.width, info->extent.height } };
+      /* in blocks, for the compressed formats: a block of one is a texel
+       * of the other
+       */
+      enum pipe_format sf = src_image->layout[src_plane].format;
+      enum pipe_format df = dst_image->layout[dst_plane].format;
+      uint32_t sbw = util_format_get_blockwidth(sf);
+      uint32_t sbh = util_format_get_blockheight(sf);
+      uint32_t w = DIV_ROUND_UP(info->extent.width, sbw);
+      uint32_t h = DIV_ROUND_UP(info->extent.height, sbh);
+      float sx = info->srcOffset.x / sbw, sy = info->srcOffset.y / sbh;
+      VkRect2D rect = {
+         { info->dstOffset.x / (int32_t)util_format_get_blockwidth(df),
+           info->dstOffset.y / (int32_t)util_format_get_blockheight(df) },
+         { w, h }
+      };
 
       if (src.samples > 1) {
          /* sample by sample */
          for (uint32_t s = 0; s < src.samples; s++) {
-            tu5_blit_rect(cmd, cs, &dst, rect, &src, info->srcOffset.x,
-                          info->srcOffset.y,
-                          info->srcOffset.x + info->extent.width,
-                          info->srcOffset.y + info->extent.height, false,
-                          dst_keep, GLOBAL_SH_FS_COPY_MS5, s);
+            tu5_blit_rect(cmd, cs, &dst, rect, &src, sx, sy, sx + w, sy + h,
+                          false, dst_keep, GLOBAL_SH_FS_COPY_MS5, s);
          }
          continue;
       }
 
-      tu5_blit_rect(cmd, cs, &dst, rect, &src, info->srcOffset.x,
-                    info->srcOffset.y, info->srcOffset.x + info->extent.width,
-                    info->srcOffset.y + info->extent.height, false, dst_keep);
+      tu5_blit_rect(cmd, cs, &dst, rect, &src, sx, sy, sx + w, sy + h, false,
+                    dst_keep);
    }
    tu5_sysmem_end(cmd, cs);
 }
@@ -2679,8 +2720,7 @@ tu5_blit_image(struct tu_cmd_buffer *cmd, struct tu_image *src_image,
    uint32_t layers = vk_image_subresource_layer_count(&dst_image->vk,
                                                       &info->dstSubresource);
 
-   if (util_format_is_depth_or_stencil(dst_format) ||
-       util_format_is_compressed(src_format)) {
+   if (util_format_is_depth_or_stencil(dst_format)) {
       mesa_logw("a5xx: blit from %s to %s not implemented",
                 util_format_name(src_format), util_format_name(dst_format));
       return;
