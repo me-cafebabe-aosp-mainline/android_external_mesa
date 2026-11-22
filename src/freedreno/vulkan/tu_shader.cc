@@ -940,6 +940,12 @@ lower_image_deref(struct tu_device *dev, nir_builder *b,
       nir_variable *var = nir_deref_instr_get_variable(deref);
       unsigned first = tu5_desc_base(shader, layout, var->data.descriptor_set,
                                      var->data.binding, TU5_DESC_IMAGE);
+      if (var->data.image.format == PIPE_FORMAT_NONE) {
+         unsigned count = layout->set[var->data.descriptor_set]
+                             .layout->binding[var->data.binding].array_size;
+         for (unsigned i = 0; i < count && first + i < TU5_MAX_IMAGES; i++)
+            shader->const_state.a5xx.image[first + i].real_format = true;
+      }
       nir_def *index = deref->deref_type == nir_deref_type_var
                           ? nir_imm_int(b, first)
                           : nir_iadd_imm(b, deref->arr.index.ssa, first);

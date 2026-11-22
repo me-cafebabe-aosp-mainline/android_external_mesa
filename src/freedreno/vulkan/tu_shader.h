@@ -70,6 +70,8 @@ struct tu5_desc_ref
    bool dynamic;
    /* a storage buffer read as a uniform buffer */
    bool storage;
+   /* a storage image of no format in the shader: the format of the view */
+   bool real_format;
    /* of the descriptor, in dwords */
    uint32_t offset;
 };

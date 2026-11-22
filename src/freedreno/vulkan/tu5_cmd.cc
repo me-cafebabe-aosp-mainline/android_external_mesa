@@ -501,7 +501,10 @@ tu5_emit_images(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       OUT_RING(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
                       CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
       OUT_RING(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
-      OUT_RING(cs, desc[6]); /* SSBO_1_0 */
+      /* the format of LDIB (see tu5_storage_format()), or the format itself
+       * for an image the shader has no format of (stores alone)
+       */
+      OUT_RING(cs, map->image[i].real_format ? desc[11] : desc[6]); /* SSBO_1_0 */
       OUT_RING(cs, desc[7]); /* SSBO_1_1 */
 
       OUT_PKT7(cs, CP_LOAD_STATE4, 3 + 2);
@@ -1172,6 +1175,11 @@ tu5_buffer_view_descriptor(uint32_t *descriptor, enum pipe_format format,
    descriptor[6] = A5XX_SSBO_1_0_FMT(fd5_pipe2tex(tu5_storage_format(format))) |
                    A5XX_SSBO_1_0_WIDTH(elements & 0x7fff);
    descriptor[7] = A5XX_SSBO_1_1_HEIGHT(elements >> 15);
+   /* with the format itself, for the stores of no format, which STIB writes
+    * right: see tu5_emit_images()
+    */
+   descriptor[11] = A5XX_SSBO_1_0_FMT(fd5_pipe2tex(format)) |
+                    A5XX_SSBO_1_0_WIDTH(elements & 0x7fff);
    descriptor[8] = cpp;
    /* for the size, which the shader divides by the bytes of a texel */
    descriptor[9] = ffs(cpp) - 1;
@@ -1216,6 +1224,9 @@ tu5_image_view_storage_descriptor(uint32_t *descriptor,
 
    descriptor[6] = A5XX_SSBO_1_0_FMT(fd5_pipe2tex(tu5_storage_format(format))) |
                    A5XX_SSBO_1_0_WIDTH(width);
+   /* with the format itself, see tu5_emit_images() */
+   descriptor[11] = A5XX_SSBO_1_0_FMT(fd5_pipe2tex(format)) |
+                    A5XX_SSBO_1_0_WIDTH(width);
    descriptor[7] = A5XX_SSBO_1_1_HEIGHT(height) | A5XX_SSBO_1_1_DEPTH(depth);
    descriptor[8] = util_format_get_blocksize(format);
    descriptor[9] = fdl_pitch(layout, level);
