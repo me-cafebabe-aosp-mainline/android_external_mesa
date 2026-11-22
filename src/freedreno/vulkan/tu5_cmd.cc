@@ -1161,7 +1161,7 @@ tu5_buffer_view_descriptor(uint32_t *descriptor, enum pipe_format format,
    descriptor[4] = (uint32_t)iova;
    descriptor[5] = (uint32_t)(iova >> 32);
 
-   descriptor[6] = A5XX_SSBO_1_0_FMT(fd5_pipe2tex(format)) |
+   descriptor[6] = A5XX_SSBO_1_0_FMT(fd5_pipe2tex(tu5_storage_format(format))) |
                    A5XX_SSBO_1_0_WIDTH(elements & 0x7fff);
    descriptor[7] = A5XX_SSBO_1_1_HEIGHT(elements >> 15);
    descriptor[8] = cpp;
@@ -1206,7 +1206,7 @@ tu5_image_view_storage_descriptor(uint32_t *descriptor,
       layer_size = layout->slices[level].size0;
    }
 
-   descriptor[6] = A5XX_SSBO_1_0_FMT(fd5_pipe2tex(format)) |
+   descriptor[6] = A5XX_SSBO_1_0_FMT(fd5_pipe2tex(tu5_storage_format(format))) |
                    A5XX_SSBO_1_0_WIDTH(width);
    descriptor[7] = A5XX_SSBO_1_1_HEIGHT(height) | A5XX_SSBO_1_1_DEPTH(depth);
    descriptor[8] = util_format_get_blocksize(format);

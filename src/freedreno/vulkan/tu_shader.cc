@@ -15,6 +15,7 @@
 #include "vk_nir_convert_ycbcr.h"
 #include "vk_pipeline.h"
 #include "vk_util.h"
+#include "nir/nir_format_convert.h"
 
 #include "ir3/ir3_compiler.h"
 #include "ir3/ir3_nir.h"
@@ -23,6 +24,7 @@
 #include "tu_lrz.h"
 #include "tu_pipeline.h"
 #include "tu_rmv.h"
+#include "tu5.h"
 #include "tu_sampler.h"
 #include "tu_subsampled_image.h"
 
@@ -837,6 +839,92 @@ lower_texel_buffers_to_image(nir_builder *b,
    }
    default:
       break;
+/* Adreno 5xx: the loads and stores of storage images (and texel buffers)
+ * of a format LDIB reads wrong are of an unsigned integer format of as many
+ * bits, see tu5_storage_format(): pack the texels stored, unpack those
+ * loaded. A load that is to read the image as a texture (isam: readonly,
+ * at a constant index) is left alone, the texture descriptor having the
+ * format; one that is lowered is not to become such a load.
+ */
+static void
+tu5_lower_storage_format(nir_builder *b, nir_intrinsic_instr *instr)
+{
+   if (instr->intrinsic != nir_intrinsic_image_load &&
+       instr->intrinsic != nir_intrinsic_image_store)
+      return;
+
+   enum pipe_format format = nir_intrinsic_format(instr);
+   if (format == PIPE_FORMAT_NONE)
+      return;
+
+   enum pipe_format raw = tu5_storage_format(format);
+   if (raw == format)
+      return;
+
+   const bool wide = util_format_get_blocksizebits(format) == 64;
+
+   if (instr->intrinsic == nir_intrinsic_image_load) {
+      if ((nir_intrinsic_access(instr) & ACCESS_CAN_REORDER) &&
+          nir_src_is_const(instr->src[0]))
+         return;
+      if (instr->def.bit_size != 32)
+         return;
+
+      nir_intrinsic_set_access(instr, (enum gl_access_qualifier)(
+         nir_intrinsic_access(instr) & ~ACCESS_CAN_REORDER));
+      nir_alu_type type = nir_intrinsic_dest_type(instr);
+      nir_intrinsic_set_format(instr, raw);
+      nir_intrinsic_set_dest_type(instr, nir_type_uint32);
+
+      b->cursor = nir_after_instr(&instr->instr);
+      nir_def *texel = &instr->def;
+      nir_def *packed;
+      if (wide) {
+         packed = nir_vec2(b,
+            nir_ior(b, nir_channel(b, texel, 0),
+                    nir_ishl_imm(b, nir_channel(b, texel, 1), 16)),
+            nir_ior(b, nir_channel(b, texel, 2),
+                    nir_ishl_imm(b, nir_channel(b, texel, 3), 16)));
+      } else {
+         packed = nir_channel(b, texel, 0);
+      }
+
+      nir_def *rgba = nir_format_unpack_rgba(b, packed, format);
+      /* what the format has not, 0 and 1 of the type read */
+      const struct util_format_description *desc =
+         util_format_description(format);
+      nir_def *comps[4];
+      for (unsigned c = 0; c < 4; c++) {
+         if (c < desc->nr_channels)
+            comps[c] = nir_channel(b, rgba, c);
+         else if (nir_alu_type_get_base_type(type) == nir_type_float)
+            comps[c] = nir_imm_float(b, c == 3 ? 1.0 : 0.0);
+         else
+            comps[c] = nir_imm_int(b, c == 3 ? 1 : 0);
+      }
+      nir_def *value = nir_vec(b, comps, instr->def.num_components);
+      nir_def_rewrite_uses_after(&instr->def, value, value->parent_instr);
+   } else {
+      if (nir_src_bit_size(instr->src[3]) != 32)
+         return;
+
+      b->cursor = nir_before_instr(&instr->instr);
+      nir_def *packed = nir_format_pack_rgba(b, format, instr->src[3].ssa);
+      nir_def *texel;
+      if (wide) {
+         nir_def *w0 = nir_channel(b, packed, 0);
+         nir_def *w1 = nir_channel(b, packed, 1);
+         texel = nir_vec4(b, nir_iand_imm(b, w0, 0xffff),
+                          nir_ushr_imm(b, w0, 16),
+                          nir_iand_imm(b, w1, 0xffff),
+                          nir_ushr_imm(b, w1, 16));
+      } else {
+         nir_def *zero = nir_imm_int(b, 0);
+         texel = nir_vec4(b, nir_channel(b, packed, 0), zero, zero, zero);
+      }
+      nir_src_rewrite(&instr->src[3], texel);
+      nir_intrinsic_set_format(instr, raw);
+      nir_intrinsic_set_src_type(instr, nir_type_uint32);
    }
 }
 
@@ -858,6 +946,7 @@ lower_image_deref(struct tu_device *dev, nir_builder *b,
 
       shader->active_desc_sets |= 1u << var->data.descriptor_set;
       nir_rewrite_image_intrinsic(instr, index, false);
+      tu5_lower_storage_format(b, instr);
       return;
    }
 

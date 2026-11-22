@@ -501,3 +501,57 @@ fd5_tex_swiz(enum pipe_format format, unsigned swizzle_r, unsigned swizzle_g,
           A5XX_TEX_CONST_0_SWIZ_Z(tex_swiz(rswiz[2])) |
           A5XX_TEX_CONST_0_SWIZ_W(tex_swiz(rswiz[3]));
 }
+
+/* The format storage images and texel buffers of a format are written and
+ * read (STIB, LDIB) with. LDIB gets texels of formats of two components,
+ * of 16-bit normalized ones and of packed ones wrong (written with STIB
+ * right): these are an unsigned integer format of as many bits, the shaders
+ * packing and unpacking the texels themselves (see tu5_lower_storage_format
+ * in tu_shader.cc). Those it reads right are of one or four components of
+ * 8, 16 or 32 bits: integers, floats, 8-bit unorm.
+ */
+enum pipe_format
+tu5_storage_format(enum pipe_format format)
+{
+   const struct util_format_description *desc = util_format_description(format);
+
+   /* Not R11G11B10_FLOAT, which LDIB also reads wrong: STIB writes its NaNs,
+    * infinities and denormals as they are, which packing them in the shader
+    * would not. Images of it are rather written than read and written.
+    */
+
+   if (!desc || desc->layout != UTIL_FORMAT_LAYOUT_PLAIN ||
+       util_format_is_depth_or_stencil(format))
+      return format;
+
+   bool ok = (desc->nr_channels == 1 || desc->nr_channels == 4) &&
+             desc->is_array && !util_format_is_srgb(format);
+   for (unsigned i = 0; ok && i < desc->nr_channels; i++) {
+      const struct util_format_channel_description *chan = &desc->channel[i];
+
+      if (desc->swizzle[i] != PIPE_SWIZZLE_X + i ||
+          (chan->size != 8 && chan->size != 16 && chan->size != 32))
+         ok = false;
+      else if (chan->normalized &&
+               (chan->size != 8 || chan->type != UTIL_FORMAT_TYPE_UNSIGNED))
+         ok = false;
+      else if (!chan->normalized && !chan->pure_integer &&
+               chan->type != UTIL_FORMAT_TYPE_FLOAT)
+         ok = false;
+   }
+   if (ok)
+      return format;
+
+   switch (desc->block.bits) {
+   case 8:
+      return PIPE_FORMAT_R8_UINT;
+   case 16:
+      return PIPE_FORMAT_R16_UINT;
+   case 32:
+      return PIPE_FORMAT_R32_UINT;
+   case 64:
+      return PIPE_FORMAT_R16G16B16A16_UINT;
+   default:
+      return format;
+   }
+}

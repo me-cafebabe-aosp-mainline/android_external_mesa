@@ -26,6 +26,7 @@ bool tu5_format_texture_supported(enum pipe_format format);
 bool tu5_format_color_supported(enum pipe_format format);
 bool tu5_format_depth_supported(enum pipe_format format);
 bool tu5_format_tileable(enum pipe_format format);
+enum pipe_format tu5_storage_format(enum pipe_format format);
 
 enum a5xx_vtx_fmt fd5_pipe2vtx(enum pipe_format format);
 enum a5xx_tex_fmt fd5_pipe2tex(enum pipe_format format);
