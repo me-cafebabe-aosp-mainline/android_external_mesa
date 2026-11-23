@@ -631,7 +631,11 @@ tu_get_image_format_properties(
          return tu_image_unsupported_format(pImageFormatProperties);
    }
 
+   /* Adreno 5xx also has 1D depth and stencil images (tiled, see
+    * tu_image_init()), as the stock driver
+    */
    if (info->type != VK_IMAGE_TYPE_2D &&
+       !(physical_device->info->chip == 5 && info->type == VK_IMAGE_TYPE_1D) &&
        vk_format_is_depth_or_stencil(info->format))
       return tu_image_unsupported_format(pImageFormatProperties);
 

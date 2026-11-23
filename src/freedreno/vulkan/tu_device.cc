@@ -1474,6 +1474,10 @@ tu_get_properties(struct tu_physical_device *pdevice,
       props->maxViewports = 1;
       props->maxFragmentDualSrcAttachments = 1;
       props->lineWidthRange[0] = props->lineWidthRange[1] = 1.0;
+      /* as in the stock driver: the layers are cleared, loaded and stored
+       * one by one
+       */
+      props->maxFramebufferLayers = 2048;
       props->lineWidthGranularity = 0.0;
    }
 
