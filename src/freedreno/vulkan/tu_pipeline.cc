@@ -4975,6 +4975,12 @@ tu_compute_pipeline_create(VkDevice device,
                                require_full_subgroups, subgroup_info,
                                dev);
 
+   /* Adreno 5xx: the subgroups are of one invocation, the threadsize is not
+    * seen. The compiler picks it, see ir3_should_double_threadsize().
+    */
+   if (tu_is_a5xx(dev))
+      key.api_wavesize = key.real_wavesize = IR3_SINGLE_OR_DOUBLE;
+
    struct vk_pipeline_robustness_state rs;
    vk_pipeline_robustness_state_fill(&dev->vk.robustness_state, &rs, pCreateInfo->pNext, stage_info->pNext);
    tu_shader_key_robustness(&key, &rs);

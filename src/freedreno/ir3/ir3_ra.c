@@ -2732,6 +2732,22 @@ calc_cs_barrier_reg_budget(struct ir3_shader_variant *v,
 {
    const struct ir3_compiler *compiler = v->compiler;
 
+   /* Adreno 505, measured: a workgroup with a barrier runs when, counted in
+    * waves of 64 invocations whatever the threadsize, its waves take at most
+    * 64 half vec4 registers per invocation in all, a full one counting as
+    * two: it faults past that (8 waves of 4 full registers run, 7 of 4 full
+    * and 1 half run, 8 of them do not; 3 waves of 9 full and 2 half run, of
+    * 9 and 4 do not).
+    */
+   if (fd_dev_gpu_id(compiler->dev_id) == 505) {
+      unsigned threads_per_wg =
+         v->local_size_variable
+            ? compiler->max_variable_workgroup_size
+            : v->local_size[0] * v->local_size[1] * v->local_size[2];
+      unsigned waves64 = MAX2(DIV_ROUND_UP(threads_per_wg, 64), 1);
+      return 64 / waves64 * 4;
+   }
+
    bool double_threadsize = ir3_should_double_threadsize(v, 0);
 
    /* The register file is grouped into reg_size_vec4 number of parts.
