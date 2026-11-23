@@ -739,6 +739,10 @@ legalize_block(struct ir3_legalize_ctx *ctx, struct ir3_block *block)
    list_inithead(&block->instr_list);
 
    state->cycle = 0;
+   /* a5xx: whether the instruction before was a load of shared memory, see
+    * below
+    */
+   bool prev_ldl = false;
 
    foreach_instr_safe (n, &instr_list) {
       unsigned i;
@@ -781,6 +785,28 @@ legalize_block(struct ir3_legalize_ctx *ctx, struct ir3_block *block)
           block->in_early_preamble &&
           regmask_get_any_shared(&state->needs_sy)) {
          last_n = insert_nop_flags(ctx, state, last_n, &build, IR3_INSTR_SY);
+      }
+
+      /* a5xx: what follows a load of shared memory, other than more of
+       * them, waits for it, as in what the blob compiles: with instructions
+       * that did not need its result right after it, shaders computed wrong
+       * values at times, depending on what ran before
+       * (dEQP-VK.memory_model.shared.nested_structs.8, where any nop more
+       * after the loads hid it).
+       */
+      if (ctx->compiler->gen == 5) {
+         if (prev_ldl && n->opc != OPC_LDL) {
+            if (opc_cat(n->opc) == 0 && n->opc != OPC_NOP) {
+               struct ir3_instruction *nop = ir3_NOP(block);
+               apply_ss(nop, state, mergedregs);
+               last_n = nop;
+               cycle++;
+            } else {
+               apply_ss(n, state, mergedregs);
+            }
+            last_input_needs_ss = false;
+         }
+         prev_ldl = n->opc == OPC_LDL;
       }
 
       /* cat5+ does not have an (ss) bit, if needed we need to
@@ -895,6 +921,12 @@ legalize_block(struct ir3_legalize_ctx *ctx, struct ir3_block *block)
 
       ir3_update_legalize_state(state, ctx->compiler, n);
       last_n = n;
+   }
+
+   /* a5xx: the same for what the block falls through to */
+   if (prev_ldl) {
+      struct ir3_instruction *nop = ir3_NOP(block);
+      apply_ss(nop, state, mergedregs);
    }
 
    assert(inputs_remaining == 0 || !ctx->early_input_release);
