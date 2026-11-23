@@ -55,6 +55,8 @@ enum pipe_format tu5_storage_format(enum pipe_format format);
 /* The border colours */
 void tu5_pack_border_color(void *entry, const VkClearColorValue *val,
                            bool is_int);
+void tu5_pack_border_color_format(void *entry, const VkClearColorValue *val,
+                                  bool is_int, VkFormat format);
 
 /* GMEM */
 bool tu5_use_gmem(struct tu_cmd_buffer *cmd);

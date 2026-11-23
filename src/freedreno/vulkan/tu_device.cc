@@ -508,6 +508,24 @@ get_device_extensions(const struct tu_physical_device *device,
       ext->KHR_shader_subgroup_uniform_control_flow = all.KHR_shader_subgroup_uniform_control_flow;
       ext->EXT_subgroup_size_control = all.EXT_subgroup_size_control;
       ext->EXT_shader_replicated_composites = all.EXT_shader_replicated_composites;
+
+      /* What the state of each draw is made from (tu5_draw_state() emits
+       * it all from the dynamic state)
+       */
+      ext->EXT_extended_dynamic_state = all.EXT_extended_dynamic_state;
+      ext->EXT_extended_dynamic_state2 = all.EXT_extended_dynamic_state2;
+      ext->EXT_extended_dynamic_state3 = all.EXT_extended_dynamic_state3;
+      ext->EXT_vertex_input_dynamic_state = all.EXT_vertex_input_dynamic_state;
+      ext->EXT_color_write_enable = all.EXT_color_write_enable;
+      ext->EXT_provoking_vertex = all.EXT_provoking_vertex;
+      ext->EXT_depth_clip_enable = all.EXT_depth_clip_enable;
+      ext->EXT_depth_clip_control = all.EXT_depth_clip_control;
+      ext->EXT_depth_clamp_zero_one = all.EXT_depth_clamp_zero_one;
+      ext->EXT_primitive_topology_list_restart = all.EXT_primitive_topology_list_restart;
+      ext->EXT_vertex_attribute_divisor = all.EXT_vertex_attribute_divisor;
+      ext->KHR_vertex_attribute_divisor = all.KHR_vertex_attribute_divisor;
+      ext->EXT_non_seamless_cube_map = all.EXT_non_seamless_cube_map;
+      ext->EXT_custom_border_color = all.EXT_custom_border_color;
       ext->KHR_maintenance4 = all.KHR_maintenance4;
    }
 }
@@ -1048,6 +1066,36 @@ tu_get_features(struct tu_physical_device *pdevice,
       features->shaderSubgroupRotateClustered = all.shaderSubgroupRotateClustered;
       features->shaderSubgroupUniformControlFlow = all.shaderSubgroupUniformControlFlow;
       features->indexTypeUint8 = all.indexTypeUint8;
+
+      /* the state of each draw, see tu5_draw_state() */
+      features->logicOp = all.logicOp;
+      features->extendedDynamicState = all.extendedDynamicState;
+      features->extendedDynamicState2 = all.extendedDynamicState2;
+      features->extendedDynamicState2LogicOp = all.extendedDynamicState2LogicOp;
+      features->extendedDynamicState3DepthClampEnable = all.extendedDynamicState3DepthClampEnable;
+      features->extendedDynamicState3PolygonMode = all.extendedDynamicState3PolygonMode;
+      features->extendedDynamicState3RasterizationSamples = all.extendedDynamicState3RasterizationSamples;
+      features->extendedDynamicState3SampleMask = all.extendedDynamicState3SampleMask;
+      features->extendedDynamicState3AlphaToCoverageEnable = all.extendedDynamicState3AlphaToCoverageEnable;
+      features->extendedDynamicState3AlphaToOneEnable = all.extendedDynamicState3AlphaToOneEnable;
+      features->extendedDynamicState3LogicOpEnable = all.extendedDynamicState3LogicOpEnable;
+      features->extendedDynamicState3ColorBlendEnable = all.extendedDynamicState3ColorBlendEnable;
+      features->extendedDynamicState3ColorBlendEquation = all.extendedDynamicState3ColorBlendEquation;
+      features->extendedDynamicState3ColorWriteMask = all.extendedDynamicState3ColorWriteMask;
+      features->extendedDynamicState3DepthClipEnable = all.extendedDynamicState3DepthClipEnable;
+      features->extendedDynamicState3ProvokingVertexMode = all.extendedDynamicState3ProvokingVertexMode;
+      features->extendedDynamicState3LineRasterizationMode = all.extendedDynamicState3LineRasterizationMode;
+      features->extendedDynamicState3DepthClipNegativeOneToOne = all.extendedDynamicState3DepthClipNegativeOneToOne;
+      features->vertexInputDynamicState = all.vertexInputDynamicState;
+      features->colorWriteEnable = all.colorWriteEnable;
+      features->provokingVertexLast = all.provokingVertexLast;
+      features->depthClipEnable = all.depthClipEnable;
+      features->depthClipControl = all.depthClipControl;
+      features->depthClampZeroOne = all.depthClampZeroOne;
+      features->primitiveTopologyListRestart = all.primitiveTopologyListRestart;
+      features->vertexAttributeInstanceRateDivisor = all.vertexAttributeInstanceRateDivisor;
+      features->nonSeamlessCubeMap = all.nonSeamlessCubeMap;
+      features->customBorderColors = all.customBorderColors;
 
 
       features->robustBufferAccess = true;

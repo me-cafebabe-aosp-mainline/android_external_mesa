@@ -675,12 +675,12 @@ tu5_emit_user_consts(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    }
 }
 
-/* A border colour as Adreno 5xx takes it. The components are in the order
- * the format has them, which is that of the colour for all but the formats
- * with blue first: the colours of Vulkan being the same either way, these
- * are packed the one way.
- *
- * TODO: custom border colours, which would be for a format
+/* A border colour as Adreno 5xx takes it. The texture units decode it as a
+ * texel of the format, then swap and swizzle it as one: so the components
+ * are in the order of the channels of the format, which is that of the
+ * colour for all but the formats with blue or alpha first, and the packed
+ * ones are laid out as a texel (see tu5_pack_border_color_format()). The
+ * built-in colours of Vulkan are packed for the formats of that order.
  */
 struct PACKED tu5_bcolor_entry {
    uint32_t fp32[4];
@@ -700,6 +700,38 @@ struct PACKED tu5_bcolor_entry {
 };
 static_assert(sizeof(struct tu5_bcolor_entry) == 128, "");
 
+/* A custom border colour for the format given with it */
+void
+tu5_pack_border_color_format(void *entry, const VkClearColorValue *val,
+                             bool is_int, VkFormat vk_format)
+{
+   enum pipe_format format = vk_format_to_pipe_format(vk_format);
+   const struct util_format_description *desc =
+      util_format_description(format);
+   VkClearColorValue raw = *val;
+
+   if (format == PIPE_FORMAT_NONE || !desc ||
+       desc->layout != UTIL_FORMAT_LAYOUT_PLAIN) {
+      tu5_pack_border_color(entry, val, is_int);
+      return;
+   }
+
+   /* in the order of the channels */
+   for (unsigned c = 0; c < 4; c++) {
+      if (desc->swizzle[c] < 4)
+         raw.uint32[desc->swizzle[c]] = val->uint32[c];
+   }
+   tu5_pack_border_color(entry, &raw, is_int);
+
+   /* the packed ones as a texel */
+   struct tu5_bcolor_entry *e = (struct tu5_bcolor_entry *)entry;
+   if (desc->block.bits == 16 && desc->nr_channels > 2 && !is_int) {
+      uint16_t texel = 0;
+      util_format_pack_rgba(format, &texel, val->float32, 1);
+      e->rgb565 = e->rgb5a1 = e->rgba4 = texel;
+   }
+}
+
 void
 tu5_pack_border_color(void *entry, const VkClearColorValue *val, bool is_int)
 {
@@ -709,8 +741,15 @@ tu5_pack_border_color(void *entry, const VkClearColorValue *val, bool is_int)
 
    for (unsigned c = 0; c < 4; c++) {
       if (is_int) {
+         /* the low bits of the value, for each size of the integer
+          * formats
+          */
          e->fp32[c] = val->uint32[c];
-         e->fp16[c] = (uint16_t)MIN2(val->uint32[c], 0xffffu);
+         e->fp16[c] = (uint16_t)val->uint32[c];
+         e->ui16[c] = (uint16_t)val->uint32[c];
+         e->si16[c] = (int16_t)val->int32[c];
+         e->ui8[c] = (uint8_t)val->uint32[c];
+         e->si8[c] = (int8_t)val->int32[c];
          continue;
       }
 
@@ -4645,7 +4684,16 @@ tu5_emit_blend(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 
          control = A5XX_RB_MRT_CONTROL_COMPONENT_ENABLE(write_mask);
          if (is_int) {
-            control |= A5XX_RB_MRT_CONTROL_ROP_CODE(ROP_COPY);
+            /* no blending, but the logical operations */
+            control |= A5XX_RB_MRT_CONTROL_ROP_CODE(rop) |
+                       COND(dyn->cb.logic_op_enable,
+                            A5XX_RB_MRT_CONTROL_ROP_ENABLE);
+            if (dyn->cb.logic_op_enable &&
+                dyn->cb.logic_op != VK_LOGIC_OP_CLEAR &&
+                dyn->cb.logic_op != VK_LOGIC_OP_COPY &&
+                dyn->cb.logic_op != VK_LOGIC_OP_COPY_INVERTED &&
+                dyn->cb.logic_op != VK_LOGIC_OP_SET)
+               mrt_blend |= 1 << i;
          } else {
             control |= A5XX_RB_MRT_CONTROL_ROP_CODE(rop) |
                        COND(dyn->cb.logic_op_enable,
