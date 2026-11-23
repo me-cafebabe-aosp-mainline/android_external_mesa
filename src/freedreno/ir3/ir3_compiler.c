@@ -387,6 +387,12 @@ ir3_compiler_create(struct fd_device *dev, const struct fd_dev_id *dev_id,
    compiler->nir_options = ir3_base_options;
    compiler->nir_options.has_iadd3 = dev_info->props.has_sad;
 
+   /* one device: gl_DeviceIndex is 0 (there is no system value for it,
+    * nir_lower_system_values() asserted on it for a5xx)
+    */
+   if (compiler->gen >= 5)
+      compiler->nir_options.lower_device_index_to_zero = true;
+
    if (compiler->gen >= 6) {
       compiler->nir_options.force_indirect_unrolling = nir_var_all,
       compiler->nir_options.lower_device_index_to_zero = true;
