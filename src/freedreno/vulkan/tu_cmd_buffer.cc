@@ -5572,14 +5572,20 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
 
    assert(pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS);
 
-   /* Binding the pipeline that is bound changes nothing: what of its state
-    * is static, nothing may have set since it was bound
-    * (VUID-vkCmdDraw-None-02859). Copying all of its dynamic state again
-    * is the most of what recording a draw costs where each is bound before.
+   /* Binding the pipeline that is bound changes nothing, unless a state it
+    * has static was set since: binding it again restores that (such a set
+    * is dirty, as a draw may not come between: VUID-vkCmdDraw-None-02859).
+    * Copying all of its dynamic state again is the most of what recording a
+    * draw costs where each is bound before.
     */
    if (tu_is_a5xx(cmd->device)) {
-      if (cmd->state.a5xx_gfx_pipeline == pipeline)
-         return;
+      if (cmd->state.a5xx_gfx_pipeline == pipeline) {
+         BITSET_DECLARE(touched, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX);
+         BITSET_AND(touched, cmd->vk.dynamic_graphics_state.dirty,
+                    tu_pipeline_to_graphics(pipeline)->dynamic_state.set);
+         if (BITSET_IS_EMPTY(touched))
+            return;
+      }
       cmd->state.a5xx_gfx_pipeline = pipeline;
    }
 
