@@ -983,7 +983,10 @@ tu5_dispatch(struct tu_cmd_buffer *cmd, const uint32_t *blocks,
                    A5XX_HLSQ_CS_CNTL_0_UNK1(regid(63, 0)) |
                    A5XX_HLSQ_CS_CNTL_0_LOCALIDREGID(ir3_find_sysval_regid(
                       v, SYSTEM_VALUE_LOCAL_INVOCATION_ID)));
-   OUT_RING(cs, 0x1); /* HLSQ_CS_CNTL_1 */
+   /* 0 as in the stock driver: with 1, workgroups of more than 256
+    * invocations that wait at a barrier fault
+    */
+   OUT_RING(cs, 0x0); /* HLSQ_CS_CNTL_1 */
 
    if (instrlen > 0)
       tu5_emit_shader(cs, v, so.iova);

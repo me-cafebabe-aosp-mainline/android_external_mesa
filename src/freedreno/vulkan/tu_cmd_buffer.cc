@@ -9001,18 +9001,15 @@ tu6_emit_vs_params(struct tu_cmd_buffer *cmd,
    cmd->state.dirty |= TU_CMD_DIRTY_VS_PARAMS;
 }
 
+/* A draw, of the given id among those of a multi draw */
 template <chip CHIP>
-VKAPI_ATTR void VKAPI_CALL
-tu_CmdDraw(VkCommandBuffer commandBuffer,
-           uint32_t vertexCount,
-           uint32_t instanceCount,
-           uint32_t firstVertex,
-           uint32_t firstInstance)
+static void
+tu_draw(struct tu_cmd_buffer *cmd, uint32_t draw_id, uint32_t vertexCount,
+        uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance)
 {
-   VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
    struct tu_cs *cs = &cmd->draw_cs;
 
-   tu6_emit_vs_params(cmd, 0, firstVertex, firstInstance);
+   tu6_emit_vs_params(cmd, draw_id, firstVertex, firstInstance);
 
    tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);
 
@@ -9044,6 +9041,20 @@ tu_CmdDraw(VkCommandBuffer commandBuffer,
       }
    }
 }
+
+template <chip CHIP>
+VKAPI_ATTR void VKAPI_CALL
+tu_CmdDraw(VkCommandBuffer commandBuffer,
+           uint32_t vertexCount,
+           uint32_t instanceCount,
+           uint32_t firstVertex,
+           uint32_t firstInstance)
+{
+   VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+
+   tu_draw<CHIP>(cmd, 0, vertexCount, instanceCount, firstVertex,
+                 firstInstance);
+}
 TU_GENX(tu_CmdDraw);
 
 template <chip CHIP>
@@ -9060,6 +9071,19 @@ tu_CmdDrawMultiEXT(VkCommandBuffer commandBuffer,
 
    if (!drawCount)
       return;
+
+   /* Adreno 5xx writes the parameters of a draw (its id, its offsets) with
+    * its state, and draws the views one after the other: the draws one by
+    * one
+    */
+   if (tu_is_a5xx(cmd->device)) {
+      uint32_t i = 0;
+      vk_foreach_multi_draw(draw, i, pVertexInfo, drawCount, stride) {
+         tu_draw<CHIP>(cmd, i, draw->vertexCount, instanceCount,
+                       draw->firstVertex, firstInstance);
+      }
+      return;
+   }
 
    bool has_tess = cmd->state.shaders[MESA_SHADER_TESS_CTRL]->variant;
 
@@ -9095,19 +9119,17 @@ tu_CmdDrawMultiEXT(VkCommandBuffer commandBuffer,
 }
 TU_GENX(tu_CmdDrawMultiEXT);
 
+/* An indexed draw, of the given id among those of a multi draw */
 template <chip CHIP>
-VKAPI_ATTR void VKAPI_CALL
-tu_CmdDrawIndexed(VkCommandBuffer commandBuffer,
-                  uint32_t indexCount,
-                  uint32_t instanceCount,
-                  uint32_t firstIndex,
-                  int32_t vertexOffset,
-                  uint32_t firstInstance)
+static void
+tu_draw_indexed(struct tu_cmd_buffer *cmd, uint32_t draw_id,
+                uint32_t indexCount, uint32_t instanceCount,
+                uint32_t firstIndex, int32_t vertexOffset,
+                uint32_t firstInstance)
 {
-   VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
    struct tu_cs *cs = &cmd->draw_cs;
 
-   tu6_emit_vs_params(cmd, 0, vertexOffset, firstInstance);
+   tu6_emit_vs_params(cmd, draw_id, vertexOffset, firstInstance);
 
    tu6_draw_common<CHIP>(cmd, cs, true, indexCount);
 
@@ -9144,6 +9166,21 @@ tu_CmdDrawIndexed(VkCommandBuffer commandBuffer,
       }
    }
 }
+
+template <chip CHIP>
+VKAPI_ATTR void VKAPI_CALL
+tu_CmdDrawIndexed(VkCommandBuffer commandBuffer,
+                  uint32_t indexCount,
+                  uint32_t instanceCount,
+                  uint32_t firstIndex,
+                  int32_t vertexOffset,
+                  uint32_t firstInstance)
+{
+   VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+
+   tu_draw_indexed<CHIP>(cmd, 0, indexCount, instanceCount, firstIndex,
+                         vertexOffset, firstInstance);
+}
 TU_GENX(tu_CmdDrawIndexed);
 
 template <chip CHIP>
@@ -9161,6 +9198,19 @@ tu_CmdDrawMultiIndexedEXT(VkCommandBuffer commandBuffer,
 
    if (!drawCount)
       return;
+
+   /* Adreno 5xx: the draws one by one, see tu_CmdDrawMultiEXT() */
+   if (tu_is_a5xx(cmd->device)) {
+      uint32_t i = 0;
+      vk_foreach_multi_draw_indexed(draw, i, pIndexInfo, drawCount, stride) {
+         tu_draw_indexed<CHIP>(cmd, i, draw->indexCount, instanceCount,
+                               draw->firstIndex,
+                               pVertexOffset ? *pVertexOffset
+                                             : draw->vertexOffset,
+                               firstInstance);
+      }
+      return;
+   }
 
    bool has_tess = cmd->state.shaders[MESA_SHADER_TESS_CTRL]->variant;
 
@@ -10563,6 +10613,12 @@ tu_CmdWriteBufferMarker2AMD(VkCommandBuffer commandBuffer,
    if (cache->flush_bits && is_top_of_pipe) {
       cache->flush_bits |= TU_CMD_FLAG_WAIT_FOR_IDLE;
    }
+   /* Adreno 5xx: what the shaders of the draws before wrote may still be in
+    * UCHE, the barrier before notwithstanding, when the marker is written
+    * from a render pass: the CP writes after it is out.
+    */
+   if (tu_is_a5xx(cmd->device))
+      cache->flush_bits |= TU_CMD_FLAG_CACHE_CLEAN | TU_CMD_FLAG_WAIT_FOR_IDLE;
 
    if (cmd->state.pass) {
       tu_emit_cache_flush_renderpass<CHIP>(cmd);

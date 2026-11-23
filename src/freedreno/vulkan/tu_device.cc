@@ -473,6 +473,42 @@ get_device_extensions(const struct tu_physical_device *device,
          .KHR_global_priority = all.KHR_global_priority,
          .EXT_global_priority_query = all.EXT_global_priority_query,
       } };
+
+      /* What does not depend on the hardware: the runtime, the API, the
+       * compiler
+       */
+      ext->EXT_tooling_info = all.EXT_tooling_info;
+      ext->EXT_private_data = all.EXT_private_data;
+      ext->KHR_copy_commands2 = all.KHR_copy_commands2;
+      ext->KHR_synchronization2 = all.KHR_synchronization2;
+      ext->KHR_format_feature_flags2 = all.KHR_format_feature_flags2;
+      ext->KHR_map_memory2 = all.KHR_map_memory2;
+      ext->GOOGLE_decorate_string = all.GOOGLE_decorate_string;
+      ext->GOOGLE_hlsl_functionality1 = all.GOOGLE_hlsl_functionality1;
+      ext->GOOGLE_user_type = all.GOOGLE_user_type;
+      ext->KHR_shader_non_semantic_info = all.KHR_shader_non_semantic_info;
+      ext->KHR_shader_terminate_invocation = all.KHR_shader_terminate_invocation;
+      ext->KHR_shader_expect_assume = all.KHR_shader_expect_assume;
+      ext->KHR_shader_relaxed_extended_instruction = all.KHR_shader_relaxed_extended_instruction;
+      ext->EXT_memory_budget = all.EXT_memory_budget;
+      ext->EXT_physical_device_drm = all.EXT_physical_device_drm;
+      ext->EXT_device_address_binding_report = all.EXT_device_address_binding_report;
+      ext->EXT_texel_buffer_alignment = all.EXT_texel_buffer_alignment;
+      ext->EXT_shader_module_identifier = all.EXT_shader_module_identifier;
+      ext->EXT_external_memory_dma_buf = all.EXT_external_memory_dma_buf;
+      ext->AMD_buffer_marker = all.AMD_buffer_marker;
+      ext->EXT_scalar_block_layout = all.EXT_scalar_block_layout;
+      ext->EXT_shader_demote_to_helper_invocation = all.EXT_shader_demote_to_helper_invocation;
+      ext->EXT_multi_draw = all.EXT_multi_draw;
+      ext->EXT_map_memory_placed = all.EXT_map_memory_placed;
+      ext->KHR_index_type_uint8 = all.KHR_index_type_uint8;
+      ext->KHR_pipeline_executable_properties = all.KHR_pipeline_executable_properties;
+      ext->KHR_shader_integer_dot_product = all.KHR_shader_integer_dot_product;
+      ext->KHR_shader_subgroup_rotate = all.KHR_shader_subgroup_rotate;
+      ext->KHR_shader_subgroup_uniform_control_flow = all.KHR_shader_subgroup_uniform_control_flow;
+      ext->EXT_subgroup_size_control = all.EXT_subgroup_size_control;
+      ext->EXT_shader_replicated_composites = all.EXT_shader_replicated_composites;
+      ext->KHR_maintenance4 = all.KHR_maintenance4;
    }
 }
 
@@ -985,7 +1021,34 @@ tu_get_features(struct tu_physical_device *pdevice,
 
    /* Adreno 5xx: those that were made to work */
    if (pdevice->info->chip == 5) {
+      const struct vk_features all = *features;
       *features = (struct vk_features) { false };
+
+      /* what does not depend on the hardware */
+      features->privateData = all.privateData;
+      features->synchronization2 = all.synchronization2;
+      features->shaderTerminateInvocation = all.shaderTerminateInvocation;
+      features->shaderDemoteToHelperInvocation = all.shaderDemoteToHelperInvocation;
+      features->multiDraw = all.multiDraw;
+      features->scalarBlockLayout = all.scalarBlockLayout;
+      features->pipelineExecutableInfo = all.pipelineExecutableInfo;
+      features->shaderIntegerDotProduct = all.shaderIntegerDotProduct;
+      features->subgroupSizeControl = all.subgroupSizeControl;
+      features->computeFullSubgroups = all.computeFullSubgroups;
+      features->shaderModuleIdentifier = all.shaderModuleIdentifier;
+      features->texelBufferAlignment = all.texelBufferAlignment;
+      features->maintenance4 = all.maintenance4;
+      features->memoryMapPlaced = all.memoryMapPlaced;
+      features->memoryUnmapReserve = all.memoryUnmapReserve;
+      features->shaderExpectAssume = all.shaderExpectAssume;
+      features->shaderRelaxedExtendedInstruction = all.shaderRelaxedExtendedInstruction;
+      features->shaderReplicatedComposites = all.shaderReplicatedComposites;
+      features->reportAddressBinding = all.reportAddressBinding;
+      features->shaderSubgroupRotate = all.shaderSubgroupRotate;
+      features->shaderSubgroupRotateClustered = all.shaderSubgroupRotateClustered;
+      features->shaderSubgroupUniformControlFlow = all.shaderSubgroupUniformControlFlow;
+      features->indexTypeUint8 = all.indexTypeUint8;
+
 
       features->robustBufferAccess = true;
       features->fullDrawIndexUint32 = true;
@@ -1231,6 +1294,12 @@ tu_get_physical_device_properties_1_3(struct tu_physical_device *pdevice,
          ? VK_SHADER_STAGE_ALL
          : (VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
 
+   /* Adreno 5xx: each invocation is a subgroup of its own */
+   if (pdevice->info->chip == 5) {
+      p->minSubgroupSize = p->maxSubgroupSize = 1;
+      p->maxComputeWorkgroupSubgroups = 512;
+   }
+
    p->maxInlineUniformBlockSize = MAX_INLINE_UBO_RANGE;
    p->maxPerStageDescriptorInlineUniformBlocks = MAX_INLINE_UBOS;
    p->maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = MAX_INLINE_UBOS;
@@ -1465,9 +1534,10 @@ tu_get_properties(struct tu_physical_device *pdevice,
       props->maxDescriptorSetStorageBuffersDynamic =
          MIN2(MAX_DYNAMIC_STORAGE_BUFFERS, TU5_MAX_SSBOS);
       props->maxDescriptorSetStorageImages = 24;
-      props->maxComputeWorkGroupInvocations = 1024;
-      props->maxComputeWorkGroupSize[0] = 1024;
-      props->maxComputeWorkGroupSize[1] = 1024;
+      /* as in the stock driver: more do not fit (vt28) */
+      props->maxComputeWorkGroupInvocations = 512;
+      props->maxComputeWorkGroupSize[0] = 512;
+      props->maxComputeWorkGroupSize[1] = 512;
       props->maxComputeWorkGroupSize[2] = 64;
       props->maxVertexInputAttributes = 32;
       props->maxVertexInputBindings = 32;
