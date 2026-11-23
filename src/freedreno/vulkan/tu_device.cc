@@ -543,6 +543,10 @@ get_device_extensions(const struct tu_physical_device *device,
        */
       ext->EXT_inline_uniform_block = all.EXT_inline_uniform_block;
       ext->EXT_border_color_swizzle = all.EXT_border_color_swizzle;
+      /* the 3D texel fetches checked in the shader, see
+       * tu5_lower_txf_3d_bounds()
+       */
+      ext->EXT_image_robustness = all.EXT_image_robustness;
    }
 }
 
@@ -1127,6 +1131,7 @@ tu_get_features(struct tu_physical_device *pdevice,
       features->inlineUniformBlock = all.inlineUniformBlock;
       features->borderColorSwizzle = all.borderColorSwizzle;
       features->borderColorSwizzleFromImage = all.borderColorSwizzleFromImage;
+      features->robustImageAccess = all.robustImageAccess;
 
 
       features->robustBufferAccess = true;

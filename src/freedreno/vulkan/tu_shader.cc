@@ -16,6 +16,7 @@
 #include "vk_pipeline.h"
 #include "vk_util.h"
 #include "nir/nir_format_convert.h"
+#include "nir/nir_builtin_builder.h"
 
 #include "ir3/ir3_compiler.h"
 #include "ir3/ir3_nir.h"
@@ -1398,6 +1399,50 @@ struct lower_instr_params {
    struct ir3_const_allocations *const_allocs;
 };
 
+/* Adreno 5xx: the texel fetches of 3D textures out of their bounds read
+ * texels in them (dEQP-VK.robustness.image_robustness.*.sampled_image.*.3d),
+ * zero is what robustImageAccess has them read: checked in the shader.
+ */
+static bool
+tu5_lower_txf_3d_bounds(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_tex)
+      return false;
+
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   if (tex->op != nir_texop_txf || tex->sampler_dim != GLSL_SAMPLER_DIM_3D)
+      return false;
+
+   int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (coord_idx < 0)
+      return false;
+
+   b->cursor = nir_before_instr(instr);
+
+   nir_def *coord = tex->src[coord_idx].src.ssa;
+   int offset_idx = nir_tex_instr_src_index(tex, nir_tex_src_offset);
+   if (offset_idx >= 0)
+      coord = nir_iadd(b, coord, tex->src[offset_idx].src.ssa);
+
+   nir_def *size = nir_build_texture_query(b, tex, nir_texop_txs, 3,
+                                           nir_type_int32, false, true);
+   int lod_idx = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+   if (lod_idx >= 0) {
+      nir_def *lod = tex->src[lod_idx].src.ssa;
+      size = nir_imax(b, nir_ishr(b, size, lod), nir_imm_int(b, 1));
+   }
+
+   nir_def *in = nir_ball(b, nir_iand(b, nir_ige_imm(b, coord, 0),
+                                      nir_ilt(b, coord, size)));
+
+   b->cursor = nir_after_instr(instr);
+   nir_def *res = nir_bcsel(b, in, &tex->def,
+                            nir_imm_zero(b, tex->def.num_components,
+                                         tex->def.bit_size));
+   nir_def_rewrite_uses_after(&tex->def, res, res->parent_instr);
+   return true;
+}
+
 /* Adreno 5xx, which has no multi-planar formats: the conversion of the
  * immutable sampler of a binding, for nir_vk_lower_ycbcr_tex()
  */
@@ -1925,8 +1970,12 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
    /* Adreno 5xx: the planes sampled one by one, then put together and
     * converted, see TU5_YCBCR_PLANE_SLOT
     */
-   if (tu_is_a5xx(dev))
+   if (tu_is_a5xx(dev)) {
       progress |= nir_vk_lower_ycbcr_tex(shader, tu5_lookup_ycbcr, layout);
+      progress |= nir_shader_instructions_pass(shader, tu5_lower_txf_3d_bounds,
+                                               nir_metadata_control_flow,
+                                               NULL);
+   }
 
    progress |= nir_shader_instructions_pass(shader,
                                             lower_instr,
