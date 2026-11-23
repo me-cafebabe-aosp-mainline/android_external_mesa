@@ -398,6 +398,23 @@ end:
       if (ycbcr_info)
          linear = optimal = buffer = 0;
 
+      /* The stores without a format in the shader take the format of the
+       * image from its descriptor, which STIB does not encode to sRGB, nor
+       * swap red and blue for in images (it does in texel buffers). As the
+       * stock driver, not for those formats.
+       */
+      if (vk_format_is_srgb(vk_format)) {
+         linear &= ~VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+         optimal &= ~VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+         buffer &= ~VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+      } else if (desc->layout == UTIL_FORMAT_LAYOUT_PLAIN &&
+                 desc->nr_channels >= 3 &&
+                 desc->swizzle[0] == PIPE_SWIZZLE_Z &&
+                 desc->swizzle[2] == PIPE_SWIZZLE_X) {
+         linear &= ~VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+         optimal &= ~VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+      }
+
       /* The multi-planar formats of the stock driver, which the shaders
        * sample plane by plane (TU5_YCBCR_PLANE_SLOT)
        */
