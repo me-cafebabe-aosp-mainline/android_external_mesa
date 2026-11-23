@@ -635,6 +635,38 @@ tu5_emit_user_consts(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       tu5_emit_const(cs, v, push->lo, dwords, &cmd->push_constants[push->lo]);
    }
 
+   /* The inline uniform blocks, from the memory of their descriptor sets to
+    * the constants (see tu6_emit_user_consts())
+    */
+   struct tu_descriptor_state *descriptors = tu_get_descriptors_state(
+      cmd, v->type == MESA_SHADER_COMPUTE ? VK_PIPELINE_BIND_POINT_COMPUTE
+                                          : VK_PIPELINE_BIND_POINT_GRAPHICS);
+
+   for (unsigned i = 0; i < shader->const_state.num_inline_ubos; i++) {
+      const struct tu_inline_ubo *ubo = &shader->const_state.ubos[i];
+
+      if (v->constlen <= ubo->const_offset_vec4)
+         continue;
+
+      uint64_t va = (descriptors->set_iova[ubo->base] & ~0x3full) + ubo->offset;
+
+      if (ubo->push_address) {
+         uint32_t addr[4] = { (uint32_t)va, (uint32_t)(va >> 32), 0, 0 };
+
+         tu5_emit_const(cs, v, ubo->const_offset_vec4 * 4, 4, addr);
+         continue;
+      }
+
+      OUT_PKT7(cs, CP_LOAD_STATE4, 3);
+      OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(ubo->const_offset_vec4) |
+                      CP_LOAD_STATE4_0_STATE_SRC(SS4_INDIRECT) |
+                      CP_LOAD_STATE4_0_STATE_BLOCK(tu5_stage2shadersb(v->type)) |
+                      CP_LOAD_STATE4_0_NUM_UNIT(MIN2(ubo->size_vec4,
+                                                     v->constlen - ubo->const_offset_vec4)));
+      OUT_RING(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) | (uint32_t)va);
+      OUT_RING(cs, (uint32_t)(va >> 32));
+   }
+
    /* The ranges of the uniform buffers read as constants */
    const struct ir3_ubo_analysis_state *state = &const_state->ubo_state;
 
