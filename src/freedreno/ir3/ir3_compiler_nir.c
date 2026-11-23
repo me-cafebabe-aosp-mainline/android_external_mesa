@@ -2187,6 +2187,38 @@ emit_intrinsic_barrier(struct ir3_context *ctx, nir_intrinsic_instr *intr)
             IR3_BARRIER_IMAGE_W | IR3_BARRIER_IMAGE_R;
       }
 
+      /* a5xx: fence.g.l is not a fence of the shared memory, what was
+       * stored there was not always what the loads after it read. As the
+       * blob has them: fence.l for the shared memory, then fence.g for
+       * the buffers and the images.
+       */
+      if (ctx->compiler->gen == 5) {
+         bool shared = modes & nir_var_mem_shared;
+         bool global = modes & (nir_var_mem_ssbo | nir_var_image |
+                                nir_var_mem_global);
+
+         barrier->cat7.l = shared;
+         barrier->cat7.g = global && !shared;
+
+         if (shared && global) {
+            struct ir3_instruction *fence_g;
+
+            array_insert(b, b->keeps, barrier);
+
+            /* Both are barriers to all that the one fence was: what is
+             * stored to the shared memory before them stays before what is
+             * stored to the buffers and the images after them.
+             */
+            fence_g = ir3_FENCE(b);
+            fence_g->cat7.r = true;
+            fence_g->cat7.w = true;
+            fence_g->cat7.g = true;
+            fence_g->barrier_class = barrier->barrier_class;
+            fence_g->barrier_conflict = barrier->barrier_conflict;
+            barrier = fence_g;
+         }
+      }
+
       /* make sure barrier doesn't get DCE'd */
       array_insert(ctx->block, ctx->block->keeps, barrier);
 
