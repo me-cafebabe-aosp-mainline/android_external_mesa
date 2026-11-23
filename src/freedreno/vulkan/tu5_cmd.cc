@@ -4496,8 +4496,17 @@ tu5_emit_rasterizer(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 
    OUT_PKT4(cs, REG_A5XX_GRAS_SU_POLY_OFFSET_SCALE, 3);
    OUT_RING(cs, A5XX_GRAS_SU_POLY_OFFSET_SCALE(dyn->rs.depth_bias.slope));
-   OUT_RING(cs,
-            A5XX_GRAS_SU_POLY_OFFSET_OFFSET(dyn->rs.depth_bias.constant));
+   /* A constant bias of 2^16 - 1 units already moves a 16-bit depth across
+    * its whole range, past which the clamp saturates it; but the hardware
+    * wraps a 16-bit depth around from 2.0 on (the stock driver's too): so
+    * it gets no more than that.
+    */
+   float bias = dyn->rs.depth_bias.constant;
+   uint32_t za = cmd->state.subpass->depth_stencil_attachment.attachment;
+   if (za != VK_ATTACHMENT_UNUSED &&
+       cmd->state.pass->attachments[za].format == VK_FORMAT_D16_UNORM)
+      bias = CLAMP(bias, -65535.0f, 65535.0f);
+   OUT_RING(cs, A5XX_GRAS_SU_POLY_OFFSET_OFFSET(bias));
    OUT_RING(cs, A5XX_GRAS_SU_POLY_OFFSET_OFFSET_CLAMP(dyn->rs.depth_bias.clamp));
 
    OUT_PKT4(cs, REG_A5XX_PC_RASTER_CNTL, 1);
