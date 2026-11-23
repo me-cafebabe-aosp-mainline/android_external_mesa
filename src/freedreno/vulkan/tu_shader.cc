@@ -3917,6 +3917,23 @@ tu_lower_nir(struct tu_device *dev,
       }
    }
 
+   /* Adreno 5xx: a vertex shader that writes no position hangs the GPU
+    * (dEQP-VK.pipeline.*.no_position.*.v0): it writes zeroes, the position
+    * being undefined then.
+    */
+   if (nir->info.stage == MESA_SHADER_VERTEX && tu_is_a5xx(dev) &&
+       !nir_find_variable_with_location(nir, nir_var_shader_out,
+                                        VARYING_SLOT_POS)) {
+      nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+      nir_builder b = nir_builder_at(nir_after_impl(impl));
+      nir_variable *pos =
+         nir_create_variable_with_location(nir, nir_var_shader_out,
+                                           VARYING_SLOT_POS,
+                                           glsl_vec4_type());
+      nir_store_var(&b, pos, nir_imm_vec4(&b, 0, 0, 0, 0), 0xf);
+      nir_metadata_preserve(impl, nir_metadata_control_flow);
+   }
+
    if (nir->info.stage == MESA_SHADER_FRAGMENT && tu_is_a5xx(dev)) {
       nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
       if (key->force_sample_interp || nir->info.fs.uses_sample_shading)
