@@ -16,6 +16,11 @@
 /* The dword of the texture descriptors with flags of Adreno 5xx, which
  * reads the first six only
  */
+/* The layers of the table of the targets the primary command buffers write
+ * for the secondary ones (tu6_global::a5xx_view_bases)
+ */
+#define TU5_MAX_TABLE_LAYERS 16
+
 #define TU5_TEX_FLAGS 15
 /* A 4444 format with alpha in the low bits: the built-in border colors, of
  * which the packed 16-bit ones are decoded as texels of the format, are

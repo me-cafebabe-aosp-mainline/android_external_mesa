@@ -845,10 +845,12 @@ tu5_views(const struct tu_cmd_buffer *cmd)
 void
 tu5_bind_view(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t view)
 {
-   if (!cmd->state.subpass->multiview_mask)
-      return;
-
-   if (cmd->state.attachments) {
+   /* Without multiview, the targets stay, but a shader may still read the
+    * view index, which is 0 then: the constant is written all the same,
+    * or it would be what a clear or another draw left there.
+    */
+   if (!cmd->state.subpass->multiview_mask) {
+   } else if (cmd->state.attachments) {
       tu5_emit_zs(cmd, cs, view);
       tu5_emit_mrt(cmd, cs, view);
    } else {
@@ -3690,6 +3692,37 @@ tu5_fill_buffer(struct tu_cmd_buffer *cmd, uint64_t dst_va, uint64_t size,
 }
 
 /* vkCmdClearAttachments(), in the draw stream of the render pass */
+/* In a secondary command buffer that does not know the framebuffer: bind a
+ * layer of a target, from the table the primary one wrote, see
+ * tu5_write_view_bases()
+ */
+static void
+tu5_bind_layer(struct tu_cmd_buffer *cmd, struct tu_cs *cs, int rt,
+               uint32_t a, uint32_t layer)
+{
+   uint64_t bases = global_iova_arr(cmd, a5xx_view_bases, layer * 10);
+
+   tu_cs_emit_wfi(cs);
+   if (rt >= 0) {
+      OUT_PKT7(cs, CP_MEM_TO_REG, 3);
+      OUT_RING(cs, CP_MEM_TO_REG_0_REG(REG_A5XX_RB_MRT_BASE_LO(rt)) |
+                      CP_MEM_TO_REG_0_CNT(2));
+      tu_cs_emit_qw(cs, bases + rt * sizeof(uint64_t));
+      return;
+   }
+
+   OUT_PKT7(cs, CP_MEM_TO_REG, 3);
+   OUT_RING(cs, CP_MEM_TO_REG_0_REG(REG_A5XX_RB_DEPTH_BUFFER_BASE_LO) |
+                   CP_MEM_TO_REG_0_CNT(2));
+   tu_cs_emit_qw(cs, bases + 8 * sizeof(uint64_t));
+   if (cmd->state.pass->attachments[a].format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+      OUT_PKT7(cs, CP_MEM_TO_REG, 3);
+      OUT_RING(cs, CP_MEM_TO_REG_0_REG(REG_A5XX_RB_STENCIL_BASE_LO) |
+                      CP_MEM_TO_REG_0_CNT(2));
+      tu_cs_emit_qw(cs, bases + 9 * sizeof(uint64_t));
+   }
+}
+
 void
 tu5_clear_attachments(struct tu_cmd_buffer *cmd, uint32_t attachment_count,
                       const VkClearAttachment *attachments,
@@ -3726,9 +3759,8 @@ tu5_clear_attachments(struct tu_cmd_buffer *cmd, uint32_t attachment_count,
       uint32_t a = rt >= 0 ? subpass->color_attachments[rt].attachment
                            : subpass->depth_stencil_attachment.attachment;
       /* A secondary command buffer need not know the framebuffer: there,
-       * the first layer alone is cleared, and the window is the largest.
-       *
-       * TODO: the other layers, as the primary command buffer runs it
+       * the layers are bound from the table of the primary one (at most
+       * TU5_MAX_TABLE_LAYERS), and the window is the largest.
        */
       const struct tu_image_view *iview =
          cmd->state.attachments ? cmd->state.attachments[a] : NULL;
@@ -3748,10 +3780,14 @@ tu5_clear_attachments(struct tu_cmd_buffer *cmd, uint32_t attachment_count,
 
          u_foreach_bit (layer, layers) {
 
-            if (!iview && layer)
-               continue;
-
-            if (layer || rebound) {
+            if (!iview) {
+               if (layer >= TU5_MAX_TABLE_LAYERS)
+                  continue;
+               if (layer || rebound) {
+                  tu5_bind_layer(cmd, cs, rt, a, layer);
+                  rebound = layer != 0;
+               }
+            } else if (layer || rebound) {
                if (rt >= 0) {
                   struct tu5_surf surf =
                      tu5_image_surf(iview->image, 0, format,
@@ -3772,7 +3808,9 @@ tu5_clear_attachments(struct tu_cmd_buffer *cmd, uint32_t attachment_count,
          }
       }
 
-      if (rebound) {
+      if (rebound && !iview) {
+         tu5_bind_layer(cmd, cs, rt, a, 0);
+      } else if (rebound) {
          if (rt >= 0) {
             struct tu5_surf surf =
                tu5_image_surf(iview->image, 0, format, iview->vk.base_mip_level,
@@ -4969,10 +5007,18 @@ tu5_write_view_bases(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
 {
    const struct tu_subpass *subpass = cmd->state.subpass;
 
-   if (!subpass || !subpass->multiview_mask || !cmd->state.attachments)
+   if (!subpass || !cmd->state.attachments)
       return;
 
-   u_foreach_bit (view, subpass->multiview_mask) {
+   /* Without multiview, the layers, for the clears of the secondary command
+    * buffers (see tu5_bind_layer())
+    */
+   const struct tu_framebuffer *fb = cmd->state.framebuffer;
+   uint32_t views = subpass->multiview_mask;
+   if (!views)
+      views = BITFIELD_MASK(MIN2(fb ? fb->layers : 1, TU5_MAX_TABLE_LAYERS));
+
+   u_foreach_bit (view, views) {
       uint64_t bases[10] = {};
 
       for (unsigned i = 0; i < subpass->color_count; i++) {
