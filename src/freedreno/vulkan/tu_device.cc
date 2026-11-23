@@ -532,6 +532,12 @@ get_device_extensions(const struct tu_physical_device *device,
       ext->KHR_maintenance5 = all.KHR_maintenance5;
       ext->KHR_maintenance6 = all.KHR_maintenance6;
       ext->KHR_maintenance4 = all.KHR_maintenance4;
+
+      /* the compute workgroups that fit in the registers, the shared memory
+       * fenced apart from the rest (see ir3_ra.c, ir3_compiler_nir.c)
+       */
+      ext->KHR_zero_initialize_workgroup_memory = all.KHR_zero_initialize_workgroup_memory;
+      ext->KHR_vulkan_memory_model = all.KHR_vulkan_memory_model;
    }
 }
 
@@ -1109,6 +1115,10 @@ tu_get_features(struct tu_physical_device *pdevice,
       features->dynamicRendering = all.dynamicRendering;
       features->maintenance5 = all.maintenance5;
       features->maintenance6 = all.maintenance6;
+      features->shaderZeroInitializeWorkgroupMemory = all.shaderZeroInitializeWorkgroupMemory;
+      features->vulkanMemoryModel = all.vulkanMemoryModel;
+      features->vulkanMemoryModelDeviceScope = all.vulkanMemoryModelDeviceScope;
+      features->vulkanMemoryModelAvailabilityVisibilityChains = all.vulkanMemoryModelAvailabilityVisibilityChains;
 
 
       features->robustBufferAccess = true;
