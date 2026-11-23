@@ -1865,13 +1865,20 @@ tu5_program_emit(struct tu_cs *ring, struct tu5_program *emit)
    OUT_PKT4(ring, REG_A5XX_SP_SP_CNTL, 1);
    OUT_RING(ring, 0x00000010); /* XXX */
 
+   /* Sample rate shading (asked for, or implied by a static use of
+    * gl_SampleID or gl_SamplePosition, even optimized out) runs the shader
+    * once a sample only with the barycentrics at the samples enabled, used
+    * or not.
+    */
+   const bool per_samp = s[FS].v->per_samp || s[FS].v->key.sample_shading;
+
    OUT_PKT4(ring, REG_A5XX_GRAS_CNTL, 1);
    OUT_RING(ring,
             CONDREG(ij_regid[IJ_PERSP_PIXEL], A5XX_GRAS_CNTL_IJ_PERSP_PIXEL) |
                CONDREG(ij_regid[IJ_PERSP_CENTROID],
                        A5XX_GRAS_CNTL_IJ_PERSP_CENTROID) |
-               CONDREG(ij_regid[IJ_PERSP_SAMPLE],
-                       A5XX_GRAS_CNTL_IJ_PERSP_SAMPLE) |
+               COND(VALIDREG(ij_regid[IJ_PERSP_SAMPLE]) || per_samp,
+                    A5XX_GRAS_CNTL_IJ_PERSP_SAMPLE) |
                CONDREG(ij_regid[IJ_LINEAR_PIXEL], A5XX_GRAS_CNTL_IJ_LINEAR_PIXEL) |
                CONDREG(ij_regid[IJ_LINEAR_CENTROID],
                        A5XX_GRAS_CNTL_IJ_LINEAR_CENTROID) |
@@ -1890,8 +1897,8 @@ tu5_program_emit(struct tu_cs *ring, struct tu5_program *emit)
               A5XX_RB_RENDER_CONTROL0_IJ_PERSP_PIXEL) |
          CONDREG(ij_regid[IJ_PERSP_CENTROID],
                  A5XX_RB_RENDER_CONTROL0_IJ_PERSP_CENTROID) |
-         CONDREG(ij_regid[IJ_PERSP_SAMPLE],
-                 A5XX_RB_RENDER_CONTROL0_IJ_PERSP_SAMPLE) |
+         COND(VALIDREG(ij_regid[IJ_PERSP_SAMPLE]) || per_samp,
+              A5XX_RB_RENDER_CONTROL0_IJ_PERSP_SAMPLE) |
          CONDREG(ij_regid[IJ_LINEAR_PIXEL],
               A5XX_RB_RENDER_CONTROL0_IJ_LINEAR_PIXEL) |
          CONDREG(ij_regid[IJ_LINEAR_CENTROID],
@@ -1911,8 +1918,7 @@ tu5_program_emit(struct tu_cs *ring, struct tu5_program *emit)
                 * samples, and the sample rate shading
                 */
                COND(VALIDREG(ij_regid[IJ_PERSP_SAMPLE]) ||
-                       VALIDREG(ij_regid[IJ_LINEAR_SAMPLE]) ||
-                       s[FS].v->key.sample_shading,
+                       VALIDREG(ij_regid[IJ_LINEAR_SAMPLE]) || per_samp,
                     A5XX_RB_RENDER_CONTROL1_PER_SAMP_MODE(0x3)) |
                CONDREG(ij_regid[IJ_PERSP_CENTER_RHW],
                        A5XX_RB_RENDER_CONTROL1_CENTERRHW));
