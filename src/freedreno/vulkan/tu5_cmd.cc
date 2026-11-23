@@ -2995,6 +2995,13 @@ tu5_sysmem_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t width,
    const struct fd_dev_info *info = cmd->device->physical_device->info;
 
    tu5_set_render_mode(cs, BYPASS);
+   /* What the shaders wrote is to be in memory before what is drawn over
+    * it: invalidating UCHE does not write out the lines they wrote, which
+    * came out after a fill or a clear of the same memory otherwise
+    * (dEQP-VK.memory_model.*: a guard buffer or image cleared before each
+    * draw or dispatch was seen with the ones of the one before).
+    */
+   tu5_event_write(cmd, cs, CACHE_FLUSH_TS, true);
    tu5_cache_flush(cs);
 
    tu5_emit_lrz_flush(cmd, cs);
@@ -3183,13 +3190,6 @@ tu5_blit_rect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 static void
 tu5_blit_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
 {
-   /* What the shaders wrote is to be in memory before what is drawn over
-    * it: tu5_sysmem_begin() only invalidates UCHE, and lines the shaders
-    * wrote came out after a fill or a clear of the same memory otherwise
-    * (dEQP-VK.memory_model.*: a guard buffer filled with zeroes was seen
-    * with the ones of the draw before).
-    */
-   tu5_event_write(cmd, cs, CACHE_FLUSH_TS, true);
    tu5_sysmem_begin(cmd, cs, 16384, 16384);
 }
 
