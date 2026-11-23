@@ -739,10 +739,8 @@ legalize_block(struct ir3_legalize_ctx *ctx, struct ir3_block *block)
    list_inithead(&block->instr_list);
 
    state->cycle = 0;
-   /* a5xx: whether the instruction before was a load of shared memory, see
-    * below
-    */
-   bool prev_ldl = false;
+   /* a5xx: the load of memory the instruction before was, or 0, see below */
+   opc_t prev_load = (opc_t)0;
 
    foreach_instr_safe (n, &instr_list) {
       unsigned i;
@@ -787,26 +785,30 @@ legalize_block(struct ir3_legalize_ctx *ctx, struct ir3_block *block)
          last_n = insert_nop_flags(ctx, state, last_n, &build, IR3_INSTR_SY);
       }
 
-      /* a5xx: what follows a load of shared memory, other than more of
-       * them, waits for it, as in what the blob compiles: with instructions
-       * that did not need its result right after it, shaders computed wrong
-       * values at times, depending on what ran before
-       * (dEQP-VK.memory_model.shared.nested_structs.8, where any nop more
-       * after the loads hid it).
+      /* a5xx: what follows a load of memory (shared memory, buffers or
+       * images), other than more of the same, waits for it: with
+       * instructions that did not need its result right after it, shaders
+       * computed wrong values at times, depending on what had run before
+       * (dEQP-VK.memory_model.shared.nested_structs.8 after .7,
+       * dEQP-VK.ssbo.layout.3_level_array.std140.
+       * column_major_mat2x3_comp_access), while any nop more after the
+       * loads hid it. The blob has the result of each load waited for
+       * right after it.
        */
       if (ctx->compiler->gen == 5) {
-         if (prev_ldl && n->opc != OPC_LDL) {
+         if (prev_load && n->opc != prev_load) {
             if (opc_cat(n->opc) == 0 && n->opc != OPC_NOP) {
-               struct ir3_instruction *nop = ir3_NOP(block);
-               apply_ss(nop, state, mergedregs);
-               last_n = nop;
-               cycle++;
+               last_n = insert_nop_flags(ctx, state, last_n, &build,
+                                         IR3_INSTR_SS);
             } else {
-               apply_ss(n, state, mergedregs);
+               n->flags |= IR3_INSTR_SS;
             }
             last_input_needs_ss = false;
          }
-         prev_ldl = n->opc == OPC_LDL;
+         if (n->opc == OPC_LDL || n->opc == OPC_LDGB || n->opc == OPC_LDIB)
+            prev_load = n->opc;
+         else if (n->opc != OPC_NOP)
+            prev_load = (opc_t)0;
       }
 
       /* cat5+ does not have an (ss) bit, if needed we need to
@@ -924,10 +926,8 @@ legalize_block(struct ir3_legalize_ctx *ctx, struct ir3_block *block)
    }
 
    /* a5xx: the same for what the block falls through to */
-   if (prev_ldl) {
-      struct ir3_instruction *nop = ir3_NOP(block);
-      apply_ss(nop, state, mergedregs);
-   }
+   if (prev_load)
+      last_n = insert_nop_flags(ctx, state, last_n, &build, IR3_INSTR_SS);
 
    assert(inputs_remaining == 0 || !ctx->early_input_release);
 
