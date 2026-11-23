@@ -3183,6 +3183,13 @@ tu5_blit_rect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 static void
 tu5_blit_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
 {
+   /* What the shaders wrote is to be in memory before what is drawn over
+    * it: tu5_sysmem_begin() only invalidates UCHE, and lines the shaders
+    * wrote came out after a fill or a clear of the same memory otherwise
+    * (dEQP-VK.memory_model.*: a guard buffer filled with zeroes was seen
+    * with the ones of the draw before).
+    */
+   tu5_event_write(cmd, cs, CACHE_FLUSH_TS, true);
    tu5_sysmem_begin(cmd, cs, 16384, 16384);
 }
 
