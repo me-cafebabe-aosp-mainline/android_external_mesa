@@ -3365,6 +3365,16 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
    if (device->vk.enabled_features.customBorderColors)
       global_size += TU_BORDER_COLOR_COUNT * sizeof(struct bcolor_entry);
 
+   /* Adreno 5xx: the built-in border colors again, for the 4444 formats with
+    * alpha in the low bits, after the custom ones
+    */
+   if (tu_is_a5xx(device)) {
+      device->a5xx_bcolor_alpha_low =
+         TU_BORDER_COLOR_BUILTIN +
+         (device->vk.enabled_features.customBorderColors ? TU_BORDER_COLOR_COUNT : 0);
+      global_size += TU_BORDER_COLOR_BUILTIN * sizeof(struct bcolor_entry);
+   }
+
    tu_bo_suballocator_init(
       &device->pipeline_suballoc, device, 128 * 1024,
       (enum tu_bo_alloc_flags) (TU_BO_ALLOC_GPU_READ_ONLY |
@@ -3447,6 +3457,10 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       if (tu_is_a5xx(device)) {
          tu5_pack_border_color(&global->bcolor_builtin[i], &border_color,
                                vk_border_color_is_int((VkBorderColor) i));
+         tu5_pack_border_color_format(
+            &global->bcolor_builtin[device->a5xx_bcolor_alpha_low + i],
+            &border_color, vk_border_color_is_int((VkBorderColor) i),
+            VK_FORMAT_R4G4B4A4_UNORM_PACK16);
       }
    }
 

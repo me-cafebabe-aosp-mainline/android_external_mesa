@@ -13,6 +13,16 @@
 
 #include "tu_common.h"
 
+/* The dword of the texture descriptors with flags of Adreno 5xx, which
+ * reads the first six only
+ */
+#define TU5_TEX_FLAGS 15
+/* A 4444 format with alpha in the low bits: the built-in border colors, of
+ * which the packed 16-bit ones are decoded as texels of the format, are
+ * those of device->a5xx_bcolor_alpha_low.
+ */
+#define TU5_TEX_FLAG_ALPHA_LOW (1u << 0)
+
 /* The descriptors of a combined image sampler with a conversion of a
  * multi-planar format, in slots of 16 dwords: the first plane, the sampler,
  * then the other planes.

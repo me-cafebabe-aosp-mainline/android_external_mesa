@@ -377,10 +377,31 @@ tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
        */
       if (!desc)
          continue;
+      uint32_t bcolor = (desc[2] & A5XX_TEX_SAMP_2_BCOLOR_OFFSET__MASK) >>
+                        A5XX_TEX_SAMP_2_BCOLOR_OFFSET__SHIFT;
+
+      /* A built-in border color of a combined image sampler (the image just
+       * before) of a 4444 format with alpha in the low bits: packed for it
+       */
+      if (bcolor < TU_BORDER_COLOR_BUILTIN) {
+         const struct tu5_desc_ref *ref = &map->samp[i];
+
+         for (unsigned t = 0; t < num_tex; t++) {
+            const struct tu5_desc_ref *tref = &map->tex[t];
+            if (tref->set != ref->set || tref->dynamic != ref->dynamic ||
+                tref->offset + A6XX_TEX_CONST_DWORDS != ref->offset)
+               continue;
+            const uint32_t *tdesc = tu5_descriptor(cmd, shader, tref);
+            if (tdesc && (tdesc[TU5_TEX_FLAGS] & TU5_TEX_FLAG_ALPHA_LOW))
+               bcolor += cmd->device->a5xx_bcolor_alpha_low;
+            break;
+         }
+      }
+
       samp_map[i * 4 + 0] = desc[0];
       samp_map[i * 4 + 1] = desc[1];
-      samp_map[i * 4 + 2] = desc[2] & (A5XX_TEX_SAMP_2_BCOLOR_OFFSET__MASK |
-                                       A5XX_TEX_SAMP_2_REDUCTION_MODE__MASK);
+      samp_map[i * 4 + 2] = A5XX_TEX_SAMP_2_BCOLOR_OFFSET(bcolor) |
+                            (desc[2] & A5XX_TEX_SAMP_2_REDUCTION_MODE__MASK);
    }
 
    for (unsigned i = 0; i < num_tex; i++) {
@@ -1181,6 +1202,9 @@ tu5_image_view_descriptor(uint32_t *descriptor, const struct tu_image *image,
    }
 
    memset(descriptor, 0, A6XX_TEX_CONST_DWORDS * sizeof(uint32_t));
+   if (format == PIPE_FORMAT_A4B4G4R4_UNORM ||
+       format == PIPE_FORMAT_A4R4G4B4_UNORM)
+      descriptor[TU5_TEX_FLAGS] = TU5_TEX_FLAG_ALPHA_LOW;
 
    uint32_t tex_swiz;
 
