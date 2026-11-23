@@ -91,6 +91,12 @@ struct tu5_desc_map
    struct tu5_desc_ref ssbo[TU5_MAX_SSBOS];
    struct tu5_desc_ref image[TU5_MAX_IMAGES];
 
+   /* The texture each sampler samples, as its number + 1: 0 when it is not
+    * known (indexed dynamically), 0xff when it samples several. For the
+    * built-in border colors of some formats, see TU5_TEX_FLAG_ALPHA_LOW.
+    */
+   uint8_t samp_tex[TU5_MAX_SAMPLERS];
+
    /* Where the index of the view is among the constants, in dwords, or ~0:
     * the views are drawn one after the other, each with its own.
     */

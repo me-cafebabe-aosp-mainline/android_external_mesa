@@ -380,10 +380,18 @@ tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       uint32_t bcolor = (desc[2] & A5XX_TEX_SAMP_2_BCOLOR_OFFSET__MASK) >>
                         A5XX_TEX_SAMP_2_BCOLOR_OFFSET__SHIFT;
 
-      /* A built-in border color of a combined image sampler (the image just
-       * before) of a 4444 format with alpha in the low bits: packed for it
+      /* A built-in border color of a sampler of an image of a 4444 format
+       * with alpha in the low bits: packed for it. The image is the one
+       * the shader samples with it, or else that of the combined image
+       * sampler (the image just before).
        */
-      if (bcolor < TU_BORDER_COLOR_BUILTIN) {
+      uint8_t pair = map->samp_tex[i];
+      if (bcolor < TU_BORDER_COLOR_BUILTIN && pair && pair != 0xff &&
+          pair - 1u < num_tex) {
+         const uint32_t *tdesc = tu5_descriptor(cmd, shader, &map->tex[pair - 1]);
+         if (tdesc && (tdesc[TU5_TEX_FLAGS] & TU5_TEX_FLAG_ALPHA_LOW))
+            bcolor += cmd->device->a5xx_bcolor_alpha_low;
+      } else if (bcolor < TU_BORDER_COLOR_BUILTIN) {
          const struct tu5_desc_ref *ref = &map->samp[i];
 
          for (unsigned t = 0; t < num_tex; t++) {

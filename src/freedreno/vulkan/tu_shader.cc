@@ -1369,6 +1369,23 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct tu_device *dev,
       lower_tex_impl(b, tex, dev, shader, layout, read_only_input_attachments, dynamic_renderpass, false);
    }
 
+   /* Adreno 5xx: which texture the sampler samples, when both are known */
+   if (tu_is_a5xx(dev) && sampler_src_idx >= 0 && tex_src_idx >= 0) {
+      nir_src *samp = &tex->src[nir_tex_instr_src_index(
+         tex, nir_tex_src_sampler_offset)].src;
+      nir_src *texture = &tex->src[nir_tex_instr_src_index(
+         tex, nir_tex_src_texture_offset)].src;
+
+      if (nir_src_is_const(*samp) && nir_src_is_const(*texture)) {
+         unsigned s = nir_src_as_uint(*samp);
+         unsigned t = nir_src_as_uint(*texture) + 1;
+         uint8_t *pair = &shader->const_state.a5xx.samp_tex[s];
+
+         if (s < TU5_MAX_SAMPLERS && t < 0xff)
+            *pair = (*pair == 0 || *pair == t) ? t : 0xff;
+      }
+   }
+
    return true;
 }
 
