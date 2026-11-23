@@ -1399,6 +1399,27 @@ struct lower_instr_params {
    struct ir3_const_allocations *const_allocs;
 };
 
+/* Adreno 5xx: gl_FragCoord is at the center of the pixel even when the
+ * shading is per sample, where its x and y are those of the sample: the
+ * pixel plus the position of the sample in it.
+ */
+static bool
+tu5_lower_frag_coord_sample(nir_builder *b, nir_intrinsic_instr *intr,
+                            void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_frag_coord)
+      return false;
+
+   b->cursor = nir_after_instr(&intr->instr);
+   nir_def *xy = nir_fadd(b, nir_ffloor(b, nir_channels(b, &intr->def, 0x3)),
+                          nir_load_sample_pos(b));
+   nir_def *res = nir_vec4(b, nir_channel(b, xy, 0), nir_channel(b, xy, 1),
+                           nir_channel(b, &intr->def, 2),
+                           nir_channel(b, &intr->def, 3));
+   nir_def_rewrite_uses_after(&intr->def, res, res->parent_instr);
+   return true;
+}
+
 /* Adreno 5xx: the texel fetches of 3D textures out of their bounds read
  * texels in them (dEQP-VK.robustness.image_robustness.*.sampled_image.*.3d),
  * zero is what robustImageAccess has them read: checked in the shader.
@@ -3894,6 +3915,14 @@ tu_lower_nir(struct tu_device *dev,
          if (!var->data.centroid)
             var->data.sample = true;
       }
+   }
+
+   if (nir->info.stage == MESA_SHADER_FRAGMENT && tu_is_a5xx(dev)) {
+      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+      if (key->force_sample_interp || nir->info.fs.uses_sample_shading)
+         NIR_PASS_V(nir, nir_shader_intrinsics_pass,
+                    tu5_lower_frag_coord_sample, nir_metadata_control_flow,
+                    NULL);
    }
 
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,
