@@ -538,6 +538,11 @@ get_device_extensions(const struct tu_physical_device *device,
        */
       ext->KHR_zero_initialize_workgroup_memory = all.KHR_zero_initialize_workgroup_memory;
       ext->KHR_vulkan_memory_model = all.KHR_vulkan_memory_model;
+      /* the inline uniform blocks loaded to the constants with the others
+       * (tu5_emit_user_consts()), the border colors swizzled as the image
+       */
+      ext->EXT_inline_uniform_block = all.EXT_inline_uniform_block;
+      ext->EXT_border_color_swizzle = all.EXT_border_color_swizzle;
    }
 }
 
@@ -1119,6 +1124,9 @@ tu_get_features(struct tu_physical_device *pdevice,
       features->vulkanMemoryModel = all.vulkanMemoryModel;
       features->vulkanMemoryModelDeviceScope = all.vulkanMemoryModelDeviceScope;
       features->vulkanMemoryModelAvailabilityVisibilityChains = all.vulkanMemoryModelAvailabilityVisibilityChains;
+      features->inlineUniformBlock = all.inlineUniformBlock;
+      features->borderColorSwizzle = all.borderColorSwizzle;
+      features->borderColorSwizzleFromImage = all.borderColorSwizzleFromImage;
 
 
       features->robustBufferAccess = true;
