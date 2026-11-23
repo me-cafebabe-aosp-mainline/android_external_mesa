@@ -526,6 +526,11 @@ get_device_extensions(const struct tu_physical_device *device,
       ext->KHR_vertex_attribute_divisor = all.KHR_vertex_attribute_divisor;
       ext->EXT_non_seamless_cube_map = all.EXT_non_seamless_cube_map;
       ext->EXT_custom_border_color = all.EXT_custom_border_color;
+
+      /* dynamic rendering makes render passes */
+      ext->KHR_dynamic_rendering = all.KHR_dynamic_rendering;
+      ext->KHR_maintenance5 = all.KHR_maintenance5;
+      ext->KHR_maintenance6 = all.KHR_maintenance6;
       ext->KHR_maintenance4 = all.KHR_maintenance4;
    }
 }
@@ -1096,6 +1101,14 @@ tu_get_features(struct tu_physical_device *pdevice,
       features->vertexAttributeInstanceRateDivisor = all.vertexAttributeInstanceRateDivisor;
       features->nonSeamlessCubeMap = all.nonSeamlessCubeMap;
       features->customBorderColors = all.customBorderColors;
+
+      /* Not descriptor indexing: a shader has a state of its own for each
+       * element of the arrays it uses, which those of the tests overflow.
+       * Not inline uniform blocks: descriptorset_random fails.
+       */
+      features->dynamicRendering = all.dynamicRendering;
+      features->maintenance5 = all.maintenance5;
+      features->maintenance6 = all.maintenance6;
 
 
       features->robustBufferAccess = true;
