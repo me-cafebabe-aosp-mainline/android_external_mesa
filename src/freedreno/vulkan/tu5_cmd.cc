@@ -4525,8 +4525,11 @@ tu5_emit_depth_stencil(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                  VK_ATTACHMENT_UNUSED;
    bool depth_test = has_zs && dyn->ds.depth.test_enable;
    bool stencil_test = has_zs && dyn->ds.stencil.test_enable;
+   /* the depth and stencil tests after the shader, when it decides which
+    * samples are covered (the sample mask it writes included)
+    */
    bool fragz = fp->no_earlyz || fp->has_kill || fp->writes_pos ||
-                dyn->ms.alpha_to_coverage_enable;
+                fp->writes_smask || dyn->ms.alpha_to_coverage_enable;
 
    OUT_PKT4(cs, REG_A5XX_RB_ALPHA_CONTROL, 1);
    OUT_RING(cs, 0x00000000);
