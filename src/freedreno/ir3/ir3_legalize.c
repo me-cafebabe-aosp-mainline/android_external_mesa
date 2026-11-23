@@ -785,8 +785,9 @@ legalize_block(struct ir3_legalize_ctx *ctx, struct ir3_block *block)
          last_n = insert_nop_flags(ctx, state, last_n, &build, IR3_INSTR_SY);
       }
 
-      /* a5xx: what follows a load of memory (shared memory, buffers or
-       * images), other than more of the same, waits for it: with
+      /* a5xx: what follows a load of memory (shared memory, buffers,
+       * images or private memory), other than more of the same, waits for
+       * it: with
        * instructions that did not need its result right after it, shaders
        * computed wrong values at times, depending on what had run before
        * (dEQP-VK.memory_model.shared.nested_structs.8 after .7,
@@ -805,7 +806,8 @@ legalize_block(struct ir3_legalize_ctx *ctx, struct ir3_block *block)
             }
             last_input_needs_ss = false;
          }
-         if (n->opc == OPC_LDL || n->opc == OPC_LDGB || n->opc == OPC_LDIB)
+         if (n->opc == OPC_LDL || n->opc == OPC_LDGB || n->opc == OPC_LDIB ||
+             n->opc == OPC_LDP)
             prev_load = n->opc;
          else if (n->opc != OPC_NOP)
             prev_load = (opc_t)0;
