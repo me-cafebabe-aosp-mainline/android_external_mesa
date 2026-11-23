@@ -192,6 +192,12 @@ emit_intrinsic_atomic_ssbo(struct ir3_context *ctx, nir_intrinsic_instr *intr)
    atomic->barrier_class = IR3_BARRIER_BUFFER_W;
    atomic->barrier_conflict = IR3_BARRIER_BUFFER_R | IR3_BARRIER_BUFFER_W;
 
+   /* a5xx returns the old value in the register of the dword offset, as
+    * the blob has it (see emit_intrinsic_atomic_shared())
+    */
+   if (ctx->compiler->gen == 5)
+      ir3_reg_tie(atomic->dsts[0], atomic->srcs[2]);
+
    /* even if nothing consume the result, we can't DCE the instruction: */
    array_insert(ctx->block, ctx->block->keeps, atomic);
 
