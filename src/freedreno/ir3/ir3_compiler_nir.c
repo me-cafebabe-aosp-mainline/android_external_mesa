@@ -3003,6 +3003,19 @@ emit_intrinsic(struct ir3_context *ctx, nir_intrinsic_instr *intr)
       break;
    }
    case nir_intrinsic_load_persp_center_rhw_ir3:
+      /* a5xx has no such input (nor GRAS_CNTL bit for it): what is read is
+       * the 1/w of the center, gl_FragCoord.w
+       * (dEQP-VK.pipeline.*.multisample_interpolation.
+       * sample_interpolate_at_*, without gl_FragCoord in the shader).
+       */
+      if (ctx->compiler->gen == 5) {
+         struct ir3_instruction *coord[4];
+
+         ir3_split_dest(b, coord, get_frag_coord(ctx, intr), 0, 4);
+         ctx->so->fragcoord_compmask |= 0x8;
+         dst[0] = coord[3];
+         break;
+      }
       if (!ctx->ij[IJ_PERSP_CENTER_RHW]) {
          ctx->ij[IJ_PERSP_CENTER_RHW] =
             create_sysval_input(ctx, SYSTEM_VALUE_BARYCENTRIC_PERSP_CENTER_RHW, 0x1);
