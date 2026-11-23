@@ -739,8 +739,13 @@ tu5_pack_border_color_format(void *entry, const VkClearColorValue *val,
       util_format_description(format);
    VkClearColorValue raw = *val;
 
+   /* The depth and the stencil are sampled as the first channel of their
+    * formats (the swizzles of the descriptions are those of depth and
+    * stencil): as they are. S8_UINT borders were the green component.
+    */
    if (format == PIPE_FORMAT_NONE || !desc ||
-       desc->layout != UTIL_FORMAT_LAYOUT_PLAIN) {
+       desc->layout != UTIL_FORMAT_LAYOUT_PLAIN ||
+       util_format_is_depth_or_stencil(format)) {
       tu5_pack_border_color(entry, val, is_int);
       return;
    }
