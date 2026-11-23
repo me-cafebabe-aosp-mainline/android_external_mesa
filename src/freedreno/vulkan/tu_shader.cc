@@ -1622,13 +1622,75 @@ tu5_vs_uses_ibo(nir_shader *shader)
    return false;
 }
 
-/* The first slot of the vertex shader, see tu5_desc_map::vs_ibo: a
+/* The slots of the storage buffers and images a vertex shader that goes
+ * through the storage state takes: the elements of the bindings it uses,
+ * which tu5_desc_base() numbers.
+ */
+static unsigned
+tu5_vs_ibo_count(nir_shader *shader, const struct tu_pipeline_layout *layout)
+{
+   struct { unsigned set, binding; } seen[TU5_GFX_IBO_SLOTS];
+   unsigned num_seen = 0, count = 0;
+
+   nir_foreach_function_impl (impl, shader) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+
+            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+            unsigned set, binding;
+
+            switch (intrin->intrinsic) {
+            case nir_intrinsic_vulkan_resource_index: {
+               VkDescriptorType type =
+                  (VkDescriptorType) nir_intrinsic_desc_type(intrin);
+               if (type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER &&
+                   type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
+                  continue;
+               set = nir_intrinsic_desc_set(intrin);
+               binding = nir_intrinsic_binding(intrin);
+               break;
+            }
+            case nir_intrinsic_image_deref_load:
+            case nir_intrinsic_image_deref_store:
+            case nir_intrinsic_image_deref_atomic:
+            case nir_intrinsic_image_deref_atomic_swap:
+            case nir_intrinsic_image_deref_size:
+            case nir_intrinsic_image_deref_samples: {
+               nir_variable *var = nir_deref_instr_get_variable(
+                  nir_src_as_deref(intrin->src[0]));
+               set = var->data.descriptor_set;
+               binding = var->data.binding;
+               break;
+            }
+            default:
+               continue;
+            }
+
+            bool found = false;
+            for (unsigned i = 0; i < num_seen; i++)
+               found |= seen[i].set == set && seen[i].binding == binding;
+            if (found || num_seen == ARRAY_SIZE(seen))
+               continue;
+
+            seen[num_seen].set = set;
+            seen[num_seen].binding = binding;
+            num_seen++;
+            count += layout->set[set].layout->binding[binding].array_size;
+         }
+      }
+   }
+   return count;
+}
+
+/* The first slot of the vertex shader, see tu5_desc_map::vs_ibo_base: a
  * constant, for ir3 to find the sizes of the images
  */
 static nir_def *
 tu5_ibo_base(nir_builder *b, const struct tu_shader *shader)
 {
-   return nir_imm_int(b, TU5_VS_IBO_BASE);
+   return nir_imm_int(b, shader->const_state.a5xx.vs_ibo_base);
 }
 
 static bool
@@ -1707,6 +1769,13 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
    }
 
    const_state->a5xx.vs_ibo = tu_is_a5xx(dev) && tu5_vs_uses_ibo(shader);
+   if (const_state->a5xx.vs_ibo) {
+      unsigned count = tu5_vs_ibo_count(shader, layout);
+      if (count > TU5_GFX_IBO_SLOTS)
+         mesa_loge("a5xx: %u storage slots in a vertex shader", count);
+      const_state->a5xx.vs_ibo_base =
+         TU5_GFX_IBO_SLOTS - MIN2(count, TU5_GFX_IBO_SLOTS);
+   }
 
    const_state->a5xx.view_loc = ~0u;
    if (tu_is_a5xx(dev) && tu5_uses_view_index(shader)) {

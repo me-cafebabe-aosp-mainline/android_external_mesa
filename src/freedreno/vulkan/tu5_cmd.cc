@@ -319,13 +319,14 @@ tu5_emit_tex_tables(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 }
 
 /* The first slot of a shader in the storage state: the vertex shader shares
- * that of the graphics shaders with the fragment shader, from
- * TU5_VS_IBO_BASE (see tu5_desc_map::vs_ibo).
+ * that of the graphics shaders with the fragment shader, in the last slots
+ * (see tu5_desc_map::vs_ibo_base).
  */
 static unsigned
 tu5_ibo_slot_base(const struct tu_shader *shader)
 {
-   return shader->variant->type == MESA_SHADER_VERTEX ? TU5_VS_IBO_BASE : 0;
+   return shader->variant->type == MESA_SHADER_VERTEX
+             ? shader->const_state.a5xx.vs_ibo_base : 0;
 }
 
 /* The textures and the samplers of a shader */
@@ -564,8 +565,8 @@ tu5_emit_images(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 }
 
 /* The storage buffers and images of a vertex shader that goes through the
- * storage state: in the slots from TU5_VS_IBO_BASE, those of the fragment
- * shader being under them.
+ * storage state: in the last slots (tu5_desc_map::vs_ibo_base), those of
+ * the fragment shader being the first ones.
  */
 static void
 tu5_emit_vs_ibos(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
@@ -575,8 +576,10 @@ tu5_emit_vs_ibos(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       return;
 
    const struct tu_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
-   if ((fs && fs->variant && fs->variant->num_ibos > TU5_VS_IBO_BASE) ||
-       TU5_VS_IBO_BASE + vs->variant->num_ibos > TU5_GFX_IBO_SLOTS)
+   if ((fs && fs->variant &&
+        fs->variant->num_ibos > vs->const_state.a5xx.vs_ibo_base) ||
+       vs->const_state.a5xx.vs_ibo_base + vs->variant->num_ibos >
+          TU5_GFX_IBO_SLOTS)
       mesa_loge("a5xx: too many storage buffers and images in the vertex "
                 "and fragment shaders");
 
