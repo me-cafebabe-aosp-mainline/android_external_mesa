@@ -1409,6 +1409,13 @@ tu_get_physical_device_properties_1_3(struct tu_physical_device *pdevice,
    p->storageTexelBufferOffsetSingleTexelAlignment = true;
    p->uniformTexelBufferOffsetAlignmentBytes = 64;
    p->uniformTexelBufferOffsetSingleTexelAlignment = true;
+   /* Adreno 5xx: the base of a buffer view is where the texture starts,
+    * which needs the 64 bytes
+    */
+   if (pdevice->info->chip == 5) {
+      p->storageTexelBufferOffsetSingleTexelAlignment = false;
+      p->uniformTexelBufferOffsetSingleTexelAlignment = false;
+   }
 
    /* The address space is 4GB for current kernels, so there's no point
     * allowing a larger buffer. Our buffer sizes are 64-bit though, so
