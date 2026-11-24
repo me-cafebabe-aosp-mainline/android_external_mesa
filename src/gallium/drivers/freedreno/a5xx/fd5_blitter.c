@@ -132,6 +132,11 @@ can_do_blit(const struct pipe_blit_info *info)
    if (!ok_format(info->src.format))
       return false;
 
+   /* not UBWC, which the 2D blits know nothing of */
+   if (fd_resource(info->dst.resource)->layout.ubwc ||
+       fd_resource(info->src.resource)->layout.ubwc)
+      return false;
+
    if (!ok_format_pair(info->src.format, info->dst.format))
       return false;
 

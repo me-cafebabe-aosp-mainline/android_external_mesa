@@ -101,14 +101,20 @@ emit_mrt(struct fd_ringbuffer *ring, unsigned nr_bufs,
                         COND(uint, A5XX_SP_FS_MRT_REG_COLOR_UINT) |
                         COND(srgb, A5XX_SP_FS_MRT_REG_COLOR_SRGB));
 
-      /* when we support UBWC, these would be the system memory
-       * addr/pitch/etc:
+      /* the UBWC flags, in system memory: for the loads of the tiles (the
+       * targets with them are drawn in GMEM, see fd_gmem_render_tiles())
        */
       OUT_PKT4(ring, REG_A5XX_RB_MRT_FLAG_BUFFER(i), 4);
-      OUT_RING(ring, 0x00000000); /* RB_MRT_FLAG_BUFFER[i].ADDR_LO */
-      OUT_RING(ring, 0x00000000); /* RB_MRT_FLAG_BUFFER[i].ADDR_HI */
-      OUT_RING(ring, A5XX_RB_MRT_FLAG_BUFFER_PITCH(0));
-      OUT_RING(ring, A5XX_RB_MRT_FLAG_BUFFER_ARRAY_PITCH(0));
+      if (!gmem && rsc && rsc->layout.ubwc) {
+         OUT_RELOC(ring, rsc->bo, fd_resource_ubwc_offset(rsc, 0, 0), 0, 0);
+         OUT_RING(ring, A5XX_RB_MRT_FLAG_BUFFER_PITCH(rsc->layout.ubwc_width0));
+         OUT_RING(ring, A5XX_RB_MRT_FLAG_BUFFER_ARRAY_PITCH(rsc->layout.layer_size));
+      } else {
+         OUT_RING(ring, 0x00000000); /* RB_MRT_FLAG_BUFFER[i].ADDR_LO */
+         OUT_RING(ring, 0x00000000); /* RB_MRT_FLAG_BUFFER[i].ADDR_HI */
+         OUT_RING(ring, A5XX_RB_MRT_FLAG_BUFFER_PITCH(0));
+         OUT_RING(ring, A5XX_RB_MRT_FLAG_BUFFER_ARRAY_PITCH(0));
+      }
    }
 }
 
@@ -563,6 +569,18 @@ fd5_emit_tile_mem2gmem(struct fd_batch *batch, const struct fd_tile *tile)
    emit_mrt(ring, pfb->nr_cbufs, pfb->cbufs, NULL);
    //	emit_zs(ring, &pfb->zsbuf, NULL);
 
+   /* the loads of the targets with UBWC flags, as the blob */
+   uint32_t flags = 0;
+   for (unsigned i = 0; i < pfb->nr_cbufs; i++) {
+      if (pfb->cbufs[i] && fd_resource(pfb->cbufs[i]->texture)->layout.ubwc)
+         flags |= A5XX_RB_RENDER_CNTL_FLAG_MRTS(1 << i) |
+                  A5XX_RB_RENDER_CNTL_FLAG_MRTS2(1 << i);
+   }
+   if (flags) {
+      OUT_PKT4(ring, REG_A5XX_RB_RENDER_CNTL, 1);
+      OUT_RING(ring, flags);
+   }
+
    OUT_PKT4(ring, REG_A5XX_RB_CNTL, 1);
    OUT_RING(ring, A5XX_RB_CNTL_WIDTH(gmem->bin_w) |
                      A5XX_RB_CNTL_HEIGHT(gmem->bin_h) | A5XX_RB_CNTL_BYPASS);
@@ -632,16 +650,24 @@ emit_gmem2mem_surf(struct fd_batch *batch, uint32_t base,
 
    assert(psurf->first_layer == psurf->last_layer);
 
+   /* to UBWC: the flags with the texels, as the blob (0xf) */
    OUT_PKT4(ring, REG_A5XX_RB_BLIT_FLAG_DST, 4);
-   OUT_RING(ring, 0x00000000); /* RB_BLIT_FLAG_DST_LO */
-   OUT_RING(ring, 0x00000000); /* RB_BLIT_FLAG_DST_HI */
-   OUT_RING(ring, 0x00000000); /* RB_BLIT_FLAG_DST_PITCH */
-   OUT_RING(ring, 0x00000000); /* RB_BLIT_FLAG_DST_ARRAY_PITCH */
+   if (rsc->layout.ubwc) {
+      OUT_RELOC(ring, rsc->bo, fd_resource_ubwc_offset(rsc, 0, 0), 0, 0);
+      OUT_RING(ring, A5XX_RB_BLIT_FLAG_DST_PITCH(rsc->layout.ubwc_width0));
+      OUT_RING(ring, A5XX_RB_BLIT_FLAG_DST_ARRAY_PITCH(rsc->layout.layer_size));
+   } else {
+      OUT_RING(ring, 0x00000000); /* RB_BLIT_FLAG_DST_LO */
+      OUT_RING(ring, 0x00000000); /* RB_BLIT_FLAG_DST_HI */
+      OUT_RING(ring, 0x00000000); /* RB_BLIT_FLAG_DST_PITCH */
+      OUT_RING(ring, 0x00000000); /* RB_BLIT_FLAG_DST_ARRAY_PITCH */
+   }
 
    tiled = fd_resource_tile_mode(psurf->texture, psurf->level);
 
    OUT_PKT4(ring, REG_A5XX_RB_RESOLVE_CNTL_3, 5);
-   OUT_RING(ring, 0x00000004 | /* XXX RB_RESOLVE_CNTL_3 */
+   OUT_RING(ring, rsc->layout.ubwc ? 0x0000000f :
+                  0x00000004 | /* XXX RB_RESOLVE_CNTL_3 */
                      COND(tiled, A5XX_RB_RESOLVE_CNTL_3_TILED));
    OUT_RELOC(ring, rsc->bo, offset, 0, 0); /* RB_BLIT_DST_LO/HI */
    OUT_RING(ring, A5XX_RB_BLIT_DST_PITCH(pitch));

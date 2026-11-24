@@ -137,6 +137,7 @@ fd5_screen_init(struct pipe_screen *pscreen)
    screen->layout_resource = fd5_layout_resource;
    if (screen->gpu_id == 504)
       screen->tile_mode = fd504_tile_mode;
+   fd5_resource_screen_init(pscreen);
    if (FD_DBG(TTILE))
       screen->tile_mode = fd5_tile_mode;
 

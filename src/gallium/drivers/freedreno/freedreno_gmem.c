@@ -729,6 +729,16 @@ fd_gmem_render_tiles(struct fd_batch *batch)
       }
    }
 
+   /* a5xx: targets with UBWC flags are drawn in GMEM, which their loads and
+    * stores have the flags for
+    */
+   if (is_a5xx(ctx->screen) && (batch->cleared || batch->num_draws)) {
+      for (unsigned i = 0; i < pfb->nr_cbufs; i++) {
+         if (pfb->cbufs[i] && fd_resource(pfb->cbufs[i]->texture)->layout.ubwc)
+            sysmem = false;
+      }
+   }
+
    if (FD_DBG(SYSMEM))
       sysmem = true;
 
