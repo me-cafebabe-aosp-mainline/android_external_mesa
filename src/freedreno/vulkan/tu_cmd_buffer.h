@@ -632,6 +632,8 @@ struct tu_cmd_state
     * holds while a5xx_vs does
     */
    float a5xx_viewport[7];
+   /* RB_RENDER_CNTL of the colour targets of the subpass, see tu5_emit_mrt() */
+   uint32_t a5xx_render_cntl;
    /* What groups of the state of the draws they last wrote, see
     * tu5_draw_state()
     */

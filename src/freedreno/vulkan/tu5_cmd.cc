@@ -44,6 +44,9 @@ using namespace a5xx_regs;
 #endif
 
 
+/* TEX_CONST_3: the texture has UBWC flags (as the blob sets it) */
+#define TU5_TEX_CONST_3_FLAG (1u << 28)
+
 /* The groups of the state of the draws, see tu5_draw_state() */
 /* The groups run in the order of their ids: the program first, which drops
  * the constants loaded before it (HLSQ_UPDATE_CNTL), then what loads them.
@@ -1472,6 +1475,14 @@ tu5_image_view_descriptor(uint32_t *descriptor, const struct tu_image *image,
    }
    if (layout->tile_all)
       descriptor[3] |= A5XX_TEX_CONST_3_TILE_ALL;
+
+   /* UBWC: from the flags, which the texels follow, see fdl5_layout() */
+   if (layout->ubwc) {
+      iova = tu_image_plane_iova(image, plane) +
+             fdl_ubwc_offset(layout, level, range->baseArrayLayer);
+      descriptor[3] |= A5XX_TEX_CONST_3_TILE_ALL | TU5_TEX_CONST_3_FLAG;
+   }
+
    descriptor[4] = (uint32_t)iova;
    descriptor[5] = (uint32_t)(iova >> 32) | A5XX_TEX_CONST_5_DEPTH(depth);
 }
@@ -2477,7 +2488,17 @@ struct tu5_surf {
    uint32_t min_layer_size;
    /* As a texture: a texel buffer of these bytes from iova, if not zero */
    uint32_t buffer_range;
+   /* UBWC: where the flags are (the start of the layer), if not zero, and
+    * their pitch, see fdl5_layout()
+    */
+   uint64_t flag_iova;
+   uint32_t flag_pitch;
 };
+
+
+/* RB_RENDER_CNTL of the colour targets of a surface with UBWC flags */
+#define TU5_RENDER_CNTL_FLAG_MRT(i) (A5XX_RB_RENDER_CNTL_FLAG_MRTS(1u << (i)) | \
+                                     A5XX_RB_RENDER_CNTL_FLAG_MRTS2(1u << (i)))
 
 /* A level of a 3D image as a texture */
 static struct tu5_surf
@@ -2527,6 +2548,10 @@ tu5_image_surf(const struct tu_image *image, unsigned plane,
       .layer_size = fdl_layer_stride(layout, level),
       .tile_mode = (enum a5xx_tile_mode)fdl_tile_mode(layout, level),
       .samples = layout->nr_samples,
+      .flag_iova = layout->ubwc ? tu_image_plane_iova(image, plane) +
+                                     fdl_ubwc_offset(layout, level, layer)
+                                : 0,
+      .flag_pitch = layout->ubwc ? layout->ubwc_width0 : 0,
    };
 }
 
@@ -2549,8 +2574,8 @@ tu5_buffer_surf(enum pipe_format format, uint64_t iova, uint32_t width,
    };
 }
 
-/* One colour target, or none */
-static void
+/* One colour target, or none: what it adds to RB_RENDER_CNTL */
+static uint32_t
 tu5_emit_mrt_surf(struct tu_cs *cs, unsigned i, const struct tu5_surf *surf)
 {
    enum a5xx_color_fmt format = (enum a5xx_color_fmt)0;
@@ -2589,12 +2614,14 @@ tu5_emit_mrt_surf(struct tu_cs *cs, unsigned i, const struct tu5_surf *surf)
                    COND(uint, A5XX_SP_FS_MRT_REG_COLOR_UINT) |
                    COND(srgb, A5XX_SP_FS_MRT_REG_COLOR_SRGB));
 
-   /* no UBWC */
+   /* the UBWC flags, with the layer for their array pitch, as the blob */
+   const bool flags = surf && surf->flag_iova;
    OUT_PKT4(cs, REG_A5XX_RB_MRT_FLAG_BUFFER(i), 4);
-   OUT_RING(cs, 0x00000000); /* RB_MRT_FLAG_BUFFER[i].ADDR_LO */
-   OUT_RING(cs, 0x00000000); /* RB_MRT_FLAG_BUFFER[i].ADDR_HI */
-   OUT_RING(cs, A5XX_RB_MRT_FLAG_BUFFER_PITCH(0));
-   OUT_RING(cs, A5XX_RB_MRT_FLAG_BUFFER_ARRAY_PITCH(0));
+   tu_cs_emit_qw(cs, flags ? surf->flag_iova : 0);
+   OUT_RING(cs, A5XX_RB_MRT_FLAG_BUFFER_PITCH(flags ? surf->flag_pitch : 0));
+   OUT_RING(cs, A5XX_RB_MRT_FLAG_BUFFER_ARRAY_PITCH(flags ? size : 0));
+
+   return flags ? TU5_RENDER_CNTL_FLAG_MRT(i) : 0;
 }
 
 /* A surface as the one 2D texture of the blits, sampled by texel */
@@ -2659,6 +2686,13 @@ tu5_emit_blit_src(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    tex[4] = (uint32_t)surf->iova;
    tex[5] = (uint32_t)(surf->iova >> 32) |
             A5XX_TEX_CONST_5_DEPTH(surf->depth ? surf->depth : 1);
+
+   /* UBWC: from the flags, which the texels follow, see fdl5_layout() */
+   if (surf->flag_iova) {
+      tex[3] |= A5XX_TEX_CONST_3_TILE_ALL | TU5_TEX_CONST_3_FLAG;
+      tex[4] = (uint32_t)surf->flag_iova;
+      tex[5] = (uint32_t)(surf->flag_iova >> 32) | A5XX_TEX_CONST_5_DEPTH(1);
+   }
 }
 
 /* The colour targets of the subpass */
@@ -2744,7 +2778,7 @@ static void
 tu5_emit_mrt(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t layer)
 {
    const struct tu_subpass *subpass = cmd->state.subpass;
-   uint32_t components = 0;
+   uint32_t components = 0, flags = 0;
 
    for (unsigned i = 0; i < A5XX_MAX_RENDER_TARGETS; i++) {
       if (i < subpass->color_count &&
@@ -2763,7 +2797,7 @@ tu5_emit_mrt(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t layer)
                                   iview->vk.base_array_layer + layer);
          }
 
-         tu5_emit_mrt_surf(cs, i, &surf);
+         flags |= tu5_emit_mrt_surf(cs, i, &surf);
          components |= 0xf << (i * 4);
       } else {
          tu5_emit_mrt_surf(cs, i, NULL);
@@ -2772,6 +2806,11 @@ tu5_emit_mrt(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t layer)
 
    OUT_PKT4(cs, REG_A5XX_RB_RENDER_COMPONENTS, 1);
    OUT_RING(cs, components);
+
+   /* see tu5_emit_subpass_begin() */
+   cmd->state.a5xx_render_cntl = 0x00000008 | flags;
+   OUT_PKT4(cs, REG_A5XX_RB_RENDER_CNTL, 1);
+   OUT_RING(cs, cmd->state.a5xx_render_cntl);
 }
 
 /* The depth and stencil buffer: a level and a layer of an image, or none */
@@ -3144,7 +3183,7 @@ tu5_bind_surf(struct tu_cs *cs, const struct tu5_surf *color,
               const struct tu_image *zs, uint32_t level, uint32_t layer)
 {
    tu5_emit_zs_surface(cs, zs, level, layer);
-   tu5_emit_mrt_surf(cs, 0, color);
+   uint32_t flags = tu5_emit_mrt_surf(cs, 0, color);
    for (unsigned i = 1; i < A5XX_MAX_RENDER_TARGETS; i++)
       tu5_emit_mrt_surf(cs, i, NULL);
 
@@ -3155,7 +3194,7 @@ tu5_bind_surf(struct tu_cs *cs, const struct tu5_surf *color,
                                                    : zs->vk.samples));
 
    OUT_PKT4(cs, REG_A5XX_RB_RENDER_CNTL, 1);
-   OUT_RING(cs, 0x00000008);
+   OUT_RING(cs, 0x00000008 | flags);
 
    OUT_PKT4(cs, REG_A5XX_GRAS_SC_CNTL, 1);
    OUT_RING(cs, 0x00000008);
@@ -3469,6 +3508,13 @@ tu5_aspect_copy_format(const struct tu_image *image, VkImageAspectFlags aspect,
       return PIPE_FORMAT_R8G8B8A8_UINT;
    }
 
+   /* UBWC compresses by the format: what has the flags is copied as its own
+    * format, which keeps the bits of those UBWC takes (see
+    * tu_image_update_layout())
+    */
+   if (image->layout[*plane].ubwc)
+      return util_format_linear(format);
+
    return tu5_copy_format(format);
 }
 
@@ -3657,6 +3703,15 @@ tu5_copy_image(struct tu_cmd_buffer *cmd, struct tu_image *src_image,
       MAX2(info->extent.depth,
            vk_image_subresource_layer_count(&src_image->vk,
                                             &info->srcSubresource));
+
+   /* to or from UBWC: as the format of that image, see above */
+   if (src_format != dst_format && src_image->layout[src_plane].ubwc !=
+                                       dst_image->layout[dst_plane].ubwc) {
+      if (src_image->layout[src_plane].ubwc)
+         dst_format = src_format;
+      else
+         src_format = dst_format;
+   }
 
    if (src_format == PIPE_FORMAT_NONE || src_format != dst_format) {
       mesa_logw("a5xx: copy from %s to %s not implemented",
@@ -4271,6 +4326,7 @@ tu5_gmem_blit(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t a,
    uint32_t level = iview->vk.base_mip_level;
    uint32_t layer = iview->vk.base_array_layer;
    uint64_t mem = image->iova + fdl_surface_offset(layout, level, layer);
+   uint64_t flag_mem = image->iova + fdl_ubwc_offset(layout, level, layer);
    enum a5xx_blit_buf buf = BLIT_MRT0;
 
    if (!store) {
@@ -4305,6 +4361,15 @@ tu5_gmem_blit(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t a,
       OUT_RING(cs, A5XX_RB_MRT_ARRAY_PITCH(fdl_layer_stride(layout, level)));
       tu_cs_emit_qw(cs, mem);
 
+      /* from UBWC: the flags with the texels, as the blob */
+      OUT_PKT4(cs, REG_A5XX_RB_MRT_FLAG_BUFFER(0), 4);
+      tu_cs_emit_qw(cs, layout->ubwc ? flag_mem : 0);
+      OUT_RING(cs, A5XX_RB_MRT_FLAG_BUFFER_PITCH(layout->ubwc ? layout->ubwc_width0 : 0));
+      OUT_RING(cs, A5XX_RB_MRT_FLAG_BUFFER_ARRAY_PITCH(
+                      layout->ubwc ? fdl_layer_stride(layout, level) : 0));
+      OUT_PKT4(cs, REG_A5XX_RB_RENDER_CNTL, 1);
+      OUT_RING(cs, layout->ubwc ? TU5_RENDER_CNTL_FLAG_MRT(0) : 0x00000008);
+
       OUT_PKT4(cs, REG_A5XX_RB_BLIT_FLAG_DST_LO, 4);
       OUT_RING(cs, 0x00000000);
       OUT_RING(cs, 0x00000000);
@@ -4334,15 +4399,17 @@ tu5_gmem_blit(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t a,
          tu5_emit_mrt_surf(cs, 0, &gmem);
       }
 
+      /* to UBWC: the flags with the texels, as the blob (0xf) */
       OUT_PKT4(cs, REG_A5XX_RB_BLIT_FLAG_DST_LO, 4);
-      OUT_RING(cs, 0x00000000);
-      OUT_RING(cs, 0x00000000);
-      OUT_RING(cs, 0x00000000);
-      OUT_RING(cs, 0x00000000);
+      tu_cs_emit_qw(cs, layout->ubwc ? flag_mem : 0);
+      OUT_RING(cs, A5XX_RB_BLIT_FLAG_DST_PITCH(layout->ubwc ? layout->ubwc_width0 : 0));
+      OUT_RING(cs, A5XX_RB_BLIT_FLAG_DST_ARRAY_PITCH(
+                      layout->ubwc ? fdl_layer_stride(layout, level) : 0));
 
       OUT_PKT4(cs, REG_A5XX_RB_RESOLVE_CNTL_3, 5);
-      OUT_RING(cs, 0x00000004 |
-                      COND(fdl_tile_mode(layout, level), A5XX_RB_RESOLVE_CNTL_3_TILED));
+      OUT_RING(cs, layout->ubwc ? 0x0000000f :
+                   0x00000004 |
+                   COND(fdl_tile_mode(layout, level), A5XX_RB_RESOLVE_CNTL_3_TILED));
       tu_cs_emit_qw(cs, mem);
       OUT_RING(cs, A5XX_RB_BLIT_DST_PITCH(fdl_pitch(layout, level)));
       OUT_RING(cs, A5XX_RB_BLIT_DST_ARRAY_PITCH(fdl_layer_stride(layout, level)));
@@ -4355,6 +4422,11 @@ tu5_gmem_blit(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t a,
    OUT_RING(cs, A5XX_RB_BLIT_CNTL_BUF(buf));
 
    tu5_event_write(cmd, cs, BLIT, true);
+
+   if (!store && layout->ubwc) {
+      OUT_PKT4(cs, REG_A5XX_RB_RENDER_CNTL, 1);
+      OUT_RING(cs, 0x00000008);
+   }
 }
 
 /* GMEM: the render pass, tile by tile: the loads, the draw stream, the stores */
@@ -4629,8 +4701,9 @@ tu5_emit_subpass_begin(struct tu_cmd_buffer *cmd)
    OUT_PKT4(cs, REG_A5XX_RB_SAMPLE_COUNT_CONTROL, 1);
    OUT_RING(cs, A5XX_RB_SAMPLE_COUNT_CONTROL_COPY);
 
+   /* with the UBWC flags of the targets tu5_emit_mrt() bound */
    OUT_PKT4(cs, REG_A5XX_RB_RENDER_CNTL, 1);
-   OUT_RING(cs, 0x00000008);
+   OUT_RING(cs, cmd->state.a5xx_render_cntl);
 
    OUT_PKT4(cs, REG_A5XX_GRAS_SC_CNTL, 1);
    OUT_RING(cs, 0x00000008);

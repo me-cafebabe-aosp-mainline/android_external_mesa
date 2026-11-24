@@ -718,12 +718,39 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
       ubwc_enabled = false;
    }
 
-   /* a5xx: the tile modes have the values of the a6xx ones, and UBWC is not
-    * supported.
+   /* a5xx: the tile modes have the values of the a6xx ones. UBWC for the
+    * colour targets of a single level and layer of 32 bits a texel, which
+    * nothing but the GPU reads or writes: tiled, rendered to, sampled and
+    * copied (see fdl5_layout() and tu5_image_surf()).
     */
    const bool a5xx = tu_is_a5xx(device);
-   if (a5xx)
-      image->ubwc_enabled = false;
+   if (a5xx) {
+      enum pipe_format f = vk_format_to_pipe_format(image->vk.format);
+
+      image->ubwc_enabled =
+         image->ubwc_enabled && !TU_DEBUG(NOUBWC) &&
+         tile_mode == TILE6_3 && !image->force_linear_tile &&
+         image->vk.image_type == VK_IMAGE_TYPE_2D &&
+         image->vk.mip_levels == 1 && image->vk.array_layers == 1 &&
+         image->vk.samples == VK_SAMPLE_COUNT_1_BIT &&
+         tu6_plane_count(image->vk.format) == 1 &&
+         !vk_format_is_depth_or_stencil(image->vk.format) &&
+         !util_format_is_compressed(f) &&
+         util_format_get_blocksize(f) == 4 &&
+         tu5_format_color_supported(f) &&
+         /* copied as their own format, which keeps all of their bits (see
+          * tu5_aspect_copy_format()): not snorm (-128 reads as -127) nor
+          * float (denormals)
+          */
+         !util_format_is_snorm(f) && !util_format_is_float(f) &&
+         (image->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+         !(image->vk.usage & (VK_IMAGE_USAGE_STORAGE_BIT |
+                              VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
+                              VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT)) &&
+         !(image->vk.create_flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
+         !image->vk.external_handle_types && !plane_layouts &&
+         modifier == DRM_FORMAT_MOD_INVALID;
+   }
 
    /* Whether a view of the image with an R8G8 format could be made. */
    bool has_r8g8 = tu_is_r8g8(vk_format_to_pipe_format(image->vk.format));
@@ -814,7 +841,9 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
           * level, which the textures are to be told.
           */
          layout->tile_all = layout->tile_mode &&
-                            util_format_is_depth_or_stencil(format);
+                            (util_format_is_depth_or_stencil(format) ||
+                             /* UBWC is of the tiles, as small as it is */
+                             layout->ubwc);
 
          /* the images begin on a page, as the Gallium driver has them */
          layout->base_align = 4096;

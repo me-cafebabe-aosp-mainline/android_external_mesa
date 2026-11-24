@@ -36,6 +36,25 @@ fdl5_layout_image(struct fdl_layout *layout, const struct fdl_image_params *para
    layout->linear_fallback_threshold_texels = FDL_LINEAR_FALLBACK_THRESHOLD;
 
    uint32_t heightalign = layout->cpp == 1 ? 32 : 16;
+
+   /* UBWC (a single level and layer of 32 bits a texel): the flags first,
+    * a byte for each tile of 16x4 texels, in rows of a multiple of 64
+    * bytes, a multiple of 16 rows, then the texels, on the next page, as
+    * the blob lays it out. The texture units find the texels from the size
+    * of the flags, which is not given to them.
+    */
+   if (layout->ubwc) {
+      assert(mip_levels == 1 && array_size == 1 && !is_3d &&
+             layout->cpp == 4 && layout->tile_mode);
+      uint32_t meta_pitch = align(DIV_ROUND_UP(width0, 16), 64);
+      uint32_t meta_rows = align(DIV_ROUND_UP(height0, 4), 16);
+
+      layout->ubwc_width0 = meta_pitch;
+      layout->ubwc_slices[0].offset = 0;
+      layout->ubwc_slices[0].size0 = align(meta_pitch * meta_rows, 4096);
+      layout->ubwc_layer_size = layout->ubwc_slices[0].size0;
+      layout->size = layout->ubwc_layer_size;
+   }
    /* in layer_first layout, the level (slice) contains just one
     * layer (since in fact the layer contains the slices)
     */
