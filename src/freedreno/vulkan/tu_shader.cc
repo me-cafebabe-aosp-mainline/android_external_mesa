@@ -973,6 +973,35 @@ tu5_lower_storage_format(nir_builder *b, nir_intrinsic_instr *instr)
    }
 }
 
+/* Adreno 5xx: whether the shader reads (or does atomics on) the image of var */
+static bool
+tu5_image_var_is_read(nir_shader *nir, nir_variable *var)
+{
+   nir_foreach_function_impl (impl, nir) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            switch (intr->intrinsic) {
+            case nir_intrinsic_image_deref_store:
+            case nir_intrinsic_image_deref_size:
+            case nir_intrinsic_image_deref_samples:
+               continue;
+            default:
+               if (!nir_intrinsic_has_image_dim(intr))
+                  continue;
+               break;
+            }
+            nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+            if (deref && nir_deref_instr_get_variable(deref) == var)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
 static void
 lower_image_deref(struct tu_device *dev, nir_builder *b,
                   nir_intrinsic_instr *instr, struct tu_shader *shader,
@@ -985,7 +1014,22 @@ lower_image_deref(struct tu_device *dev, nir_builder *b,
       nir_variable *var = nir_deref_instr_get_variable(deref);
       unsigned first = tu5_desc_base(shader, layout, var->data.descriptor_set,
                                      var->data.binding, TU5_DESC_IMAGE);
-      if (var->data.image.format == PIPE_FORMAT_NONE) {
+      /* What is written goes out as the format of the view, whatever the
+       * shader says (a rgba32ui image over a view of R32G32_UINT, which the
+       * image descriptor has as 16 bit channels for LDIB): the stores of an
+       * image that is not read, of a format the shader stores as it is, are
+       * made as those of no format, through the descriptor of the format of
+       * the view. Those of a format packed for LDIB (rg32f, rg8) are not:
+       * the packed stores are right for the views of that format.
+       */
+      bool real_format = var->data.image.format == PIPE_FORMAT_NONE;
+      if (!real_format && instr->intrinsic == nir_intrinsic_image_deref_store &&
+          tu5_storage_format(var->data.image.format) == var->data.image.format &&
+          !tu5_image_var_is_read(b->shader, var)) {
+         nir_intrinsic_set_format(instr, PIPE_FORMAT_NONE);
+         real_format = true;
+      }
+      if (real_format) {
          unsigned count = layout->set[var->data.descriptor_set]
                              .layout->binding[var->data.binding].array_size;
          for (unsigned i = 0; i < count && first + i < TU5_MAX_IMAGES; i++)
