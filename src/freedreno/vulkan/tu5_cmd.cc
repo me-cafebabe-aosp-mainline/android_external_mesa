@@ -2065,6 +2065,18 @@ tu5_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *ring)
    tu5_set_render_mode(ring, BYPASS);
    tu5_cache_flush(ring);
 
+   /* The color and depth caches keep the lines of what was drawn before,
+    * which a new image in the same memory, of another format, is not to
+    * meet: those of a depth buffer of 16 bits left in the depth cache are
+    * what the clear of one of 32 bits there reads back.
+    */
+   tu5_emit_flushes(cmd, ring,
+                    TU_CMD_FLAG_CCU_CLEAN_COLOR |
+                    TU_CMD_FLAG_CCU_CLEAN_DEPTH |
+                    TU_CMD_FLAG_CCU_INVALIDATE_COLOR |
+                    TU_CMD_FLAG_CCU_INVALIDATE_DEPTH |
+                    TU_CMD_FLAG_WAIT_FOR_IDLE);
+
    OUT_PKT4(ring, REG_A5XX_HLSQ_UPDATE_CNTL, 1);
    OUT_RING(ring, 0xfffff);
 
