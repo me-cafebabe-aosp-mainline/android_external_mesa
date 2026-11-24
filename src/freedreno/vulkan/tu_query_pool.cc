@@ -815,6 +815,14 @@ emit_copy_query_pool_results(struct tu_cmd_buffer *cmdbuf,
     * wait for all writes to complete.
     */
    tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
+   /* Adreno 5xx: CP_WAIT_MEM_WRITES does not wait for the results the
+    * CP_REG_TO_MEM of the timestamps writes, which CP_MEM_TO_MEM read as
+    * they were before (0 after a reset): wait for idle and for the ME.
+    */
+   if (tu_is_a5xx(cmdbuf->device)) {
+      tu_cs_emit_wfi(cs);
+      tu_cs_emit_pkt7(cs, CP_WAIT_FOR_ME, 0);
+   }
 
    for (uint32_t i = 0; i < queryCount; i++) {
       uint32_t query = firstQuery + i;
