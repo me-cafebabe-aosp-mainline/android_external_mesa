@@ -4626,6 +4626,22 @@ tu5_emit_viewport_scissor(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
       zoffset = (vp->minDepth + vp->maxDepth) * 0.5f;
    }
 
+   /* The viewport is written after a wait for idle, which drains the
+    * pipeline: only when it changes, as fd5_emit.c does. What it was is
+    * known while the state of the draws has not been written over (see
+    * where a5xx_vs is cleared); the binning pass has a stream of its own.
+    */
+   const float viewport[7] = {
+      vp->x, vp->y, vp->width, vp->height, vp->minDepth, vp->maxDepth,
+      (float)dyn->vp.depth_clip_negative_one_to_one,
+   };
+   if (cs != &cmd->a5xx_binning_cs) {
+      if (cmd->state.a5xx_vs &&
+          !memcmp(cmd->state.a5xx_viewport, viewport, sizeof(viewport)))
+         return;
+      memcpy(cmd->state.a5xx_viewport, viewport, sizeof(viewport));
+   }
+
    tu_cs_emit_wfi(cs);
    OUT_PKT4(cs, REG_A5XX_GRAS_CL_VPORT_XOFFSET_0, 6);
    OUT_RING(cs, A5XX_GRAS_CL_VPORT_XOFFSET_0(vp->x + vp->width / 2.0f));

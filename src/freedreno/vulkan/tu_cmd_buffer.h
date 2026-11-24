@@ -628,6 +628,10 @@ struct tu_cmd_state
     */
    const struct tu_shader *a5xx_vs, *a5xx_fs;
    unsigned a5xx_max_loc;
+   /* The viewport the draws last wrote, see tu5_emit_viewport_scissor(): it
+    * holds while a5xx_vs does
+    */
+   float a5xx_viewport[7];
 
    /* Adreno 5xx: whether the render pass draws to GMEM, tile by tile, see
     * tu5_use_gmem()
