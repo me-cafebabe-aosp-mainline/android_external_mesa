@@ -459,7 +459,7 @@ get_device_extensions(const struct tu_physical_device *device,
          /* also in the stock driver */
          .KHR_device_group = true,
          .EXT_index_type_uint8 = true,
-         /* with none of the line modes, as in the stock driver */
+         /* rectangular lines (the stock driver has no line mode) */
          .EXT_line_rasterization = true,
          .KHR_line_rasterization = true,
          /* STORE_OP_NONE: not stored, see tu_render_pass_attachment */
@@ -1088,6 +1088,11 @@ tu_get_features(struct tu_physical_device *pdevice,
       features->shaderSubgroupRotate = all.shaderSubgroupRotate;
       features->shaderSubgroupRotateClustered = all.shaderSubgroupRotateClustered;
       features->indexTypeUint8 = all.indexTypeUint8;
+      /* VK_KHR_line_rasterization is to have one of the line modes: the
+       * rectangular lines are those drawn by default (strictLines), which
+       * the rasterization tests pass
+       */
+      features->rectangularLines = all.rectangularLines;
 
       /* the state of each draw, see tu5_draw_state() */
       features->logicOp = all.logicOp;
