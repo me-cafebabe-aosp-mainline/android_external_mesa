@@ -505,7 +505,10 @@ get_device_extensions(const struct tu_physical_device *device,
       ext->KHR_pipeline_executable_properties = all.KHR_pipeline_executable_properties;
       ext->KHR_shader_integer_dot_product = all.KHR_shader_integer_dot_product;
       ext->KHR_shader_subgroup_rotate = all.KHR_shader_subgroup_rotate;
-      ext->KHR_shader_subgroup_uniform_control_flow = all.KHR_shader_subgroup_uniform_control_flow;
+      /* no VK_KHR_shader_subgroup_uniform_control_flow: with an invocation a
+       * subgroup there is nothing for it to guarantee, and its tests count
+       * on subgroups of more than one invocation
+       */
       ext->EXT_subgroup_size_control = all.EXT_subgroup_size_control;
       ext->EXT_shader_replicated_composites = all.EXT_shader_replicated_composites;
 
@@ -1084,7 +1087,6 @@ tu_get_features(struct tu_physical_device *pdevice,
       features->reportAddressBinding = all.reportAddressBinding;
       features->shaderSubgroupRotate = all.shaderSubgroupRotate;
       features->shaderSubgroupRotateClustered = all.shaderSubgroupRotateClustered;
-      features->shaderSubgroupUniformControlFlow = all.shaderSubgroupUniformControlFlow;
       features->indexTypeUint8 = all.indexTypeUint8;
 
       /* the state of each draw, see tu5_draw_state() */
