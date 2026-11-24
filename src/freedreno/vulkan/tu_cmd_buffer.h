@@ -632,6 +632,13 @@ struct tu_cmd_state
     * holds while a5xx_vs does
     */
    float a5xx_viewport[7];
+   /* What groups of the state of the draws they last wrote, see
+    * tu5_draw_state()
+    */
+#define TU5_DRAW_GROUPS 10
+#define TU5_DRAW_GROUP_DWORDS 512
+   uint32_t a5xx_group[TU5_DRAW_GROUPS][TU5_DRAW_GROUP_DWORDS];
+   uint32_t a5xx_group_dwords[TU5_DRAW_GROUPS];
 
    /* Adreno 5xx: whether the render pass draws to GMEM, tile by tile, see
     * tu5_use_gmem()
@@ -733,6 +740,11 @@ struct tu_cmd_buffer
    struct tu_cs tile_store_cs;
    struct tu_cs draw_epilogue_cs;
    struct tu_cs sub_cs;
+
+   /* Adreno 5xx: where a group of the state of a draw is written first, see
+    * tu5_draw_state()
+    */
+   uint32_t a5xx_group_scratch[4096];
 
    /* Adreno 5xx: the draws of the render pass for the binning pass, see
     * tu5_cmd_render_gmem()

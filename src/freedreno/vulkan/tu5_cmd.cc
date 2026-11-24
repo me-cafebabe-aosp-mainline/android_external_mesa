@@ -44,6 +44,42 @@ using namespace a5xx_regs;
 #endif
 
 
+/* The groups of the state of the draws, see tu5_draw_state() */
+/* The groups run in the order of their ids: the program first, which drops
+ * the constants loaded before it (HLSQ_UPDATE_CNTL), then what loads them.
+ */
+enum tu5_draw_group {
+   TU5_GROUP_PROGRAM,
+   TU5_GROUP_CONSTS,
+   TU5_GROUP_DEPTH_STENCIL,
+   TU5_GROUP_RASTERIZER,
+   TU5_GROUP_BLEND,
+   TU5_GROUP_VERTEX_BUFS,
+   TU5_GROUP_DRAW,
+   TU5_GROUP_VS_PARAMS,
+   /* the view index constant, see tu5_bind_view() */
+   TU5_GROUP_VIEW,
+   /* the constants of an indirect draw, see tu5_draw_indirect() */
+   TU5_GROUP_INDIRECT,
+};
+static_assert(TU5_GROUP_INDIRECT < TU5_DRAW_GROUPS, "");
+
+/* What the draw state groups bound so far is not to be run: before what
+ * draws with registers written inline (clears, blits, dispatches, the
+ * binning pass, the loads of a tile), which a pending group would write over
+ * at the draw.
+ */
+static void
+tu5_disable_draw_states(struct tu_cs *cs)
+{
+   tu_cs_emit_pkt7(cs, CP_SET_DRAW_STATE, 3);
+   tu_cs_emit(cs, CP_SET_DRAW_STATE__0_COUNT(0) |
+                  CP_SET_DRAW_STATE__0_DISABLE_ALL_GROUPS |
+                  CP_SET_DRAW_STATE__0_GROUP_ID(0));
+   tu_cs_emit(cs, 0);
+   tu_cs_emit(cs, 0);
+}
+
 static void
 tu5_event_write(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                 enum vgt_event_type evt, bool timestamp)
@@ -874,6 +910,87 @@ static void tu5_emit_mrt(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 static void tu5_emit_zs(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                         uint32_t layer);
 
+/* The state of the draws is in groups, each written first into memory of the
+ * CPU, then, when it is not what the group last had, into memory of the GPU
+ * as a draw state group (CP_SET_DRAW_STATE), as the blob has it. With
+ * binning in GMEM, the CP runs the draw stream again for each tile (68 for
+ * the whole screen), and the groups of the draws that a tile does not see
+ * only as the few dwords of their CP_SET_DRAW_STATE: a group runs at the
+ * next draw that is drawn. Written inline, the state took the CP more than
+ * drawing in GMEM saves: forty rectangles 1.65 ms, 0.36 ms in memory.
+ *
+ * What a group last had holds while a5xx_vs does (see where it is cleared);
+ * what writes the same registers in between clears it. None of the
+ * registers of these groups is one the program writes.
+ *
+ * An indirect draw loads the constants of its first vertex and instance
+ * from memory: in a group of its own, which runs after those of the draw.
+ */
+#define TU5_GROUP_SCRATCH_DWORDS 4096
+
+static void
+tu5_group_begin(struct tu_cmd_buffer *cmd, struct tu_cs *scratch,
+                uint32_t *buf)
+{
+   tu_cs_init_external(scratch, cmd->device, buf,
+                       buf + TU5_GROUP_SCRATCH_DWORDS, 0, false);
+   tu_cs_begin(scratch);
+}
+
+static void
+tu5_group_end(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+              enum tu5_draw_group g, bool known, bool draw_state,
+              const uint32_t *buf, const struct tu_cs *scratch)
+{
+   uint32_t dwords = scratch->cur - buf;
+
+   if (known && dwords == cmd->state.a5xx_group_dwords[g] &&
+       !memcmp(buf, cmd->state.a5xx_group[g], dwords * sizeof(uint32_t)))
+      return;
+
+   if (dwords <= TU5_DRAW_GROUP_DWORDS) {
+      memcpy(cmd->state.a5xx_group[g], buf, dwords * sizeof(uint32_t));
+      cmd->state.a5xx_group_dwords[g] = dwords;
+   } else {
+      cmd->state.a5xx_group_dwords[g] = UINT32_MAX;
+   }
+
+   if (!draw_state) {
+      if (dwords) {
+         tu_cs_reserve(cs, dwords);
+         tu_cs_emit_array(cs, buf, dwords);
+      }
+      return;
+   }
+
+   struct tu_cs_memory mem = {};
+   if (dwords &&
+       tu_cs_alloc(&cmd->sub_cs, DIV_ROUND_UP(dwords, 4), 4, &mem) !=
+          VK_SUCCESS)
+      return;
+   if (dwords)
+      memcpy(mem.map, buf, dwords * sizeof(uint32_t));
+
+   tu_cs_emit_pkt7(cs, CP_SET_DRAW_STATE, 3);
+   tu_cs_emit(cs, CP_SET_DRAW_STATE__0_COUNT(dwords) |
+                  COND(!dwords, CP_SET_DRAW_STATE__0_DISABLE) |
+                  CP_SET_DRAW_STATE__0_GROUP_ID(g + 1));
+   tu_cs_emit_qw(cs, dwords ? mem.iova : 0);
+}
+
+#define TU5_GROUP_EMIT(g, known, draw_state, ...)                            \
+   do {                                                                      \
+      uint32_t *_buf = cmd->a5xx_group_scratch;                              \
+      struct tu_cs _scratch;                                                 \
+      tu5_group_begin(cmd, &_scratch, _buf);                                 \
+      {                                                                      \
+         struct tu_cs *gcs = &_scratch;                                      \
+         __VA_ARGS__;                                                        \
+      }                                                                      \
+      tu5_group_end(cmd, cs, g, known, draw_state, _buf, &_scratch);         \
+   } while (0)
+#define TU5_GROUP(g, known, ...) TU5_GROUP_EMIT(g, known, true, __VA_ARGS__)
+
 /* Multiview: the views are drawn one after the other. The views of the
  * subpass, or the one view there is without multiview.
  */
@@ -888,6 +1005,24 @@ tu5_views(const struct tu_cmd_buffer *cmd)
 /* Before the draw of a view: the targets are its layer of the attachments,
  * and the shaders are given its index.
  */
+/* The view index, which a shader may read without multiview too: 0 then,
+ * written all the same, or it would be what a clear or another draw left
+ */
+static void
+tu5_emit_view_consts(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                     uint32_t view)
+{
+   for (unsigned stage = MESA_SHADER_VERTEX; stage <= MESA_SHADER_FRAGMENT;
+        stage += MESA_SHADER_FRAGMENT - MESA_SHADER_VERTEX) {
+      const struct tu_shader *shader = cmd->state.shaders[stage];
+      uint32_t loc = shader->const_state.a5xx.view_loc;
+      const uint32_t consts[4] = { view };
+
+      if (loc != ~0u && loc < shader->variant->constlen * 4)
+         tu5_emit_const(cs, shader->variant, loc, 4, consts);
+   }
+}
+
 void
 tu5_bind_view(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t view)
 {
@@ -935,14 +1070,14 @@ tu5_bind_view(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t view)
       }
    }
 
-   for (unsigned stage = MESA_SHADER_VERTEX; stage <= MESA_SHADER_FRAGMENT;
-        stage += MESA_SHADER_FRAGMENT - MESA_SHADER_VERTEX) {
-      const struct tu_shader *shader = cmd->state.shaders[stage];
-      uint32_t loc = shader->const_state.a5xx.view_loc;
-      const uint32_t consts[4] = { view };
-
-      if (loc != ~0u && loc < shader->variant->constlen * 4)
-         tu5_emit_const(cs, shader->variant, loc, 4, consts);
+   /* after the program, which drops the constants loaded before it: in a
+    * group of the draws (the binning pass has its state inline)
+    */
+   if (cs == &cmd->a5xx_binning_cs) {
+      tu5_emit_view_consts(cmd, cs, view);
+   } else {
+      TU5_GROUP_EMIT(TU5_GROUP_VIEW, false, true,
+                     tu5_emit_view_consts(cmd, gcs, view));
    }
 }
 
@@ -950,6 +1085,7 @@ tu5_bind_view(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t view)
  * draw, a draw for each of the structures of the buffer. What the vertex
  * shader reads of them as constants is copied to where these are loaded from.
  */
+
 void
 tu5_draw_indirect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                   uint32_t initiator, bool indexed, uint64_t iova,
@@ -990,14 +1126,17 @@ tu5_draw_indirect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
           */
          tu5_cache_flush(cs);
 
-         OUT_PKT7(cs, CP_LOAD_STATE4, 3);
-         OUT_RING(cs, CP_LOAD_STATE4_0_DST_OFF(param) |
-                         CP_LOAD_STATE4_0_STATE_SRC(SS4_INDIRECT) |
-                         CP_LOAD_STATE4_0_STATE_BLOCK(SB4_VS_SHADER) |
-                         CP_LOAD_STATE4_0_NUM_UNIT(1));
-         OUT_RING(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
-                         (uint32_t)tmp);
-         OUT_RING(cs, (uint32_t)(tmp >> 32));
+         /* at the draw, after the groups of its state, see above */
+         TU5_GROUP(TU5_GROUP_INDIRECT, false, {
+            OUT_PKT7(gcs, CP_LOAD_STATE4, 3);
+            OUT_RING(gcs, CP_LOAD_STATE4_0_DST_OFF(param) |
+                             CP_LOAD_STATE4_0_STATE_SRC(SS4_INDIRECT) |
+                             CP_LOAD_STATE4_0_STATE_BLOCK(SB4_VS_SHADER) |
+                             CP_LOAD_STATE4_0_NUM_UNIT(1));
+            OUT_RING(gcs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
+                             (uint32_t)tmp);
+            OUT_RING(gcs, (uint32_t)(tmp >> 32));
+         });
       }
 
       if (indexed) {
@@ -1012,6 +1151,19 @@ tu5_draw_indirect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
          OUT_RING(cs, initiator);
          tu_cs_emit_qw(cs, iova);
       }
+   }
+
+   /* the constants of the first vertex and instance were loaded from the
+    * buffer: what tu5_draw_state() last wrote of them is not there anymore,
+    * and the group that loaded them is not to run again
+    */
+   cmd->state.a5xx_group_dwords[TU5_GROUP_VS_PARAMS] = UINT32_MAX;
+   if (param < vs->constlen) {
+      tu_cs_emit_pkt7(cs, CP_SET_DRAW_STATE, 3);
+      tu_cs_emit(cs, CP_SET_DRAW_STATE__0_COUNT(0) |
+                     CP_SET_DRAW_STATE__0_DISABLE |
+                     CP_SET_DRAW_STATE__0_GROUP_ID(TU5_GROUP_INDIRECT + 1));
+      tu_cs_emit_qw(cs, 0);
    }
 }
 
@@ -1031,6 +1183,7 @@ tu5_dispatch(struct tu_cmd_buffer *cmd, const uint32_t *blocks,
    cmd->state.a5xx_vs = cmd->state.a5xx_fs = NULL;
 
    struct tu_cs *cs = &cmd->cs;
+   tu5_disable_draw_states(cs);
    const struct tu_shader *shader = cmd->state.shaders[MESA_SHADER_COMPUTE];
    const struct ir3_shader_variant *v = shader->variant;
    const struct ir3_const_state *const_state = ir3_const_state(v);
@@ -2777,6 +2930,7 @@ tu5_draw_rect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 {
    /* the program state of the draws is to be written out again */
    cmd->state.a5xx_vs = cmd->state.a5xx_fs = NULL;
+   tu5_disable_draw_states(cs);
 
    struct tu5_program prog = {};
 
@@ -3068,6 +3222,7 @@ tu5_sysmem_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t width,
 {
    /* the program state of the draws is to be written out again */
    cmd->state.a5xx_vs = cmd->state.a5xx_fs = NULL;
+   tu5_disable_draw_states(cs);
 
    const struct fd_dev_info *info = cmd->device->physical_device->info;
 
@@ -4306,6 +4461,7 @@ tu5_cmd_render_gmem(struct tu_cmd_buffer *cmd)
       OUT_PKT4(cs, REG_A5XX_RB_WINDOW_OFFSET, 1);
       OUT_RING(cs, A5XX_RB_WINDOW_OFFSET_X(0) | A5XX_RB_WINDOW_OFFSET_Y(0));
 
+      tu5_disable_draw_states(cs);
       tu_cs_emit_call(cs, &cmd->a5xx_binning_cs);
 
       tu5_event_write(cmd, cs, UNK_2D, false);
@@ -4340,6 +4496,8 @@ tu5_cmd_render_gmem(struct tu_cmd_buffer *cmd)
 
    for (uint32_t ty = ty0; ty < ty1; ty++) {
       for (uint32_t tx = tx0; tx < tx1; tx++) {
+         /* what the draws of the last tile left bound */
+         tu5_disable_draw_states(cs);
          uint32_t x1 = tx * tile0.width, y1 = ty * tile0.height;
          uint32_t x2 = MIN2(x1 + tile0.width, fb->width) - 1;
          uint32_t y2 = MIN2(y1 + tile0.height, fb->height) - 1;
@@ -5066,9 +5224,7 @@ tu5_binning_state(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool indexed)
    OUT_RING(cs, cmd->state.last_vs_params.first_instance);
 }
 
-/* TODO: only what changed. Everything is written out for each draw for now,
- * as the draw stream is not built from draw state groups here.
- */
+
 VkResult
 tu5_draw_state(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool indexed)
 {
@@ -5090,24 +5246,33 @@ tu5_draw_state(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool indexed)
     */
    const bool same_program = cmd->state.a5xx_vs == vs_shader &&
                              cmd->state.a5xx_fs == fs_shader;
+   /* what the groups last wrote is still there */
+   const bool known = cmd->state.a5xx_vs != NULL;
 
-   tu5_emit_depth_stencil(cmd, cs, prog.fs);
+   TU5_GROUP(TU5_GROUP_DEPTH_STENCIL, known,
+             tu5_emit_depth_stencil(cmd, gcs, prog.fs));
    tu5_emit_viewport_scissor(cmd, cs);
    if (!same_program) {
-      tu5_program_emit(cs, &prog);
+      /* with the immediates of the shaders, which it lays out */
+      TU5_GROUP(TU5_GROUP_PROGRAM, false, {
+         tu5_program_emit(gcs, &prog);
+         tu5_emit_immediates(gcs, prog.vs);
+         tu5_emit_immediates(gcs, prog.fs);
+      });
       cmd->state.a5xx_vs = vs_shader;
       cmd->state.a5xx_fs = fs_shader;
       cmd->state.a5xx_max_loc = prog.max_loc;
    }
-   tu5_emit_rasterizer(cmd, cs, prog.vs, cmd->state.a5xx_max_loc, indexed);
-   tu5_emit_blend(cmd, cs, prog.fs);
-   tu5_emit_vertex_bufs(cmd, cs, prog.vs);
+   TU5_GROUP(TU5_GROUP_RASTERIZER, known,
+             tu5_emit_rasterizer(cmd, gcs, prog.vs, cmd->state.a5xx_max_loc,
+                                 indexed));
+   TU5_GROUP(TU5_GROUP_BLEND, known, tu5_emit_blend(cmd, gcs, prog.fs));
+   TU5_GROUP(TU5_GROUP_VERTEX_BUFS, known,
+             tu5_emit_vertex_bufs(cmd, gcs, prog.vs));
 
-   if (!same_program) {
-      tu5_emit_immediates(cs, prog.vs);
-      tu5_emit_immediates(cs, prog.fs);
-   }
-   tu5_emit_vs_params(cmd, cs, prog.vs);
+   /* constants of the program, which another program lays out otherwise */
+   TU5_GROUP(TU5_GROUP_VS_PARAMS, known && same_program,
+             tu5_emit_vs_params(cmd, gcs, prog.vs));
 
    /* What the shaders read through the descriptor sets and the push
     * constants, again only for other shaders (or after something else
@@ -5117,25 +5282,32 @@ tu5_draw_state(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool indexed)
    if (!same_program ||
        (cmd->state.dirty &
         (TU_CMD_DIRTY_DESC_SETS | TU_CMD_DIRTY_SHADER_CONSTS))) {
-      tu5_emit_user_consts(cmd, cs, vs_shader);
-      tu5_emit_user_consts(cmd, cs, fs_shader);
-      tu5_emit_textures(cmd, cs, vs_shader);
-      tu5_emit_textures(cmd, cs, fs_shader);
-      tu5_emit_ssbos(cmd, cs, fs_shader);
-      tu5_emit_images(cmd, cs, fs_shader);
-      tu5_emit_vs_ibos(cmd, cs, vs_shader);
+      TU5_GROUP(TU5_GROUP_CONSTS, false, {
+         tu5_emit_user_consts(cmd, gcs, vs_shader);
+         tu5_emit_user_consts(cmd, gcs, fs_shader);
+         tu5_emit_textures(cmd, gcs, vs_shader);
+         tu5_emit_textures(cmd, gcs, fs_shader);
+         tu5_emit_ssbos(cmd, gcs, fs_shader);
+         tu5_emit_images(cmd, gcs, fs_shader);
+         tu5_emit_vs_ibos(cmd, gcs, vs_shader);
+      });
    }
 
-   OUT_PKT4(cs, REG_A5XX_VFD_INDEX_OFFSET, 2);
-   OUT_RING(cs, cmd->state.last_vs_params.vertex_offset);
-   OUT_RING(cs, cmd->state.last_vs_params.first_instance);
+   /* inline: an indirect draw writes VFD_INDEX_OFFSET itself, at the draw,
+    * where a group would write it over
+    */
+   TU5_GROUP_EMIT(TU5_GROUP_DRAW, known, false, {
+      OUT_PKT4(gcs, REG_A5XX_VFD_INDEX_OFFSET, 2);
+      OUT_RING(gcs, cmd->state.last_vs_params.vertex_offset);
+      OUT_RING(gcs, cmd->state.last_vs_params.first_instance);
 
-   /* see tu5_pack_border_color() */
-   OUT_PKT4(cs, REG_A5XX_TPL1_TP_BORDER_COLOR_BASE_ADDR_LO, 2);
-   tu_cs_emit_qw(cs, global_iova(cmd, bcolor_builtin));
+      /* see tu5_pack_border_color() */
+      OUT_PKT4(gcs, REG_A5XX_TPL1_TP_BORDER_COLOR_BASE_ADDR_LO, 2);
+      tu_cs_emit_qw(gcs, global_iova(cmd, bcolor_builtin));
 
-   OUT_PKT4(cs, REG_A5XX_TPL1_CS_TEX_COUNT, 1);
-   OUT_RING(cs, 0);
+      OUT_PKT4(gcs, REG_A5XX_TPL1_CS_TEX_COUNT, 1);
+      OUT_RING(gcs, 0);
+   });
 
    /* and the state of the draw for the binning pass */
    if (cmd->state.a5xx_binning)
