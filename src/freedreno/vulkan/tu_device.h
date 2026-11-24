@@ -59,6 +59,10 @@ enum global_shader {
    GLOBAL_SH_FS_RESOLVE5_4,
    /* Adreno 5xx: the sample a constant says */
    GLOBAL_SH_FS_COPY_MS5,
+   /* Adreno 5xx: the texels of buffer rows of any pitch, see
+    * tu5_copy_buffer_rect()
+    */
+   GLOBAL_SH_FS_COPY_BUF5,
    GLOBAL_SH_FS_CLEAR0,
    GLOBAL_SH_FS_CLEAR_MAX = GLOBAL_SH_FS_CLEAR0 + MAX_RTS,
    GLOBAL_SH_COUNT,

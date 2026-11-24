@@ -43,6 +43,7 @@ using namespace a5xx_regs;
 #define COND(bool, val) ((bool) ? (val) : 0)
 #endif
 
+
 static void
 tu5_event_write(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                 enum vgt_event_type evt, bool timestamp)
@@ -2321,6 +2322,8 @@ struct tu5_surf {
     */
    uint32_t depth;
    uint32_t min_layer_size;
+   /* As a texture: a texel buffer of these bytes from iova, if not zero */
+   uint32_t buffer_range;
 };
 
 /* A level of a 3D image as a texture */
@@ -2451,6 +2454,25 @@ tu5_emit_blit_src(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 
    if (!tu5_emit_tex_tables(cmd, cs, MESA_SHADER_FRAGMENT, 1, 1, &samp, &tex))
       return;
+
+   if (surf->buffer_range) {
+      memset(samp, 0, 4 * sizeof(uint32_t));
+      tu5_buffer_view_descriptor(tex, surf->format, surf->iova,
+                                 surf->buffer_range);
+      /* the texture alone: what follows is for the storage images, see
+       * tu5_emit_textures()
+       */
+      memset(&tex[6], 0, 10 * sizeof(uint32_t));
+      if (surf->swiz) {
+         tex[0] &= ~(A5XX_TEX_CONST_0_SWIZ_X__MASK |
+                     A5XX_TEX_CONST_0_SWIZ_Y__MASK |
+                     A5XX_TEX_CONST_0_SWIZ_Z__MASK |
+                     A5XX_TEX_CONST_0_SWIZ_W__MASK);
+         tex[0] |= fd5_tex_swiz(surf->format, surf->swiz[0], surf->swiz[1],
+                                surf->swiz[2], surf->swiz[3]);
+      }
+      return;
+   }
 
    samp[0] = A5XX_TEX_SAMP_0_XY_MAG(filter) | A5XX_TEX_SAMP_0_XY_MIN(filter) |
              A5XX_TEX_SAMP_0_WRAP_S(A5XX_TEX_CLAMP_TO_EDGE) |
@@ -3325,6 +3347,44 @@ tu5_copy_buffer_rect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
          tu5_blit_rect(cmd, cs, image, (VkRect2D) { { (int32_t)x, (int32_t)y }, { w, h } },
                        &buf, 0, 0, w, h, false, keep_mask);
       }
+      return;
+   }
+
+   /* Into the image, in one draw: the buffer read as a texel buffer from
+    * the 64 bytes before it, each texel at its row and column.
+    */
+   uint32_t skip = (va & 63) / cpp;
+   uint64_t range = (va & 63) + (uint64_t)(h - 1) * pitch + (uint64_t)w * cpp;
+   if (!to_buffer && !(pitch % cpp) && !((va & 63) % cpp) &&
+       range / cpp <= (1u << 27)) {
+      struct tu5_surf buf = {
+         .format = format,
+         .iova = va & ~63ull,
+         .width = w,
+         .height = h,
+         .samples = 1,
+         .swiz = swiz,
+         .buffer_range = (uint32_t)range,
+      };
+      const uint32_t consts[4] = { skip, pitch / cpp };
+      struct tu5_rect_draw d = {
+         .fs = GLOBAL_SH_FS_COPY_BUF5,
+         .width = image->width,
+         .height = image->height,
+         .rect = { { (int32_t)x, (int32_t)y }, { w, h } },
+         .rt = 0,
+         .fs_consts = consts,
+         .fs_consts_dwords = 4,
+         .src = &buf,
+         .s0 = 0.0f,
+         .t0 = 0.0f,
+         .s1 = (float)w,
+         .t1 = (float)h,
+         .keep_mask = keep_mask,
+      };
+
+      tu5_bind_surf(cs, image, NULL, 0, 0);
+      tu5_draw_rect(cmd, cs, &d);
       return;
    }
 

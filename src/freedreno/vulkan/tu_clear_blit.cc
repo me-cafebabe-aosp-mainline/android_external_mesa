@@ -901,6 +901,61 @@ build_resolve5_fs_shader(unsigned samples)
    return b->shader;
 }
 
+/* Adreno 5xx: a texel of the rows of a buffer, read as a texel buffer: the
+ * one of constant 0.x, plus the row (t) times the texels of a row (0.y),
+ * plus the column (s).
+ */
+static nir_shader *
+build_copy_buf5_fs_shader(void)
+{
+   nir_builder _b =
+      nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, NULL,
+                                     "buffer copy fs");
+   nir_builder *b = &_b;
+   b->shader->info.internal = true;
+
+   nir_variable *out_color =
+      nir_variable_create(b->shader, nir_var_shader_out, glsl_vec4_type(),
+                          "color0");
+   out_color->data.location = FRAG_RESULT_DATA0;
+
+   nir_variable *in_coords =
+      nir_variable_create(b->shader, nir_var_shader_in, glsl_vec_type(2),
+                          "coords");
+   in_coords->data.location = VARYING_SLOT_VAR0;
+
+   b->shader->info.num_textures = 1;
+   BITSET_SET(b->shader->info.textures_used, 0);
+   BITSET_SET(b->shader->info.textures_used_by_txf, 0);
+
+   nir_def *coord = nir_f2i32(b, nir_load_var(b, in_coords));
+   nir_def *c = load_const(b, 0, 2);
+   nir_def *index =
+      nir_iadd(b, nir_channel(b, c, 0),
+               nir_iadd(b, nir_imul(b, nir_channel(b, coord, 1),
+                                    nir_channel(b, c, 1)),
+                        nir_channel(b, coord, 0)));
+
+   nir_tex_instr *tex = nir_tex_instr_create(b->shader, 2);
+   tex->op = nir_texop_txf;
+   /* the bits are copied: the type does not matter */
+   tex->dest_type = nir_type_int32;
+   tex->is_array = false;
+   tex->is_shadow = false;
+   tex->sampler_dim = GLSL_SAMPLER_DIM_BUF;
+   tex->texture_index = 0;
+   tex->sampler_index = 0;
+   tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, index);
+   tex->coord_components = 1;
+   tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_int(b, 0));
+   nir_def_init(&tex->instr, &tex->def, 4, 32);
+   nir_builder_instr_insert(b, &tex->instr);
+
+   nir_store_var(b, out_color, &tex->def, 0xf);
+
+   return b->shader;
+}
+
 static nir_shader *
 build_rect5_vs_shader(void)
 {
@@ -1101,6 +1156,8 @@ tu_init_clear_blit_shaders(struct tu_device *dev)
                      GLOBAL_SH_FS_RESOLVE5_4);
       compile_shader(dev, build_resolve5_fs_shader(0), 1, &offset,
                      GLOBAL_SH_FS_COPY_MS5);
+      compile_shader(dev, build_copy_buf5_fs_shader(), 1, &offset,
+                     GLOBAL_SH_FS_COPY_BUF5);
 
    for (uint32_t num_rts = 0; num_rts <= MAX_RTS; num_rts++) {
       compile_shader(dev, build_clear_fs_shader(num_rts), num_rts, &offset,
