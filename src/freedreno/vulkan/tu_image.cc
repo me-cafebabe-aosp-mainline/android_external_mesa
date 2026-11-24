@@ -370,6 +370,20 @@ ubwc_possible(struct tu_device *device,
     */
    if (flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT)
       return false;
+   /* Adreno 5xx: the colour formats of 32 bits a texel, not snorm (copied
+    * as unorm) nor float (see tu5_aspect_copy_format())
+    */
+   if (info->chip == 5) {
+      enum pipe_format f = vk_format_to_pipe_format(format);
+      return type == VK_IMAGE_TYPE_2D && samples == VK_SAMPLE_COUNT_1_BIT &&
+             vk_format_get_plane_count(format) == 1 &&
+             !vk_format_is_depth_or_stencil(format) &&
+             !vk_format_is_compressed(format) &&
+             util_format_get_blocksize(f) == 4 &&
+             tu5_format_color_supported(f) &&
+             !util_format_is_snorm(f) && !util_format_is_float(f) &&
+             !(usage & VK_IMAGE_USAGE_STORAGE_BIT);
+   }
 
    /* no UBWC with compressed formats, E5B9G9R9, S8_UINT
     * (S8_UINT because separate stencil doesn't have UBWC-enable bit)
@@ -726,7 +740,29 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
    const bool a5xx = tu_is_a5xx(device);
    if (a5xx) {
       enum pipe_format f = vk_format_to_pipe_format(image->vk.format);
+      /* what UBWC of a5xx is for, see fdl5_layout() */
+      const bool ubwc_layout =
+         tile_mode == TILE6_3 && !image->force_linear_tile &&
+         image->vk.image_type == VK_IMAGE_TYPE_2D &&
+         image->vk.mip_levels == 1 && image->vk.array_layers == 1 &&
+         image->vk.samples == VK_SAMPLE_COUNT_1_BIT &&
+         tu6_plane_count(image->vk.format) == 1 &&
+         !vk_format_is_depth_or_stencil(image->vk.format) &&
+         !util_format_is_compressed(f) &&
+         util_format_get_blocksize(f) == 4 &&
+         tu5_format_color_supported(f) &&
+         !util_format_is_snorm(f) && !util_format_is_float(f) &&
+         !(image->vk.usage & (VK_IMAGE_USAGE_STORAGE_BIT |
+                              VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT));
 
+      /* A buffer gralloc made with UBWC (minigbm: the flags first, as
+       * fdl5_layout() has them): as it is, or not at all.
+       */
+      if (modifier == DRM_FORMAT_MOD_QCOM_COMPRESSED) {
+         if (!ubwc_layout)
+            return vk_error(device, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
+         image->ubwc_enabled = true;
+      } else
       image->ubwc_enabled =
          image->ubwc_enabled && !TU_DEBUG(NOUBWC) &&
          tile_mode == TILE6_3 && !image->force_linear_tile &&
@@ -856,7 +892,14 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
          /* The layout an imported buffer has, as gralloc made it: linear, of
           * one level and one layer, with the pitch and the offset given.
           */
-         if (plane_layouts) {
+         if (plane_layouts && layout->ubwc) {
+            /* UBWC from gralloc: of the layout above, its pitch the one of
+             * the texels, from the start of the buffer
+             */
+            if (plane_layouts[i].offset ||
+                plane_layouts[i].rowPitch != fdl_pitch(layout, 0))
+               return vk_error(device, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
+         } else if (plane_layouts) {
             const VkSubresourceLayout *pl = &plane_layouts[i];
             uint32_t pitch = pl->rowPitch;
             uint32_t nblocksy = util_format_get_nblocksy(format, height0);
@@ -948,6 +991,29 @@ TU_GENX(tu_image_init);
 
 /* Deferred ANB image support for ANB v8+ aliased images. */
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
+/* Adreno 5xx: whether a mutable image is viewed in nothing but its format
+ * and its sRGB (or UNORM) twin, as the mutable swapchains of Android are,
+ * which tiling (and UBWC) do not mind
+ */
+static bool
+tu5_srgb_views_only(const VkImageCreateInfo *pCreateInfo)
+{
+   const VkImageFormatListCreateInfo *fmt_list =
+      vk_find_struct_const(pCreateInfo->pNext, IMAGE_FORMAT_LIST_CREATE_INFO);
+   enum pipe_format f =
+      util_format_linear(vk_format_to_pipe_format(pCreateInfo->format));
+
+   if (!fmt_list || !fmt_list->viewFormatCount)
+      return false;
+
+   for (uint32_t i = 0; i < fmt_list->viewFormatCount; i++) {
+      if (util_format_linear(vk_format_to_pipe_format(
+             fmt_list->pViewFormats[i])) != f)
+         return false;
+   }
+   return true;
+}
+
 static VkResult
 tu_android_get_wsi_memory(struct tu_device *dev,
                           const VkBindImageMemoryInfo *bind_info,
@@ -962,7 +1028,8 @@ tu_android_get_wsi_memory(struct tu_device *dev,
     */
    if (tu_is_a5xx(device) &&
        ((pCreateInfo->usage & VK_IMAGE_USAGE_STORAGE_BIT) ||
-        (pCreateInfo->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) ||
+        ((pCreateInfo->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
+         !tu5_srgb_views_only(pCreateInfo)) ||
         !tu5_format_tileable(vk_format_to_pipe_format(image->vk.format))))
       image->force_linear_tile = true;
 
