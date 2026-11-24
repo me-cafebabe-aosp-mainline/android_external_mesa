@@ -1281,9 +1281,18 @@ tu_get_physical_device_properties_1_2(struct tu_physical_device *pdevice,
       };
    }
 
-   /* Adreno 5xx has not passed the conformance tests */
+   /* Adreno 5xx: the version of the conformance tests it is run with (that
+    * of Android 14), not one it was submitted with. It is to be a known
+    * one, of no older a version than that of the API (1.2): there are only
+    * those of 1.3 in that list.
+    */
    if (pdevice->info->chip == 5)
-      p->conformanceVersion = (VkConformanceVersion) {};
+      p->conformanceVersion = (VkConformanceVersion) {
+         .major = 1,
+         .minor = 3,
+         .subminor = 8,
+         .patch = 0,
+      };
 
    p->denormBehaviorIndependence =
       VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL;
