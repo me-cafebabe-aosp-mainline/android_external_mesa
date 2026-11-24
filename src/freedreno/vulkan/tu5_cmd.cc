@@ -4877,23 +4877,26 @@ tu5_emit_blend(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                    A5XX_RB_BLEND_CNTL_INDEPENDENT_BLEND |
                    A5XX_RB_BLEND_CNTL_SAMPLE_MASK(dyn->ms.sample_mask & 0xffff));
 
+   /* the signed ones through int32_t: a negative float made an unsigned
+    * integer is 0 on arm64
+    */
    const float *bc = dyn->cb.blend_constants;
    OUT_PKT4(cs, REG_A5XX_RB_BLEND_RED, 8);
    OUT_RING(cs, A5XX_RB_BLEND_RED_FLOAT(bc[0]) |
                    A5XX_RB_BLEND_RED_UINT(CLAMP(bc[0], 0.f, 1.f) * 0xff) |
-                   A5XX_RB_BLEND_RED_SINT(CLAMP(bc[0], -1.f, 1.f) * 0x7f));
+                   A5XX_RB_BLEND_RED_SINT((int32_t)(CLAMP(bc[0], -1.f, 1.f) * 0x7f)));
    OUT_RING(cs, A5XX_RB_BLEND_RED_F32(bc[0]));
    OUT_RING(cs, A5XX_RB_BLEND_GREEN_FLOAT(bc[1]) |
                    A5XX_RB_BLEND_GREEN_UINT(CLAMP(bc[1], 0.f, 1.f) * 0xff) |
-                   A5XX_RB_BLEND_GREEN_SINT(CLAMP(bc[1], -1.f, 1.f) * 0x7f));
+                   A5XX_RB_BLEND_GREEN_SINT((int32_t)(CLAMP(bc[1], -1.f, 1.f) * 0x7f)));
    OUT_RING(cs, A5XX_RB_BLEND_RED_F32(bc[1]));
    OUT_RING(cs, A5XX_RB_BLEND_BLUE_FLOAT(bc[2]) |
                    A5XX_RB_BLEND_BLUE_UINT(CLAMP(bc[2], 0.f, 1.f) * 0xff) |
-                   A5XX_RB_BLEND_BLUE_SINT(CLAMP(bc[2], -1.f, 1.f) * 0x7f));
+                   A5XX_RB_BLEND_BLUE_SINT((int32_t)(CLAMP(bc[2], -1.f, 1.f) * 0x7f)));
    OUT_RING(cs, A5XX_RB_BLEND_BLUE_F32(bc[2]));
    OUT_RING(cs, A5XX_RB_BLEND_ALPHA_FLOAT(bc[3]) |
                    A5XX_RB_BLEND_ALPHA_UINT(CLAMP(bc[3], 0.f, 1.f) * 0xff) |
-                   A5XX_RB_BLEND_ALPHA_SINT(CLAMP(bc[3], -1.f, 1.f) * 0x7f));
+                   A5XX_RB_BLEND_ALPHA_SINT((int32_t)(CLAMP(bc[3], -1.f, 1.f) * 0x7f)));
    OUT_RING(cs, A5XX_RB_BLEND_ALPHA_F32(bc[3]));
 
    uint32_t posz_regid = ir3_find_output_regid(fp, FRAG_RESULT_DEPTH);
