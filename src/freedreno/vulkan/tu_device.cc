@@ -1612,6 +1612,11 @@ tu_get_properties(struct tu_physical_device *pdevice,
     * TODO: storage buffers and storage images
     */
    if (pdevice->info->chip == 5) {
+      /* As in the stock driver: the 31 vec4 inputs of 124 components the
+       * fragment shader reads hang the GPU
+       * (dEQP-VK.pipeline.*.max_varyings.test_*_io_between_vertex_fragment).
+       */
+      props->maxFragmentInputComponents = 112;
       props->maxPerStageDescriptorSamplers = TU5_MAX_SAMPLERS;
       props->maxPerStageDescriptorSampledImages = TU5_MAX_TEXTURES;
       props->maxPerStageDescriptorUniformBuffers = TU5_MAX_UBOS - 2;
