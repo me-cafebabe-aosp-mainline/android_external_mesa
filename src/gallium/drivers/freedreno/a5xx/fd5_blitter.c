@@ -188,8 +188,10 @@ can_do_blit(const struct pipe_blit_info *info)
 }
 
 static void
-emit_setup(struct fd_ringbuffer *ring)
+emit_setup(struct fd_batch *batch, struct fd_ringbuffer *ring)
 {
+   const uint32_t hbb = (batch->ctx->screen->highest_bank_bit - 13) & 3;
+
    OUT_PKT4(ring, REG_A5XX_RB_RENDER_CNTL, 1);
    OUT_RING(ring, 0x00000008);
 
@@ -206,13 +208,13 @@ emit_setup(struct fd_ringbuffer *ring)
    OUT_RING(ring, A5XX_RB_CNTL_BYPASS);
 
    OUT_PKT4(ring, REG_A5XX_RB_MODE_CNTL, 1);
-   OUT_RING(ring, 0x00000004); /* RB_MODE_CNTL */
+   OUT_RING(ring, hbb << 1); /* RB_MODE_CNTL: the highest bank bit */
 
    OUT_PKT4(ring, REG_A5XX_SP_MODE_CNTL, 1);
    OUT_RING(ring, 0x0000000c); /* SP_MODE_CNTL */
 
    OUT_PKT4(ring, REG_A5XX_TPL1_MODE_CNTL, 1);
-   OUT_RING(ring, 0x00000344); /* TPL1_MODE_CNTL */
+   OUT_RING(ring, 0x00000244 | hbb << 7); /* TPL1_MODE_CNTL: the highest bank bit */
 
    OUT_PKT4(ring, REG_A5XX_HLSQ_MODE_CNTL, 1);
    OUT_RING(ring, 0x00000002); /* HLSQ_MODE_CNTL */
@@ -483,7 +485,7 @@ fd5_blitter_blit(struct fd_context *ctx,
 
    fd_batch_update_queries(batch);
 
-   emit_setup(batch->draw);
+   emit_setup(batch, batch->draw);
 
    if ((info->src.resource->target == PIPE_BUFFER) &&
        (info->dst.resource->target == PIPE_BUFFER)) {

@@ -2224,6 +2224,14 @@ tu5_program_emit(struct tu_cs *ring, struct tu5_program *emit)
 void
 tu5_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *ring)
 {
+   /* the highest bank bit UBWC is laid out by, as the kernel gives it to
+    * the display too (15 when it does not say, as a5xx always had)
+    */
+   const uint32_t kernel_hbb =
+      cmd->device->physical_device->ubwc_config.highest_bank_bit;
+   const uint32_t hbb =
+      ((kernel_hbb >= 13 && kernel_hbb <= 16 ? kernel_hbb : 15) - 13) & 3;
+
    /* the program state of the draws is to be written out again */
    cmd->state.a5xx_vs = cmd->state.a5xx_fs = NULL;
 
@@ -2283,7 +2291,7 @@ tu5_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *ring)
    OUT_RING(ring, 0x00000000); /* UNKNOWN_E293 */
 
    OUT_PKT4(ring, REG_A5XX_RB_MODE_CNTL, 1);
-   OUT_RING(ring, 0x00000044); /* RB_MODE_CNTL */
+   OUT_RING(ring, 0x00000040 | hbb << 1); /* RB_MODE_CNTL: the highest bank bit */
 
    OUT_PKT4(ring, REG_A5XX_RB_DBG_ECO_CNTL, 1);
    OUT_RING(ring, 0x00100000); /* RB_DBG_ECO_CNTL */
@@ -2312,7 +2320,7 @@ tu5_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *ring)
    }
 
    OUT_PKT4(ring, REG_A5XX_TPL1_MODE_CNTL, 1);
-   OUT_RING(ring, 0x00000544); /* TPL1_MODE_CNTL */
+   OUT_RING(ring, 0x00000444 | hbb << 7); /* TPL1_MODE_CNTL: the highest bank bit */
 
    OUT_PKT4(ring, REG_A5XX_HLSQ_TIMEOUT_THRESHOLD_0, 2);
    OUT_RING(ring, 0x00000080); /* HLSQ_TIMEOUT_THRESHOLD_0 */
