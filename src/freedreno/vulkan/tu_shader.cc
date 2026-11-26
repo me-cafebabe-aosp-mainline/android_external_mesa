@@ -4147,6 +4147,16 @@ tu_shader_create(struct tu_device *dev,
    shader->variant =
       ir3_shader_create_variant(ir3_shader, ir3_key, executable_info);
 
+   /* the compiler failed, e.g. a register allocation the hardware's limits
+    * leave no room for
+    */
+   if (!shader->variant) {
+      ir3_shader_destroy(ir3_shader);
+      vk_pipeline_cache_object_finish(&shader->base);
+      vk_free(&dev->vk.alloc, shader);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+
    if (ir3_exceeds_safe_constlen(shader->variant)) {
       struct ir3_shader_key safe_constlen_key = *ir3_key;
       safe_constlen_key.safe_constlen = true;
