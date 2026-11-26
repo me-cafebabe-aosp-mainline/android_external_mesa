@@ -208,7 +208,9 @@ ir3_context_init(struct ir3_compiler *compiler, struct ir3_shader *shader,
       nir_log_shaderi(ctx->s);
    }
 
-   ir3_ibo_mapping_init(&so->image_mapping, ctx->s->info.num_textures);
+   ir3_ibo_mapping_init(&so->image_mapping,
+                        MAX2(ctx->s->info.num_textures,
+                             so->shader_options.min_num_textures));
 
    return ctx;
 }

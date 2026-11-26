@@ -15,6 +15,8 @@
 #include "vk_nir_convert_ycbcr.h"
 #include "vk_pipeline.h"
 #include "vk_util.h"
+#include "nir/nir_format_convert.h"
+#include "nir/nir_builtin_builder.h"
 
 #include "ir3/ir3_compiler.h"
 #include "ir3/ir3_nir.h"
@@ -23,6 +25,7 @@
 #include "tu_lrz.h"
 #include "tu_pipeline.h"
 #include "tu_rmv.h"
+#include "tu5.h"
 #include "tu_sampler.h"
 #include "tu_subsampled_image.h"
 
@@ -323,6 +326,117 @@ lower_load_push_constant(struct tu_device *dev,
    nir_def_replace(&instr->def, load);
 }
 
+/* Adreno 5xx: the planes of the elements of a binding of combined image
+ * samplers with conversions, which are textures of their own: as many as
+ * its multi-planar formats have at most, 1 otherwise.
+ */
+static unsigned
+tu5_binding_planes(const struct tu_descriptor_set_layout *set_layout,
+                   const struct tu_descriptor_set_binding_layout *binding)
+{
+   const struct vk_ycbcr_conversion_state *ycbcr =
+      tu_immutable_ycbcr_samplers(set_layout, binding);
+   unsigned planes = 1;
+
+   if (!ycbcr)
+      return 1;
+
+   for (unsigned i = 0; i < binding->array_size; i++) {
+      if (vk_format_get_ycbcr_info(ycbcr[i].format))
+         planes = MAX2(planes, vk_format_get_plane_count(ycbcr[i].format));
+   }
+   return planes;
+}
+
+/* The first of the numbers of a binding in a shader for Adreno 5xx, one for
+ * each element of the binding (for each of its planes, see
+ * tu5_binding_planes()), given when first asked for.
+ */
+static unsigned
+tu5_desc_base(struct tu_shader *shader,
+              const struct tu_pipeline_layout *layout, unsigned set,
+              unsigned binding, enum tu5_desc_kind kind)
+{
+   const VkDescriptorType type = layout->set[set].layout->binding[binding].type;
+   const bool storage = kind == TU5_DESC_UBO &&
+                        (type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+                         type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC);
+
+   struct tu5_desc_map *map = shader->a5xx;
+   const struct tu_descriptor_set_binding_layout *binding_layout =
+      &layout->set[set].layout->binding[binding];
+
+   for (unsigned i = 0; i < map->num_bindings; i++) {
+      if (map->bindings[i].set == set && map->bindings[i].binding == binding &&
+          map->bindings[i].kind == kind)
+         return map->bindings[i].base;
+   }
+
+   struct tu5_desc_ref *refs = kind == TU5_DESC_TEXTURE ? map->tex :
+                               kind == TU5_DESC_SAMPLER ? map->samp :
+                               kind == TU5_DESC_UBO ? map->ubo :
+                               kind == TU5_DESC_SSBO ? map->ssbo : map->image;
+   unsigned max = kind == TU5_DESC_TEXTURE ? TU5_MAX_TEXTURES :
+                  kind == TU5_DESC_SAMPLER ? TU5_MAX_SAMPLERS :
+                  kind == TU5_DESC_UBO ? TU5_MAX_UBOS :
+                  kind == TU5_DESC_SSBO ? TU5_MAX_SSBOS : TU5_MAX_IMAGES;
+   unsigned base = map->count[kind];
+   const unsigned planes =
+      kind == TU5_DESC_TEXTURE
+         ? tu5_binding_planes(layout->set[set].layout, binding_layout) : 1;
+   unsigned count = binding_layout->array_size * planes;
+
+   if (base + count > max) {
+      mesa_loge("a5xx: too many descriptors of kind %u in a shader", kind);
+      return 0;
+   }
+
+   bool dynamic =
+      binding_layout->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+      binding_layout->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+   uint32_t offset = binding_layout->offset;
+
+   if (dynamic) {
+      offset = binding_layout->dynamic_offset_offset;
+      for (unsigned i = 0; i < set; i++) {
+         if (shader->dynamic_descriptor_sizes[i] < 0) {
+            /* TODO: sets the sizes of which are known at link time */
+            mesa_loge("a5xx: dynamic buffers with independent sets");
+            break;
+         }
+         offset += shader->dynamic_descriptor_sizes[i];
+      }
+   }
+
+   /* The sampler comes after the image, see
+    * write_combined_image_sampler_descriptor().
+    */
+   if (kind == TU5_DESC_SAMPLER &&
+       binding_layout->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+      offset += FDL6_TEX_CONST_DWORDS * 4;
+
+   for (unsigned i = 0; i < count; i++) {
+      refs[base + i] = (struct tu5_desc_ref) {
+         .set = (uint8_t)set,
+         .dynamic = dynamic,
+         .storage = storage,
+         .offset = (offset + (i / planes) * binding_layout->size) / 4 +
+                   TU5_YCBCR_PLANE_SLOT(i % planes) * FDL6_TEX_CONST_DWORDS,
+      };
+   }
+   map->count[kind] += count;
+
+   map->bindings[map->num_bindings].set = set;
+   map->bindings[map->num_bindings].kind = kind;
+   map->bindings[map->num_bindings].base = base;
+   map->bindings[map->num_bindings].binding = binding;
+   map->num_bindings++;
+
+   return base;
+}
+
+static nir_def *tu5_ibo_base(nir_builder *b, const struct tu_shader *shader);
+
 static void
 lower_vulkan_resource_index(struct tu_device *dev, nir_builder *b,
                             nir_intrinsic_instr *instr,
@@ -343,6 +457,35 @@ lower_vulkan_resource_index(struct tu_device *dev, nir_builder *b,
       return;
 
    shader->active_desc_sets |= 1u << set;
+
+   if (tu_is_a5xx(dev)) {
+      /* The number of the buffer in the shader, in the place of the index
+       * of the descriptor.
+       */
+      bool ubo =
+         binding_layout->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+         binding_layout->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+
+      /* There is no state for the storage buffers of the vertex shaders:
+       * these read theirs through pointers, as uniform buffers. See
+       * lower_ssbo_ubo_intrinsic().
+       */
+      const bool vs_ibo = shader->a5xx->vs_ibo;
+      if (b->shader->info.stage == MESA_SHADER_VERTEX && !vs_ibo)
+         ubo = true;
+
+      unsigned first = tu5_desc_base(shader, layout, set, binding,
+                                     ubo ? TU5_DESC_UBO : TU5_DESC_SSBO);
+
+      nir_def *index = nir_iadd_imm(b, vulkan_idx, first);
+      if (vs_ibo && !ubo)
+         index = nir_iadd(b, index, tu5_ibo_base(b, shader));
+      nir_def *def = nir_vec3(b, nir_imm_int(b, 0), index,
+                              nir_imm_int(b, 0));
+
+      nir_def_replace(&instr->def, def);
+      return;
+   }
 
    if (vk_descriptor_type_is_dynamic(binding_layout->type)) {
       int offset = 0;
@@ -425,7 +568,8 @@ lower_load_vulkan_descriptor(nir_builder *b, nir_intrinsic_instr *intrin)
 
 static bool
 lower_ssbo_ubo_intrinsic(struct tu_device *dev,
-                         nir_builder *b, nir_intrinsic_instr *intrin)
+                         nir_builder *b, nir_intrinsic_instr *intrin,
+                         const struct tu_shader *shader)
 {
    const nir_intrinsic_info *info = &nir_intrinsic_infos[intrin->intrinsic];
 
@@ -449,6 +593,50 @@ lower_ssbo_ubo_intrinsic(struct tu_device *dev,
 
    nir_scalar scalar_idx = nir_scalar_resolved(intrin->src[buffer_src].ssa, 0);
    nir_def *descriptor_idx = nir_channel(b, intrin->src[buffer_src].ssa, 1);
+
+   if (tu_is_a5xx(dev)) {
+      /* The buffers are numbered, see lower_vulkan_resource_index() */
+      const bool vs_ibo =
+         b->shader->info.stage == MESA_SHADER_VERTEX &&
+         shader->a5xx->vs_ibo;
+
+      if (b->shader->info.stage == MESA_SHADER_VERTEX && !vs_ibo &&
+          intrin->intrinsic == nir_intrinsic_load_ssbo) {
+         /* Read through the pointer, and never ahead of the draw as the
+          * constants are: what was written before the draw is to be seen.
+          */
+         nir_def *load =
+            nir_load_ubo(b, intrin->def.num_components, intrin->def.bit_size,
+                         descriptor_idx, intrin->src[1].ssa,
+                         .access = ACCESS_VOLATILE,
+                         .align_mul = nir_intrinsic_align_mul(intrin),
+                         .align_offset = nir_intrinsic_align_offset(intrin),
+                         .range_base = 0, .range = ~0);
+
+         nir_def_replace(&intrin->def, load);
+         return true;
+      }
+
+      if (b->shader->info.stage == MESA_SHADER_VERTEX && !vs_ibo &&
+          intrin->intrinsic != nir_intrinsic_load_ubo) {
+         /* TODO: the sizes of the storage buffers. The stores and the
+          * atomics are not a feature of the vertex shaders.
+          */
+         mesa_loge("a5xx: %s in a vertex shader not implemented",
+                   nir_intrinsic_infos[intrin->intrinsic].name);
+         if (info->has_dest) {
+            nir_def_replace(&intrin->def,
+                            nir_imm_zero(b, intrin->def.num_components,
+                                         intrin->def.bit_size));
+         } else {
+            nir_instr_remove(&intrin->instr);
+         }
+         return true;
+      }
+
+      nir_src_rewrite(&intrin->src[buffer_src], descriptor_idx);
+      return true;
+   }
 
    if (intrin->intrinsic == nir_intrinsic_load_ubo &&
        dev->instance->drirc.misc.allow_oob_indirect_ubo_loads) {
@@ -524,7 +712,7 @@ build_bindless(struct tu_device *dev, nir_builder *b,
                struct tu_shader *shader,
                const struct tu_pipeline_layout *layout,
                uint32_t read_only_input_attachments,
-               bool dynamic_renderpass)
+               bool dynamic_renderpass, unsigned plane = 0)
 {
    nir_variable *var = nir_deref_instr_get_variable(deref);
 
@@ -532,6 +720,31 @@ build_bindless(struct tu_device *dev, nir_builder *b,
    unsigned binding = var->data.binding;
    const struct tu_descriptor_set_binding_layout *bind_layout =
       &layout->set[set].layout->binding[binding];
+
+   if (tu_is_a5xx(dev)) {
+      /* The number of the texture or of the sampler in the shader. The input
+       * attachments are textures like the others, there being no tiles.
+       */
+      const bool is_sampler = combined_descriptor_offset == 1;
+      unsigned first =
+         tu5_desc_base(shader, layout, set, binding,
+                       is_sampler ? TU5_DESC_SAMPLER : TU5_DESC_TEXTURE);
+
+      shader->active_desc_sets |= 1u << set;
+
+      /* the textures of the planes of an element follow each other */
+      const unsigned planes =
+         is_sampler ? 1 : tu5_binding_planes(layout->set[set].layout,
+                                             bind_layout);
+      first += plane;
+
+      if (deref->deref_type == nir_deref_type_var)
+         return nir_imm_int(b, first);
+
+      assert(deref->deref_type == nir_deref_type_array);
+      return nir_iadd_imm(b, nir_imul_imm(b, deref->arr.index.ssa, planes),
+                          first);
+   }
 
    /* input attachments use non bindless workaround */
    if (bind_layout->type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT &&
@@ -675,12 +888,171 @@ lower_texel_buffers_to_image(nir_builder *b,
    }
 }
 
+/* Adreno 5xx: the loads and stores of storage images (and texel buffers)
+ * of a format LDIB reads wrong are of an unsigned integer format of as many
+ * bits, see tu5_storage_format(): pack the texels stored, unpack those
+ * loaded. A load that is to read the image as a texture (isam: readonly,
+ * at a constant index) is left alone, the texture descriptor having the
+ * format; one that is lowered is not to become such a load.
+ */
+static void
+tu5_lower_storage_format(nir_builder *b, nir_intrinsic_instr *instr)
+{
+   if (instr->intrinsic != nir_intrinsic_image_load &&
+       instr->intrinsic != nir_intrinsic_image_store)
+      return;
+
+   enum pipe_format format = nir_intrinsic_format(instr);
+   if (format == PIPE_FORMAT_NONE)
+      return;
+
+   enum pipe_format raw = tu5_storage_format(format);
+   if (raw == format)
+      return;
+
+   const bool wide = util_format_get_blocksizebits(format) == 64;
+
+   if (instr->intrinsic == nir_intrinsic_image_load) {
+      if ((nir_intrinsic_access(instr) & ACCESS_CAN_REORDER) &&
+          nir_src_is_const(instr->src[0]))
+         return;
+      if (instr->def.bit_size != 32)
+         return;
+
+      nir_intrinsic_set_access(instr, (enum gl_access_qualifier)(
+         nir_intrinsic_access(instr) & ~ACCESS_CAN_REORDER));
+      nir_alu_type type = nir_intrinsic_dest_type(instr);
+      nir_intrinsic_set_format(instr, raw);
+      nir_intrinsic_set_dest_type(instr, nir_type_uint32);
+
+      b->cursor = nir_after_instr(&instr->instr);
+      nir_def *texel = &instr->def;
+      nir_def *packed;
+      if (wide) {
+         packed = nir_vec2(b,
+            nir_ior(b, nir_channel(b, texel, 0),
+                    nir_ishl_imm(b, nir_channel(b, texel, 1), 16)),
+            nir_ior(b, nir_channel(b, texel, 2),
+                    nir_ishl_imm(b, nir_channel(b, texel, 3), 16)));
+      } else {
+         packed = nir_channel(b, texel, 0);
+      }
+
+      nir_def *rgba = nir_format_unpack_rgba(b, packed, format);
+      /* what the format has not, 0 and 1 of the type read */
+      const struct util_format_description *desc =
+         util_format_description(format);
+      nir_def *comps[4];
+      for (unsigned c = 0; c < 4; c++) {
+         if (c < desc->nr_channels)
+            comps[c] = nir_channel(b, rgba, c);
+         else if (nir_alu_type_get_base_type(type) == nir_type_float)
+            comps[c] = nir_imm_float(b, c == 3 ? 1.0 : 0.0);
+         else
+            comps[c] = nir_imm_int(b, c == 3 ? 1 : 0);
+      }
+      nir_def *value = nir_vec(b, comps, instr->def.num_components);
+      nir_def_rewrite_uses_after(&instr->def, value);
+   } else {
+      if (nir_src_bit_size(instr->src[3]) != 32)
+         return;
+
+      b->cursor = nir_before_instr(&instr->instr);
+      nir_def *packed = nir_format_pack_rgba(b, format, instr->src[3].ssa);
+      nir_def *texel;
+      if (wide) {
+         nir_def *w0 = nir_channel(b, packed, 0);
+         nir_def *w1 = nir_channel(b, packed, 1);
+         texel = nir_vec4(b, nir_iand_imm(b, w0, 0xffff),
+                          nir_ushr_imm(b, w0, 16),
+                          nir_iand_imm(b, w1, 0xffff),
+                          nir_ushr_imm(b, w1, 16));
+      } else {
+         nir_def *zero = nir_imm_int(b, 0);
+         texel = nir_vec4(b, nir_channel(b, packed, 0), zero, zero, zero);
+      }
+      nir_src_rewrite(&instr->src[3], texel);
+      nir_intrinsic_set_format(instr, raw);
+      nir_intrinsic_set_src_type(instr, nir_type_uint32);
+   }
+}
+
+/* Adreno 5xx: whether the shader reads (or does atomics on) the image of var */
+static bool
+tu5_image_var_is_read(nir_shader *nir, nir_variable *var)
+{
+   nir_foreach_function_impl (impl, nir) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            switch (intr->intrinsic) {
+            case nir_intrinsic_image_deref_store:
+            case nir_intrinsic_image_deref_size:
+            case nir_intrinsic_image_deref_samples:
+               continue;
+            default:
+               if (!nir_intrinsic_has_image_dim(intr))
+                  continue;
+               break;
+            }
+            nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+            if (deref && nir_deref_instr_get_variable(deref) == var)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
 static void
 lower_image_deref(struct tu_device *dev, nir_builder *b,
                   nir_intrinsic_instr *instr, struct tu_shader *shader,
                   const struct tu_pipeline_layout *layout)
 {
    nir_deref_instr *deref = nir_src_as_deref(instr->src[0]);
+
+   if (tu_is_a5xx(dev)) {
+      /* The number of the image in the shader, which is to be constant */
+      nir_variable *var = nir_deref_instr_get_variable(deref);
+      unsigned first = tu5_desc_base(shader, layout, var->data.descriptor_set,
+                                     var->data.binding, TU5_DESC_IMAGE);
+      /* What is written goes out as the format of the view, whatever the
+       * shader says (a rgba32ui image over a view of R32G32_UINT, which the
+       * image descriptor has as 16 bit channels for LDIB): the stores of an
+       * image that is not read, of a format the shader stores as it is, are
+       * made as those of no format, through the descriptor of the format of
+       * the view. Those of a format packed for LDIB (rg32f, rg8) are not:
+       * the packed stores are right for the views of that format.
+       */
+      bool real_format = var->data.image.format == PIPE_FORMAT_NONE;
+      if (!real_format && instr->intrinsic == nir_intrinsic_image_deref_store &&
+          tu5_storage_format(var->data.image.format) == var->data.image.format &&
+          !tu5_image_var_is_read(b->shader, var)) {
+         nir_intrinsic_set_format(instr, PIPE_FORMAT_NONE);
+         real_format = true;
+      }
+      if (real_format) {
+         unsigned count = layout->set[var->data.descriptor_set]
+                             .layout->binding[var->data.binding].array_size;
+         for (unsigned i = 0; i < count && first + i < TU5_MAX_IMAGES; i++)
+            shader->a5xx->image[first + i].real_format = true;
+      }
+      nir_def *index = deref->deref_type == nir_deref_type_var
+                          ? nir_imm_int(b, first)
+                          : nir_iadd_imm(b, deref->arr.index.ssa, first);
+      /* the slots of the vertex shader follow those of the fragment shader */
+      if (b->shader->info.stage == MESA_SHADER_VERTEX &&
+          shader->a5xx->vs_ibo)
+         index = nir_iadd(b, index, tu5_ibo_base(b, shader));
+
+      shader->active_desc_sets |= 1u << var->data.descriptor_set;
+      nir_rewrite_image_intrinsic(instr, index, nir_image_intrinsic_type_default);
+      tu5_lower_storage_format(b, instr);
+      return;
+   }
+
    nir_def *bindless = build_bindless(dev, b, deref, 0, shader, layout, 0, false);
    nir_rewrite_image_intrinsic(instr, bindless,
                                nir_image_intrinsic_type_bindless);
@@ -723,7 +1095,7 @@ lower_intrinsic(nir_builder *b, nir_intrinsic_instr *instr,
    case nir_intrinsic_ssbo_atomic:
    case nir_intrinsic_ssbo_atomic_swap:
    case nir_intrinsic_get_ssbo_size:
-      return lower_ssbo_ubo_intrinsic(dev, b, instr);
+      return lower_ssbo_ubo_intrinsic(dev, b, instr, shader);
 
    case nir_intrinsic_image_deref_load:
    case nir_intrinsic_image_deref_sparse_load:
@@ -939,7 +1311,8 @@ lower_tex_immutable(struct tu_device *dev,
 
    const struct vk_ycbcr_conversion_state *ycbcr_samplers =
       tu_immutable_ycbcr_samplers(set_layout, binding);
-   if (ycbcr_samplers) {
+   /* Adreno 5xx samples the planes one by one, see tu5_lower_ycbcr() */
+   if (ycbcr_samplers && !tu_is_a5xx(dev)) {
       const struct vk_ycbcr_conversion_state *ycbcr_sampler = ycbcr_samplers + array_index;
       lower_tex_ycbcr(ycbcr_sampler, builder, tex);
    }
@@ -984,6 +1357,16 @@ lower_tex_impl(nir_builder *b, nir_tex_instr *tex, struct tu_device *dev,
           uint32_t read_only_input_attachments, bool dynamic_renderpass,
           bool ref)
 {
+   /* Adreno 5xx samples the planes one by one, see tu5_lower_ycbcr() */
+   unsigned plane = 0;
+   if (tu_is_a5xx(dev) && !ref) {
+      int plane_src_idx = nir_tex_instr_src_index(tex, nir_tex_src_plane);
+      if (plane_src_idx >= 0) {
+         plane = nir_src_as_uint(tex->src[plane_src_idx].src);
+         nir_tex_instr_remove_src(tex, plane_src_idx);
+      }
+   }
+
    int sampler_src_idx = nir_tex_instr_src_index(tex, ref ? nir_tex_src_sampler_2_deref : nir_tex_src_sampler_deref);
    if (sampler_src_idx >= 0) {
       nir_deref_instr *deref = nir_src_as_deref(tex->src[sampler_src_idx].src);
@@ -991,7 +1374,9 @@ lower_tex_impl(nir_builder *b, nir_tex_instr *tex, struct tu_device *dev,
                                          read_only_input_attachments,
                                          dynamic_renderpass);
       nir_src_rewrite(&tex->src[sampler_src_idx].src, bindless);
-      tex->src[sampler_src_idx].src_type = ref ? nir_tex_src_sampler_2_handle : nir_tex_src_sampler_handle;
+      tex->src[sampler_src_idx].src_type =
+         ref ? nir_tex_src_sampler_2_handle :
+         tu_is_a5xx(dev) ? nir_tex_src_sampler_offset : nir_tex_src_sampler_handle;
    }
 
    int tex_src_idx = nir_tex_instr_src_index(tex, ref ? nir_tex_src_texture_2_deref : nir_tex_src_texture_deref);
@@ -999,12 +1384,14 @@ lower_tex_impl(nir_builder *b, nir_tex_instr *tex, struct tu_device *dev,
       nir_deref_instr *deref = nir_src_as_deref(tex->src[tex_src_idx].src);
       nir_def *bindless = build_bindless(dev, b, deref, 0, shader, layout,
                                          read_only_input_attachments,
-                                         dynamic_renderpass);
+                                         dynamic_renderpass, plane);
       nir_src_rewrite(&tex->src[tex_src_idx].src, bindless);
       tex->src[tex_src_idx].src_type = ref ? nir_tex_src_texture_2_handle : nir_tex_src_texture_handle;
 
-      /* for the input attachment case: */
-      if (!nir_def_is_intrinsic(bindless))
+      /* for the input attachment case, and for Adreno 5xx, which numbers
+       * the textures: an index that is a push constant is an intrinsic too
+       */
+      if (!nir_def_is_intrinsic(bindless) || tu_is_a5xx(dev))
          tex->src[tex_src_idx].src_type = nir_tex_src_texture_offset;
    }
 
@@ -1031,6 +1418,25 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct tu_device *dev,
       lower_tex_impl(b, tex, dev, shader, layout, read_only_input_attachments, dynamic_renderpass, false);
    }
 
+   /* Adreno 5xx: which texture the sampler samples, when both are known */
+   const int sampler_src_idx =
+      nir_tex_instr_src_index(tex, nir_tex_src_sampler_offset);
+   const int tex_src_idx =
+      nir_tex_instr_src_index(tex, nir_tex_src_texture_offset);
+   if (tu_is_a5xx(dev) && sampler_src_idx >= 0 && tex_src_idx >= 0) {
+      nir_src *samp = &tex->src[sampler_src_idx].src;
+      nir_src *texture = &tex->src[tex_src_idx].src;
+
+      if (nir_src_is_const(*samp) && nir_src_is_const(*texture)) {
+         unsigned s = nir_src_as_uint(*samp);
+         unsigned t = nir_src_as_uint(*texture) + 1;
+         uint8_t *pair = &shader->a5xx->samp_tex[s];
+
+         if (s < TU5_MAX_SAMPLERS && t < 0xff)
+            *pair = (*pair == 0 || *pair == t) ? t : 0xff;
+      }
+   }
+
    return true;
 }
 
@@ -1042,6 +1448,87 @@ struct lower_instr_params {
    bool dynamic_renderpass;
    struct ir3_const_allocations *const_allocs;
 };
+
+/* Adreno 5xx: gl_FragCoord is at the center of the pixel even when the
+ * shading is per sample, where its x and y are those of the sample: the
+ * pixel plus the position of the sample in it.
+ */
+static bool
+tu5_lower_frag_coord_sample(nir_builder *b, nir_intrinsic_instr *intr,
+                            void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_frag_coord)
+      return false;
+
+   b->cursor = nir_after_instr(&intr->instr);
+   nir_def *xy = nir_fadd(b, nir_ffloor(b, nir_channels(b, &intr->def, 0x3)),
+                          nir_load_sample_pos(b));
+   nir_def *res = nir_vec4(b, nir_channel(b, xy, 0), nir_channel(b, xy, 1),
+                           nir_channel(b, &intr->def, 2),
+                           nir_channel(b, &intr->def, 3));
+   nir_def_rewrite_uses_after(&intr->def, res);
+   return true;
+}
+
+/* Adreno 5xx: the texel fetches of 3D textures out of their bounds read
+ * texels in them (dEQP-VK.robustness.image_robustness.*.sampled_image.*.3d),
+ * zero is what robustImageAccess has them read: checked in the shader.
+ */
+static bool
+tu5_lower_txf_3d_bounds(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_tex)
+      return false;
+
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   if (tex->op != nir_texop_txf || tex->sampler_dim != GLSL_SAMPLER_DIM_3D)
+      return false;
+
+   int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (coord_idx < 0)
+      return false;
+
+   b->cursor = nir_before_instr(instr);
+
+   nir_def *coord = tex->src[coord_idx].src.ssa;
+   int offset_idx = nir_tex_instr_src_index(tex, nir_tex_src_offset);
+   if (offset_idx >= 0)
+      coord = nir_iadd(b, coord, tex->src[offset_idx].src.ssa);
+
+   nir_def *size = nir_build_texture_query(b, tex, nir_texop_txs, 3,
+                                           nir_type_int32, false, true);
+   int lod_idx = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+   if (lod_idx >= 0) {
+      nir_def *lod = tex->src[lod_idx].src.ssa;
+      size = nir_imax(b, nir_ishr(b, size, lod), nir_imm_int(b, 1));
+   }
+
+   nir_def *in = nir_ball(b, nir_iand(b, nir_ige_imm(b, coord, 0),
+                                      nir_ilt(b, coord, size)));
+
+   b->cursor = nir_after_instr(instr);
+   nir_def *res = nir_bcsel(b, in, &tex->def,
+                            nir_imm_zero(b, tex->def.num_components,
+                                         tex->def.bit_size));
+   nir_def_rewrite_uses_after(&tex->def, res);
+   return true;
+}
+
+/* Adreno 5xx, which has no multi-planar formats: the conversion of the
+ * immutable sampler of a binding, for nir_vk_lower_ycbcr_tex()
+ */
+static const struct vk_ycbcr_conversion_state *
+tu5_lookup_ycbcr(const void *data, uint32_t set, uint32_t binding,
+                 uint32_t array_index)
+{
+   const struct tu_pipeline_layout *layout =
+      (const struct tu_pipeline_layout *) data;
+   const struct tu_descriptor_set_layout *set_layout = layout->set[set].layout;
+   const struct vk_ycbcr_conversion_state *ycbcr =
+      tu_immutable_ycbcr_samplers(set_layout, &set_layout->binding[binding]);
+
+   return ycbcr ? &ycbcr[array_index] : NULL;
+}
 
 static bool
 lower_instr(nir_builder *b, nir_instr *instr, void *cb_data)
@@ -1215,6 +1702,146 @@ shader_uses_push_consts(nir_shader *shader)
    return false;
 }
 
+/* Adreno 5xx draws the views one after the other, the index of the view
+ * being a constant of the shaders for each.
+ */
+static bool
+tu5_lower_view_index(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
+{
+   const uint32_t *loc = (const uint32_t *)data;
+
+   if (intrin->intrinsic != nir_intrinsic_load_view_index)
+      return false;
+
+   b->cursor = nir_before_instr(&intrin->instr);
+   nir_def_replace(&intrin->def,
+                   nir_load_const_ir3(b, 1, 32, nir_imm_int(b, 0),
+                                      .base = *loc));
+   return true;
+}
+
+/* Adreno 5xx: a vertex shader that writes storage buffers, or uses images,
+ * goes through the storage state, which it shares with the fragment shader.
+ */
+static bool
+tu5_vs_uses_ibo(nir_shader *shader)
+{
+   if (shader->info.stage != MESA_SHADER_VERTEX)
+      return false;
+
+   nir_foreach_function_impl (impl, shader) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+            case nir_intrinsic_store_ssbo:
+            case nir_intrinsic_ssbo_atomic:
+            case nir_intrinsic_ssbo_atomic_swap:
+            case nir_intrinsic_get_ssbo_size:
+            case nir_intrinsic_image_deref_load:
+            case nir_intrinsic_image_deref_store:
+            case nir_intrinsic_image_deref_atomic:
+            case nir_intrinsic_image_deref_atomic_swap:
+            case nir_intrinsic_image_deref_size:
+            case nir_intrinsic_image_deref_samples:
+               return true;
+            default:
+               break;
+            }
+         }
+      }
+   }
+   return false;
+}
+
+/* The slots of the storage buffers and images a vertex shader that goes
+ * through the storage state takes: the elements of the bindings it uses,
+ * which tu5_desc_base() numbers.
+ */
+static unsigned
+tu5_vs_ibo_count(nir_shader *shader, const struct tu_pipeline_layout *layout)
+{
+   struct { unsigned set, binding; } seen[TU5_GFX_IBO_SLOTS];
+   unsigned num_seen = 0, count = 0;
+
+   nir_foreach_function_impl (impl, shader) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+
+            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+            unsigned set, binding;
+
+            switch (intrin->intrinsic) {
+            case nir_intrinsic_vulkan_resource_index: {
+               VkDescriptorType type =
+                  (VkDescriptorType) nir_intrinsic_desc_type(intrin);
+               if (type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER &&
+                   type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
+                  continue;
+               set = nir_intrinsic_desc_set(intrin);
+               binding = nir_intrinsic_binding(intrin);
+               break;
+            }
+            case nir_intrinsic_image_deref_load:
+            case nir_intrinsic_image_deref_store:
+            case nir_intrinsic_image_deref_atomic:
+            case nir_intrinsic_image_deref_atomic_swap:
+            case nir_intrinsic_image_deref_size:
+            case nir_intrinsic_image_deref_samples: {
+               nir_variable *var = nir_deref_instr_get_variable(
+                  nir_src_as_deref(intrin->src[0]));
+               set = var->data.descriptor_set;
+               binding = var->data.binding;
+               break;
+            }
+            default:
+               continue;
+            }
+
+            bool found = false;
+            for (unsigned i = 0; i < num_seen; i++)
+               found |= seen[i].set == set && seen[i].binding == binding;
+            if (found || num_seen == ARRAY_SIZE(seen))
+               continue;
+
+            seen[num_seen].set = set;
+            seen[num_seen].binding = binding;
+            num_seen++;
+            count += layout->set[set].layout->binding[binding].array_size;
+         }
+      }
+   }
+   return count;
+}
+
+/* The first slot of the vertex shader, see tu5_desc_map::vs_ibo_base: a
+ * constant, for ir3 to find the sizes of the images
+ */
+static nir_def *
+tu5_ibo_base(nir_builder *b, const struct tu_shader *shader)
+{
+   return nir_imm_int(b, shader->a5xx->vs_ibo_base);
+}
+
+static bool
+tu5_uses_view_index(nir_shader *shader)
+{
+   nir_foreach_function_impl (impl, shader) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic ==
+                   nir_intrinsic_load_view_index)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
 static bool
 tu_lower_io(nir_shader *shader, struct tu_device *dev,
             struct tu_shader *tu_shader,
@@ -1272,6 +1899,28 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
 
       ir3_const_alloc(const_allocs, IR3_CONST_ALLOC_PUSH_CONSTS,
                       push_consts_vec4, offset_align_vec4);
+   }
+
+   if (tu_is_a5xx(dev))
+      tu_shader->a5xx->vs_ibo = tu5_vs_uses_ibo(shader);
+   if (tu_is_a5xx(dev) && tu_shader->a5xx->vs_ibo) {
+      unsigned count = tu5_vs_ibo_count(shader, layout);
+      if (count > TU5_GFX_IBO_SLOTS)
+         mesa_loge("a5xx: %u storage slots in a vertex shader", count);
+      tu_shader->a5xx->vs_ibo_base =
+         TU5_GFX_IBO_SLOTS - MIN2(count, TU5_GFX_IBO_SLOTS);
+   }
+
+   if (tu_is_a5xx(dev))
+      tu_shader->a5xx->view_loc = ~0u;
+   if (tu_is_a5xx(dev) && tu5_uses_view_index(shader)) {
+      ir3_const_alloc(const_allocs, TU5_CONST_ALLOC_VIEW_INDEX,
+                      dev->compiler->const_upload_unit, 1);
+      tu_shader->a5xx->view_loc =
+         const_allocs->consts[TU5_CONST_ALLOC_VIEW_INDEX].offset_vec4 * 4;
+      nir_shader_intrinsics_pass(shader, tu5_lower_view_index,
+                                 nir_metadata_control_flow,
+                                 &tu_shader->a5xx->view_loc);
    }
 
    bool unknown_dynamic_size = false;
@@ -1393,10 +2042,36 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
                                                &params);
    }
 
+   /* Adreno 5xx: the planes sampled one by one, then put together and
+    * converted, see TU5_YCBCR_PLANE_SLOT
+    */
+   if (tu_is_a5xx(dev)) {
+      progress |= nir_vk_lower_ycbcr_tex(shader, tu5_lookup_ycbcr, layout);
+      progress |= nir_shader_instructions_pass(shader, tu5_lower_txf_3d_bounds,
+                                               nir_metadata_control_flow,
+                                               NULL);
+   }
+
    progress |= nir_shader_instructions_pass(shader,
                                             lower_instr,
                                             nir_metadata_none,
                                             &params);
+
+   /* The pointers to the uniform buffers are constants of the shader */
+   if (tu_is_a5xx(dev)) {
+      shader->info.num_ubos = tu_shader->a5xx->count[TU5_DESC_UBO];
+      shader->info.num_ssbos = tu_shader->a5xx->count[TU5_DESC_SSBO];
+      shader->info.num_images = tu_shader->a5xx->count[TU5_DESC_IMAGE];
+
+      /* The variables of the textures are kept, for the compiler to count
+       * them and to number what it reads the images through after them.
+       */
+      if (progress)
+         nir_opt_dce(shader);
+      nir_remove_dead_variables(shader, nir_var_mem_ubo | nir_var_mem_ssbo,
+                                NULL);
+      return progress;
+   }
 
    /* Remove now-unused variables so that when we gather the shader info later
     * they won't be counted.
@@ -2994,6 +3669,12 @@ tu_upload_shader(struct tu_device *dev,
 
    uint64_t iova = tu_upload_variant(&shader->cs, v);
    uint64_t binning_iova = tu_upload_variant(&shader->cs, binning);
+
+   shader->binary_iova = iova;
+   shader->binning_iova = binning_iova;
+   shader->pvtmem.iova = pvtmem_config.iova;
+   shader->pvtmem.per_fiber_size = pvtmem_config.per_fiber_size;
+   shader->pvtmem.per_sp_size = pvtmem_config.per_sp_size;
    uint64_t safe_const_iova = tu_upload_variant(&shader->cs, safe_const);
    uint64_t safe_const_binning_iova = tu_upload_variant(&shader->cs, safe_const_binning);
 
@@ -3091,10 +3772,14 @@ tu_shader_init(struct tu_device *dev, const void *key_data, size_t key_size)
    VK_MULTIALLOC(ma);
    VK_MULTIALLOC_DECL(&ma, struct tu_shader, shader, 1);
    VK_MULTIALLOC_DECL_SIZE(&ma, char, obj_key_data, key_size);
+   VK_MULTIALLOC_DECL(&ma, struct tu5_desc_map, a5xx_map,
+                      tu_is_a5xx(dev) ? 1 : 0);
 
    if (!vk_multialloc_zalloc(&ma, &dev->vk.alloc,
                              VK_SYSTEM_ALLOCATION_SCOPE_DEVICE))
       return NULL;
+
+   shader->a5xx = tu_is_a5xx(dev) ? a5xx_map : NULL;
 
    if (key_size > 0)
       memcpy(obj_key_data, key_data, key_size);
@@ -3118,6 +3803,9 @@ tu_shader_serialize(struct vk_pipeline_cache_object *object,
       container_of(object, struct tu_shader, base);
 
    blob_write_bytes(blob, &shader->const_state, sizeof(shader->const_state));
+   if (shader->a5xx)
+      blob_write_bytes(blob, shader->a5xx,
+                       sizeof(*shader->a5xx));
    blob_write_bytes(blob, &shader->dynamic_descriptor_sizes,
                     sizeof(shader->dynamic_descriptor_sizes));
    blob_write_uint32(blob, shader->view_mask);
@@ -3164,6 +3852,8 @@ tu_shader_deserialize(struct vk_pipeline_cache *cache,
       return NULL;
 
    blob_copy_bytes(blob, &shader->const_state, sizeof(shader->const_state));
+   if (shader->a5xx)
+      blob_copy_bytes(blob, shader->a5xx, sizeof(*shader->a5xx));
    blob_copy_bytes(blob, &shader->dynamic_descriptor_sizes,
                    sizeof(shader->dynamic_descriptor_sizes));
    shader->view_mask = blob_read_uint32(blob);
@@ -3210,6 +3900,7 @@ tu_lower_nir(struct tu_device *dev,
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       const nir_input_attachment_options att_options = {
+
          /* When using multiview rendering, we must use
           * gl_ViewIndex as the layer id to pass to the texture
           * sampling function. gl_Layer doesn't work when
@@ -3228,7 +3919,8 @@ tu_lower_nir(struct tu_device *dev,
       const nir_lower_sysvals_to_varyings_options sysval_options = {
          .point_coord = true,
          .layer_id = true,
-         .view_index = true,
+         /* Adreno 5xx: a constant, see tu5_lower_view_index() */
+         .view_index = !tu_is_a5xx(dev),
       };
       NIR_PASS(_, nir, nir_lower_sysvals_to_varyings, &sysval_options);
    }
@@ -3269,7 +3961,11 @@ tu_lower_nir(struct tu_device *dev,
    bool is_last_stage =
     (nir->info.stage == MESA_SHADER_VERTEX && !ir3_key->has_gs && !ir3_key->tessellation);
 
-   if (nir->info.stage == MESA_SHADER_VERTEX && key->multiview_mask)
+   /* Adreno 5xx draws the views one after the other, see
+    * tu5_lower_view_index()
+    */
+   if (nir->info.stage == MESA_SHADER_VERTEX && key->multiview_mask &&
+       !tu_is_a5xx(dev))
       tu_nir_lower_multiview(nir, key->multiview_mask, dev, is_last_stage);
    if (nir->info.stage == MESA_SHADER_GEOMETRY)
       nir->info.view_mask = key->multiview_mask;
@@ -3283,6 +3979,31 @@ tu_lower_nir(struct tu_device *dev,
          if (!var->data.centroid)
             var->data.sample = true;
       }
+   }
+
+   /* Adreno 5xx: a vertex shader that writes no position hangs the GPU
+    * (dEQP-VK.pipeline.*.no_position.*.v0): it writes zeroes, the position
+    * being undefined then.
+    */
+   if (nir->info.stage == MESA_SHADER_VERTEX && tu_is_a5xx(dev) &&
+       !nir_find_variable_with_location(nir, nir_var_shader_out,
+                                        VARYING_SLOT_POS)) {
+      nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+      nir_builder b = nir_builder_at(nir_after_impl(impl));
+      nir_variable *pos =
+         nir_create_variable_with_location(nir, nir_var_shader_out,
+                                           VARYING_SLOT_POS,
+                                           glsl_vec4_type());
+      nir_store_var(&b, pos, nir_imm_vec4(&b, 0, 0, 0, 0), 0xf);
+      nir_progress(true, impl, nir_metadata_control_flow);
+   }
+
+   if (nir->info.stage == MESA_SHADER_FRAGMENT && tu_is_a5xx(dev)) {
+      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+      if (key->force_sample_interp || nir->info.fs.uses_sample_shading)
+         NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+                  tu5_lower_frag_coord_sample, nir_metadata_control_flow,
+                  NULL);
    }
 
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,
@@ -3427,6 +4148,8 @@ tu_shader_create(struct tu_device *dev,
       .push_consts_base = shader->const_state.push_consts.lo_dwords,
       .push_consts_dwords = shader->const_state.push_consts.dwords,
       .const_allocs = const_allocs,
+      .min_num_textures = tu_is_a5xx(dev) ?
+         shader->a5xx->count[TU5_DESC_TEXTURE] : 0,
       .nir_options = nir_options,
    };
 
@@ -3435,6 +4158,16 @@ tu_shader_create(struct tu_device *dev,
 
    shader->variant =
       ir3_shader_create_variant(ir3_shader, ir3_key, executable_info);
+
+   /* the compiler failed, e.g. a register allocation the hardware's limits
+    * leave no room for
+    */
+   if (!shader->variant) {
+      ir3_shader_destroy(ir3_shader);
+      vk_pipeline_cache_object_finish(&shader->base);
+      vk_free(&dev->vk.alloc, shader);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
 
    if (ir3_exceeds_safe_constlen(shader->variant)) {
       struct ir3_shader_key safe_constlen_key = *ir3_key;
@@ -3619,6 +4352,13 @@ tu_compile_shaders(struct tu_device *device,
 
    if (nir[MESA_SHADER_GEOMETRY])
       ir3_key.has_gs = true;
+
+   /* Adreno 5xx: the sample and centroid barycentrics are the pixel ones
+    * without it (ir3 emit_intrinsic_barycentric()); they are those of the
+    * pixel center with a single sample anyway.
+    */
+   if (tu_is_a5xx(device))
+      ir3_key.msaa = true;
 
    if (nir_initial_disasm) {
       for (mesa_shader_stage stage = MESA_SHADER_VERTEX;

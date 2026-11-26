@@ -192,6 +192,12 @@ emit_intrinsic_atomic_ssbo(struct ir3_context *ctx, nir_intrinsic_instr *intr)
    atomic->barrier_class = IR3_BARRIER_BUFFER_W;
    atomic->barrier_conflict = IR3_BARRIER_BUFFER_R | IR3_BARRIER_BUFFER_W;
 
+   /* a5xx returns the old value in the register of the dword offset, as
+    * the blob has it (see emit_intrinsic_atomic_shared())
+    */
+   if (ctx->compiler->gen == 5)
+      ir3_reg_tie(atomic->dsts[0], atomic->srcs[2]);
+
    /* even if nothing consume the result, we can't DCE the instruction: */
    array_insert(ctx->block, ctx->block->keeps, atomic);
 
@@ -294,6 +300,13 @@ emit_intrinsic_load_image(struct ir3_context *ctx, nir_intrinsic_instr *intr,
       }
    }
    ldib->dsts[0]->wrmask = MASK(intr->num_components);
+   /* a5xx: LDIB writes the four components of the texel whatever is asked
+    * of it (the blob always has it load four): a load of one component, as
+    * those of imageAtomicLoad() are, wrote over the three registers after
+    * its own.
+    */
+   if (ctx->compiler->gen == 5)
+      ldib->dsts[0]->wrmask = MASK(4);
    ldib->cat6.iim_val = ncomp;
    ldib->cat6.d = ncoords;
    ldib->cat6.type = ir3_get_type_for_image_intrinsic(intr);

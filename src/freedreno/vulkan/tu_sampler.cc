@@ -11,6 +11,7 @@
 
 #include "tu_device.h"
 #include "tu_util.h"
+#include "tu5.h"
 
 template <chip CHIP>
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -79,12 +80,21 @@ tu_CreateSampler(VkDevice _device,
          color.uint32[1] = color.uint32[0];
       }
 
-      tu6_pack_border_color(
-         &device->global_bo_map->bcolor[border_color_index], &color,
-         pCreateInfo->borderColor == VK_BORDER_COLOR_INT_CUSTOM_EXT);
+      if (tu_is_a5xx(device)) {
+         tu5_pack_border_color_format(
+            &device->global_bo_map->bcolor[border_color_index], &color,
+            pCreateInfo->borderColor == VK_BORDER_COLOR_INT_CUSTOM_EXT,
+            sampler->vk.format);
+      } else {
+         tu6_pack_border_color(
+            &device->global_bo_map->bcolor[border_color_index], &color,
+            pCreateInfo->borderColor == VK_BORDER_COLOR_INT_CUSTOM_EXT);
+      }
       border_color = border_color_index + TU_BORDER_COLOR_BUILTIN;
-   } else if (sampler->vk.format != VK_FORMAT_UNDEFINED ||
-              device->instance->drirc.misc.enable_fast_border_color_for_undefined_formats) {
+   } else if (!tu_is_a5xx(device) &&
+              (sampler->vk.format != VK_FORMAT_UNDEFINED ||
+               device->instance->drirc.misc.enable_fast_border_color_for_undefined_formats)) {
+      /* not on Adreno 5xx, which has no fast border colors */
       fast_border_color_enable = true;
       switch (pCreateInfo->borderColor) {
          case VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK:

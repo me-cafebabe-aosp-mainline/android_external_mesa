@@ -63,6 +63,8 @@ libtu_files = files(
   'tu_subsampled_image.cc',
   'tu_tile_config.cc',
   'tu_util.cc',
+  'tu5_format.c',
+  'tu5_cmd.cc',
 )
 
 libtu_files += custom_target(

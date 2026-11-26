@@ -26,6 +26,7 @@
 #include "tu_cs.h"
 #include "tu_descriptor_set.h"
 #include "tu_device.h"
+#include "tu5.h"
 #include "tu_formats.h"
 #include "tu_lrz.h"
 #include "tu_rmv.h"
@@ -188,6 +189,7 @@ tu_image_view_init(struct tu_device *device,
    assert(iview->vk.format != VK_FORMAT_UNDEFINED);
 
    iview->image = image;
+   iview->a5xx_planes = 0;
 
    const struct fdl_layout *layouts[3];
 
@@ -281,6 +283,34 @@ tu_image_view_init(struct tu_device *device,
 
    TU_CALLX(device, fdl6_view_init)(&iview->view, layouts, &args, device->use_z24uint_s8uint);
 
+   if (tu_is_a5xx(device) && aspect_mask == VK_IMAGE_ASPECT_COLOR_BIT &&
+       vk_format_get_plane_count(iview->vk.format) > 1) {
+      /* One descriptor for each plane, in its own format: the shader puts
+       * the components together and converts them (nir_vk_lower_ycbcr_tex),
+       * the swizzles of the conversion included.
+       */
+      static const unsigned char identity[4] = {
+         PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y, PIPE_SWIZZLE_Z, PIPE_SWIZZLE_W,
+      };
+
+      iview->a5xx_planes = vk_format_get_plane_count(iview->vk.format);
+      for (unsigned p = 0; p < iview->a5xx_planes; p++) {
+         tu5_image_view_descriptor(
+            p ? iview->a5xx_plane_descriptor[p - 1] : iview->view.descriptor,
+            image, p, tu6_plane_format(iview->vk.format, p), range,
+            pCreateInfo->viewType, identity);
+      }
+   } else if (tu_is_a5xx(device)) {
+      tu5_image_view_descriptor(iview->view.descriptor, image,
+                                tu6_plane_index(image->vk.format, aspect_mask),
+                                args.format, range, pCreateInfo->viewType,
+                                args.swiz);
+      tu5_image_view_storage_descriptor(
+         iview->view.storage_descriptor, image,
+         tu6_plane_index(image->vk.format, aspect_mask), args.format, range,
+         pCreateInfo->viewType);
+   }
+
    if (image->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
       VkImageAspectFlags other_aspect =
          (aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT) ?
@@ -340,6 +370,20 @@ ubwc_possible(struct tu_device *device,
     */
    if (flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT)
       return false;
+   /* Adreno 5xx: the colour formats of 32 bits a texel, not snorm (copied
+    * as unorm) nor float (see tu5_aspect_copy_format())
+    */
+   if (info->chip == 5) {
+      enum pipe_format f = vk_format_to_pipe_format(format);
+      return type == VK_IMAGE_TYPE_2D && samples == VK_SAMPLE_COUNT_1_BIT &&
+             vk_format_get_plane_count(format) == 1 &&
+             !vk_format_is_depth_or_stencil(format) &&
+             !vk_format_is_compressed(format) &&
+             util_format_get_blocksize(f) == 4 &&
+             tu5_format_color_supported(f) &&
+             !util_format_is_snorm(f) && !util_format_is_float(f) &&
+             !(usage & VK_IMAGE_USAGE_STORAGE_BIT);
+   }
 
    /* no UBWC with compressed formats, E5B9G9R9, S8_UINT
     * (S8_UINT because separate stencil doesn't have UBWC-enable bit)
@@ -517,6 +561,29 @@ format_list_ubwc_possible(struct tu_device *dev,
    return true;
 }
 
+/* Adreno 5xx: whether a mutable image is viewed in nothing but its format
+ * and its sRGB (or UNORM) twin, as the mutable swapchains of Android are,
+ * which tiling (and UBWC) do not mind
+ */
+static bool
+tu5_srgb_views_only(const VkImageCreateInfo *pCreateInfo)
+{
+   const VkImageFormatListCreateInfo *fmt_list =
+      vk_find_struct_const(pCreateInfo->pNext, IMAGE_FORMAT_LIST_CREATE_INFO);
+   enum pipe_format f =
+      util_format_linear(vk_format_to_pipe_format(pCreateInfo->format));
+
+   if (!fmt_list || !fmt_list->viewFormatCount)
+      return false;
+
+   for (uint32_t i = 0; i < fmt_list->viewFormatCount; i++) {
+      if (util_format_linear(vk_format_to_pipe_format(
+             fmt_list->pViewFormats[i])) != f)
+         return false;
+   }
+   return true;
+}
+
 template <chip CHIP>
 VkResult
 tu_image_init(struct tu_device *device, struct tu_image *image,
@@ -539,8 +606,22 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
       force_linear_tile = true;
    }
 
-   /* No sense in tiling a 1D image, you'd just waste space and cache locality. */
-   if (pCreateInfo->imageType == VK_IMAGE_TYPE_1D) {
+   /* Adreno 5xx: the shaders find the texels of the storage images by
+    * themselves, row after row. And not all the formats can be tiled, nor
+    * can those the image may be viewed as when its format is mutable.
+    */
+   if (tu_is_a5xx(device) &&
+       ((pCreateInfo->usage & VK_IMAGE_USAGE_STORAGE_BIT) ||
+        ((pCreateInfo->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
+         !tu5_srgb_views_only(pCreateInfo)) ||
+        !tu5_format_tileable(vk_format_to_pipe_format(image->vk.format))))
+      force_linear_tile = true;
+
+   /* No sense in tiling a 1D image, you'd just waste space and cache locality.
+    * But Adreno 5xx renders depth and stencil tiled.
+    */
+   if (pCreateInfo->imageType == VK_IMAGE_TYPE_1D &&
+       !(tu_is_a5xx(device) && vk_format_is_depth_or_stencil(image->vk.format))) {
       force_linear_tile = true;
    }
 
@@ -685,6 +766,62 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
       ubwc_enabled = false;
    }
 
+   /* a5xx: the tile modes have the values of the a6xx ones. UBWC for the
+    * colour targets of a single level and layer of 32 bits a texel, which
+    * nothing but the GPU reads or writes: tiled, rendered to, sampled and
+    * copied (see fdl5_layout() and tu5_image_surf()).
+    */
+   const bool a5xx = tu_is_a5xx(device);
+   if (a5xx) {
+      enum pipe_format f = vk_format_to_pipe_format(image->vk.format);
+      /* what UBWC of a5xx is for, see fdl5_layout() */
+      const bool ubwc_layout =
+         tile_mode == TILE6_3 && !force_linear_tile &&
+         image->vk.image_type == VK_IMAGE_TYPE_2D &&
+         image->vk.mip_levels == 1 && image->vk.array_layers == 1 &&
+         image->vk.samples == VK_SAMPLE_COUNT_1_BIT &&
+         tu6_plane_count(image->vk.format) == 1 &&
+         !vk_format_is_depth_or_stencil(image->vk.format) &&
+         !util_format_is_compressed(f) &&
+         util_format_get_blocksize(f) == 4 &&
+         tu5_format_color_supported(f) &&
+         !util_format_is_snorm(f) && !util_format_is_float(f) &&
+         !(image->vk.usage & (VK_IMAGE_USAGE_STORAGE_BIT |
+                              VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT));
+
+      /* A buffer gralloc made with UBWC (minigbm: the flags first, as
+       * fdl5_layout() has them): as it is, or not at all.
+       */
+      if (modifier == DRM_FORMAT_MOD_QCOM_COMPRESSED) {
+         if (!ubwc_layout)
+            return vk_error(device, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
+         ubwc_enabled = true;
+      } else
+      ubwc_enabled =
+         ubwc_enabled && !TU_DEBUG(NOUBWC) &&
+         tile_mode == TILE6_3 && !force_linear_tile &&
+         image->vk.image_type == VK_IMAGE_TYPE_2D &&
+         image->vk.mip_levels == 1 && image->vk.array_layers == 1 &&
+         image->vk.samples == VK_SAMPLE_COUNT_1_BIT &&
+         tu6_plane_count(image->vk.format) == 1 &&
+         !vk_format_is_depth_or_stencil(image->vk.format) &&
+         !util_format_is_compressed(f) &&
+         util_format_get_blocksize(f) == 4 &&
+         tu5_format_color_supported(f) &&
+         /* copied as their own format, which keeps all of their bits (see
+          * tu5_aspect_copy_format()): not snorm (-128 reads as -127) nor
+          * float (denormals)
+          */
+         !util_format_is_snorm(f) && !util_format_is_float(f) &&
+         (image->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+         !(image->vk.usage & (VK_IMAGE_USAGE_STORAGE_BIT |
+                              VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
+                              VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT)) &&
+         !(image->vk.create_flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
+         !image->vk.external_handle_types && !plane_layouts &&
+         modifier == DRM_FORMAT_MOD_INVALID;
+   }
+
    /* Whether a view of the image with an R8G8 format could be made. */
    bool has_r8g8 = tu_is_r8g8(vk_format_to_pipe_format(image->vk.format));
 
@@ -768,8 +905,50 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
          .plane = i,
       };
 
-      if (!fdl6_layout_image(layout, &device->physical_device->dev_info,
-                             &params, plane_layouts ? &plane_layout : NULL)) {
+      if (a5xx) {
+         /* The depth buffers have no tile mode: these are tiled at every
+          * level, which the textures are to be told.
+          */
+         params.tile_all = util_format_is_depth_or_stencil(format) ||
+                           /* UBWC is of the tiles, as small as it is */
+                           params.ubwc;
+         fdl5_layout_image(layout, &params);
+
+         /* the images begin on a page, as the Gallium driver has them */
+         layout->base_align = 4096;
+
+         /* The layout an imported buffer has, as gralloc made it: linear, of
+          * one level and one layer, with the pitch and the offset given.
+          */
+         if (plane_layouts && layout->ubwc) {
+            /* UBWC from gralloc: of the layout above, its pitch the one of
+             * the texels, from the start of the buffer
+             */
+            if (plane_layouts[i].offset ||
+                plane_layouts[i].rowPitch != fdl_pitch(layout, 0))
+               return vk_error(device, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
+         } else if (plane_layouts) {
+            const VkSubresourceLayout *pl = &plane_layouts[i];
+            uint32_t pitch = pl->rowPitch;
+            uint32_t nblocksy = util_format_get_nblocksy(format, height0);
+
+            if (layout->tile_mode || image->vk.mip_levels > 1 ||
+                image->vk.array_layers > 1 || image->vk.extent.depth > 1 ||
+                pitch < util_format_get_nblocksx(format, width0) * layout->cpp ||
+                (pitch & 63))
+               return vk_error(device, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
+
+            /* the pitch is its own alignment, fdl_pitch() leaving it be */
+            layout->pitch0 = pitch;
+            layout->pitchalign = ffs(pitch) - 1;
+            layout->slices[0].offset = pl->offset;
+            layout->slices[0].size0 = pitch * nblocksy;
+            layout->layer_size = pl->arrayPitch ? pl->arrayPitch
+                                                : layout->slices[0].size0;
+            layout->size = pl->offset + layout->slices[0].size0;
+         }
+      } else if (!fdl6_layout_image(layout, &device->physical_device->dev_info,
+                                    &params, plane_layouts ? &plane_layout : NULL)) {
          assert(plane_layouts); /* can only fail with explicit layout */
          return vk_error(device, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
       }
@@ -1090,6 +1269,21 @@ tu_image_bind(struct tu_device *device,
    }
 
    assert(mem);
+
+   /* a plane of a disjoint image, in memory of its own */
+   const VkBindImagePlaneMemoryInfo *plane_info =
+      vk_find_struct_const(bind_info->pNext, BIND_IMAGE_PLANE_MEMORY_INFO);
+   if (tu_is_a5xx(device) && plane_info &&
+       (image->vk.create_flags & VK_IMAGE_CREATE_DISJOINT_BIT)) {
+      unsigned plane =
+         tu6_plane_index(image->vk.format, plane_info->planeAspect);
+
+      image->plane_base[plane] =
+         mem->iova + offset - tu_image_plane_start(image, plane);
+      if (plane)
+         return VK_SUCCESS;
+   }
+
    image->mem = mem;
    image->mem_offset = offset;
    image->iova = mem->iova + offset;
@@ -1143,7 +1337,8 @@ tu_BindImageMemory2(VkDevice _device,
 
 static void
 tu_get_image_memory_requirements(struct tu_device *dev, struct tu_image *image,
-                                 VkMemoryRequirements2 *pMemoryRequirements)
+                                 VkMemoryRequirements2 *pMemoryRequirements,
+                                 VkImageAspectFlags plane_aspect = 0)
 {
    uint32_t alignment = image->layout[0].base_align;
    if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)
@@ -1158,13 +1353,21 @@ tu_get_image_memory_requirements(struct tu_device *dev, struct tu_image *image,
       (image->vk.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) ?
       dev->physical_device->memory.type_count :
       dev->physical_device->memory.non_lazy_type_count;
+   uint64_t size = image->total_size;
+
+   /* one plane of a disjoint image */
+   if (tu_is_a5xx(dev) && plane_aspect &&
+       (image->vk.create_flags & VK_IMAGE_CREATE_DISJOINT_BIT)) {
+      unsigned plane = tu6_plane_index(image->vk.format, plane_aspect);
+      size = image->layout[plane].size - tu_image_plane_start(image, plane);
+   }
 
    pMemoryRequirements->memoryRequirements = (VkMemoryRequirements) {
       /* Due to how we fake the sparse tile size, the real size may not be
        * aligned. CTS doesn't like this, and real apps may also be surprised,
        * so we align it.
        */
-      .size = align64(image->total_size, alignment),
+      .size = align64(size, alignment),
       .alignment = alignment,
       .memoryTypeBits = (1 << type_count) - 1,
    };
@@ -1342,8 +1545,11 @@ tu_GetImageMemoryRequirements2(VkDevice _device,
 {
    VK_FROM_HANDLE(tu_device, device, _device);
    VK_FROM_HANDLE(tu_image, image, pInfo->image);
+   const VkImagePlaneMemoryRequirementsInfo *plane_info =
+      vk_find_struct_const(pInfo->pNext, IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO);
 
-   tu_get_image_memory_requirements(device, image, pMemoryRequirements);
+   tu_get_image_memory_requirements(device, image, pMemoryRequirements,
+                                    plane_info ? plane_info->planeAspect : 0);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1374,7 +1580,8 @@ tu_GetDeviceImageMemoryRequirements(
    vk_image_init(&device->vk, &image.vk, pInfo->pCreateInfo);
    TU_CALLX(device, tu_image_init)(device, &image, pInfo->pCreateInfo, DRM_FORMAT_MOD_INVALID, NULL);
 
-   tu_get_image_memory_requirements(device, &image, pMemoryRequirements);
+   tu_get_image_memory_requirements(device, &image, pMemoryRequirements,
+                                    pInfo->planeAspect);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1401,15 +1608,20 @@ tu_get_image_subresource_layout(struct tu_image *image,
                                 const VkImageSubresource2KHR *pSubresource,
                                 VkSubresourceLayout2KHR *pLayout)
 {
-   struct fdl_layout *layout =
-      &image->layout[tu6_plane_index(image->vk.format,
-                                     pSubresource->imageSubresource.aspectMask)];
+   const unsigned plane =
+      tu6_plane_index(image->vk.format,
+                      pSubresource->imageSubresource.aspectMask);
+   struct fdl_layout *layout = &image->layout[plane];
    const struct fdl_slice *slice = layout->slices +
       pSubresource->imageSubresource.mipLevel;
 
    pLayout->subresourceLayout.offset =
       fdl_surface_offset(layout, pSubresource->imageSubresource.mipLevel,
                          pSubresource->imageSubresource.arrayLayer);
+   /* in the memory of the plane, for a disjoint image (Adreno 5xx) */
+   if ((image->vk.create_flags & VK_IMAGE_CREATE_DISJOINT_BIT) &&
+       tu_is_a5xx(container_of(image->vk.base.device, struct tu_device, vk)))
+      pLayout->subresourceLayout.offset -= tu_image_plane_start(image, plane);
    pLayout->subresourceLayout.rowPitch =
       fdl_pitch(layout, pSubresource->imageSubresource.mipLevel);
    pLayout->subresourceLayout.arrayPitch =

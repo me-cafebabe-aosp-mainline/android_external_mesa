@@ -171,6 +171,17 @@ disk_cache_create_custom(const char *gpu_name, const char *driver_id,
                          uint32_t max_size);
 
 /**
+ * Create a cache in the given directory, of at most 32 MB unless
+ * MESA_SHADER_CACHE_MAX_SIZE says otherwise, also where disk_cache_create()
+ * makes none: on Android, where EGL_ANDROID_blob_cache keeps what the GL
+ * drivers compile but nothing keeps what the Vulkan drivers do, a Vulkan
+ * driver can keep it in the cache directory of the app.
+ */
+struct disk_cache *
+disk_cache_create_in_dir(const char *gpu_name, const char *driver_id,
+                         uint64_t driver_flags, const char *dir);
+
+/**
  * Destroy a cache object, (freeing all associated resources).
  */
 void
@@ -283,6 +294,13 @@ static inline struct disk_cache *
 disk_cache_create_custom(const char *gpu_name, const char *driver_id,
                          uint64_t driver_flags, const char *cache_dir_name,
                          uint32_t max_size)
+{
+   return NULL;
+}
+
+static inline struct disk_cache *
+disk_cache_create_in_dir(const char *gpu_name, const char *driver_id,
+                         uint64_t driver_flags, const char *dir)
 {
    return NULL;
 }

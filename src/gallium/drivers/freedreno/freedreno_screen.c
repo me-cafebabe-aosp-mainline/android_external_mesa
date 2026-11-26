@@ -947,6 +947,7 @@ fd_screen_create(int fd,
 
    // maybe this should be in context?
    screen->pipe = fd_pipe_new(screen->dev, FD_PIPE_3D);
+
    if (!screen->pipe) {
       DBG("could not create 3d pipe");
       goto fail;
@@ -995,6 +996,15 @@ fd_screen_create(int fd,
    }
    screen->chip_id = val;
    screen->gen = fd_dev_gen(screen->dev_id);
+
+   /* a5xx: what the kernel and the display lay UBWC out by; 15 when the
+    * kernel does not say, which is what a5xx was always given
+    */
+   screen->highest_bank_bit = 15;
+   if (screen->gen == 5 &&
+       !fd_pipe_get_param(screen->pipe, FD_HIGHEST_BANK_BIT, &val) &&
+       val >= 13 && val <= 16)
+      screen->highest_bank_bit = val;
 
    if (fd_pipe_get_param(screen->pipe, FD_NR_PRIORITIES, &val)) {
       DBG("could not get # of rings");

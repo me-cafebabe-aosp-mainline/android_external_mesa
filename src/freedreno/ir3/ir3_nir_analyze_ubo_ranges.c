@@ -11,11 +11,20 @@
 
 static inline bool
 get_ubo_load_range(nir_shader *nir, nir_intrinsic_instr *instr,
-                   uint32_t alignment, struct ir3_ubo_range *r)
+                   uint32_t alignment, struct ir3_ubo_range *r, bool gen5)
 {
    uint32_t offset =
       nir_intrinsic_has_range_base(instr) ? nir_intrinsic_range_base(instr) : 0;
    uint32_t size = nir_intrinsic_range(instr);
+
+   /* a5xx (turnip reads the storage buffers of vertex shaders as uniform
+    * buffers, volatile): what may be written between the time the constants
+    * are loaded and the time the shader runs is to be read by the shader
+    * itself.
+    */
+   if (gen5 && instr->intrinsic == nir_intrinsic_load_ubo &&
+       (nir_intrinsic_access(instr) & ACCESS_VOLATILE))
+      return false;
 
    /* If the offset is constant, the range is trivial (and NIR may not have
     * figured it out).
@@ -131,14 +140,14 @@ merge_neighbors(struct ir3_ubo_analysis_state *state, int index)
 static void
 gather_ubo_ranges(nir_shader *nir, nir_intrinsic_instr *instr,
                   struct ir3_ubo_analysis_state *state, uint32_t alignment,
-                  uint32_t *upload_remaining)
+                  uint32_t *upload_remaining, bool gen5)
 {
    struct ir3_ubo_info ubo = {};
    if (!get_ubo_info(instr, &ubo))
       return;
 
    struct ir3_ubo_range r;
-   if (!get_ubo_load_range(nir, instr, alignment, &r))
+   if (!get_ubo_load_range(nir, instr, alignment, &r, gen5))
       return;
 
    /* See if there's an existing range for this UBO we want to merge into. */
@@ -264,12 +273,12 @@ track_ubo_use(nir_intrinsic_instr *instr, nir_builder *b, int *num_ubos)
 static bool
 lower_ubo_load_to_uniform(nir_intrinsic_instr *instr, nir_builder *b,
                           const struct ir3_ubo_analysis_state *state,
-                          int *num_ubos, uint32_t alignment)
+                          int *num_ubos, uint32_t alignment, bool gen5)
 {
    b->cursor = nir_before_instr(&instr->instr);
 
    struct ir3_ubo_range r;
-   if (!get_ubo_load_range(b->shader, instr, alignment, &r)) {
+   if (!get_ubo_load_range(b->shader, instr, alignment, &r, gen5)) {
       if (instr->intrinsic == nir_intrinsic_load_ubo)
          track_ubo_use(instr, b, num_ubos);
       return false;
@@ -571,7 +580,7 @@ ir3_nir_lower_const_global_loads(nir_shader *nir, struct ir3_shader_variant *v)
                    ir3_def_is_rematerializable_for_preamble(nir_instr_as_intrinsic(instr)->src[0].ssa, NULL))
                   gather_ubo_ranges(nir, nir_instr_as_intrinsic(instr), &state,
                                     align_vec4,
-                                    &upload_remaining);
+                                    &upload_remaining, compiler->gen == 5);
             }
          }
       }
@@ -596,7 +605,7 @@ ir3_nir_lower_const_global_loads(nir_shader *nir, struct ir3_shader_variant *v)
                      continue;
                   progress |= lower_ubo_load_to_uniform(
                      nir_instr_as_intrinsic(instr), &builder, &state, NULL,
-                     align_vec4);
+                     align_vec4, compiler->gen == 5);
                }
             }
 
@@ -653,7 +662,7 @@ ir3_nir_analyze_ubo_ranges(nir_shader *nir, struct ir3_shader_variant *v)
                if (instr_is_load_ubo(instr))
                   gather_ubo_ranges(nir, nir_instr_as_intrinsic(instr), state,
                                     align_vec4,
-                                    &upload_remaining);
+                                    &upload_remaining, compiler->gen == 5);
             }
          }
       }
@@ -699,7 +708,7 @@ ir3_nir_lower_ubo_loads(nir_shader *nir, struct ir3_shader_variant *v)
                   continue;
                progress |= lower_ubo_load_to_uniform(
                   nir_instr_as_intrinsic(instr), &builder, state, &num_ubos,
-                  align_vec4);
+                  align_vec4, compiler->gen == 5);
             }
          }
 

@@ -214,6 +214,18 @@ ir3_should_double_threadsize(struct ir3_shader_variant *v, unsigned regs_count)
       return false;
    }
 
+   /* a5xx: with the smaller threadsize, compute workgroups of 289 to 511
+    * invocations fault on Adreno 505, these take the doubled one (the blob
+    * takes it for every compute shader of few registers). The smaller
+    * workgroups keep the smaller one: with the doubled one, shaders of 24
+    * registers faulted (dEQP-VK.ssbo.layout.*), and the blob has the
+    * smaller one from 18 registers.
+    */
+   if (compiler->gen == 5 && mesa_shader_stage_is_compute(v->type)) {
+      return v->local_size_variable ||
+             v->local_size[0] * v->local_size[1] * v->local_size[2] > 256;
+   }
+
    switch (v->type) {
    case MESA_SHADER_KERNEL:
    case MESA_SHADER_COMPUTE:

@@ -1658,7 +1658,7 @@ static const struct u_transfer_vtbl transfer_vtbl = {
    .get_stencil = fd_resource_get_stencil,
 };
 
-static bool
+bool
 fd_layout_resource_for_handle(struct fd_resource *rsc, struct winsys_handle *handle)
 {
    struct pipe_resource *prsc = &rsc->b.b;

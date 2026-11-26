@@ -6,6 +6,8 @@
 
 #include "tu_formats.h"
 
+#include "tu5.h"
+
 #include "drm-uapi/drm_fourcc.h"
 
 #include "vk_acceleration_structure.h"
@@ -156,6 +158,13 @@ tu_physical_device_get_format_properties(
    }
 
    bool is_npot = !util_is_power_of_two_or_zero(desc->block.bits);
+   bool a5xx = physical_device->info->chip == 5;
+
+   if (a5xx) {
+      supported_vtx = tu5_format_vtx_supported(format);
+      supported_color = tu5_format_color_supported(format);
+      supported_tex = tu5_format_texture_supported(format);
+   }
 
    if (format == PIPE_FORMAT_NONE ||
        !(supported_vtx || supported_color || supported_tex)) {
@@ -333,7 +342,8 @@ tu_physical_device_get_format_properties(
     * DEPTH_STENCIL_ATTACHMENT_BIT for the optimal features.
     */
    linear = optimal;
-   if (tu6_pipe2depth(vk_format) != DEPTH6_NONE)
+   if (a5xx ? tu5_format_depth_supported(format)
+            : tu6_pipe2depth(vk_format) != DEPTH6_NONE)
       optimal |= VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
 
    if (!tiling_possible(vk_format) &&
@@ -372,6 +382,71 @@ tu_physical_device_get_format_properties(
       buffer |= VK_FORMAT_FEATURE_2_ACCELERATION_STRUCTURE_VERTEX_BUFFER_BIT_KHR;
 
 end:
+   /* Adreno 5xx. TODO: storage images and texel buffers, multi-planar and
+    * compressed formats in the copies
+    */
+   if (a5xx) {
+      const VkFormatFeatureFlags2 no =
+         VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
+         VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT |
+         VK_FORMAT_FEATURE_2_FRAGMENT_DENSITY_MAP_BIT_EXT |
+         VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_CUBIC_BIT_EXT |
+         /* no acceleration structures, no fragment shading rate */
+         VK_FORMAT_FEATURE_2_ACCELERATION_STRUCTURE_VERTEX_BUFFER_BIT_KHR |
+         VK_FORMAT_FEATURE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+
+      linear &= ~no;
+      optimal &= ~no;
+      buffer &= ~no;
+
+      /* atomics on floats would be VK_EXT_shader_atomic_float */
+      if (vk_format == VK_FORMAT_R32_SFLOAT) {
+         optimal &= ~VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;
+         linear &= ~VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;
+         buffer &= ~VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT;
+      }
+
+      linear &= ~no;
+      optimal &= ~no;
+      buffer &= ~no;
+      if (ycbcr_info)
+         linear = optimal = buffer = 0;
+
+      /* The stores without a format in the shader take the format of the
+       * image from its descriptor, which STIB does not encode to sRGB, nor
+       * swap red and blue for in images (it does in texel buffers). As the
+       * stock driver, not for those formats.
+       */
+      if (vk_format_is_srgb(vk_format)) {
+         linear &= ~VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+         optimal &= ~VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+         buffer &= ~VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+      } else if (desc->layout == UTIL_FORMAT_LAYOUT_PLAIN &&
+                 desc->nr_channels >= 3 &&
+                 desc->swizzle[0] == PIPE_SWIZZLE_Z &&
+                 desc->swizzle[2] == PIPE_SWIZZLE_X) {
+         linear &= ~VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+         optimal &= ~VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+      }
+
+      /* The multi-planar formats of the stock driver, which the shaders
+       * sample plane by plane (TU5_YCBCR_PLANE_SLOT)
+       */
+      if (vk_format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM ||
+          vk_format == VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM) {
+         linear = optimal =
+            VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+            VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_MINMAX_BIT |
+            VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
+            VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT |
+            VK_FORMAT_FEATURE_2_MIDPOINT_CHROMA_SAMPLES_BIT |
+            VK_FORMAT_FEATURE_2_COSITED_CHROMA_SAMPLES_BIT |
+            VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER_BIT |
+            VK_FORMAT_FEATURE_2_DISJOINT_BIT;
+      }
+   }
+
    out_properties->linearTilingFeatures = linear;
    out_properties->optimalTilingFeatures = optimal;
    out_properties->bufferFeatures = buffer;
@@ -587,7 +662,11 @@ tu_get_image_format_properties(
          return tu_image_unsupported_format(pImageFormatProperties);
    }
 
+   /* Adreno 5xx also has 1D depth and stencil images (tiled, see
+    * tu_image_init()), as the stock driver
+    */
    if (info->type != VK_IMAGE_TYPE_2D &&
+       !(physical_device->info->chip == 5 && info->type == VK_IMAGE_TYPE_1D) &&
        vk_format_is_depth_or_stencil(info->format))
       return tu_image_unsupported_format(pImageFormatProperties);
 
@@ -878,7 +957,13 @@ tu_GetPhysicalDeviceImageFormatProperties2(
    }
 
    if (ycbcr_props)
-      ycbcr_props->combinedImageSamplerDescriptorCount = 1;
+      /* Adreno 5xx: the other planes come after the sampler, the
+       * descriptor taking TU5_YCBCR_SLOTS slots instead of 2
+       */
+      ycbcr_props->combinedImageSamplerDescriptorCount =
+         physical_device->info->chip == 5 &&
+               vk_format_get_plane_count(base_info->format) > 1
+            ? TU5_YCBCR_SLOTS / 2 : 1;
 
    if (hic_props) {
       /* This should match tu_image_init() as much as possible given the

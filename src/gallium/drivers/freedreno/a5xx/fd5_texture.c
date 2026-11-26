@@ -179,6 +179,13 @@ fd5_sampler_view_create(struct pipe_context *pctx, struct pipe_resource *prsc,
 
    so->texconst2 |= A5XX_TEX_CONST_2_TYPE(fd5_tex_type(cso->target));
 
+   /* UBWC: from the flags, which the texels follow (see fdl5_layout()),
+    * TEX_CONST_3 bit 28 as the blob has it
+    */
+   const bool ubwc = cso->target != PIPE_BUFFER && rsc->layout.ubwc;
+   if (ubwc)
+      so->offset = fd_resource_ubwc_offset(rsc, lvl, cso->u.tex.first_layer);
+
    switch (cso->target) {
    case PIPE_TEXTURE_RECT:
    case PIPE_TEXTURE_1D:
@@ -207,6 +214,9 @@ fd5_sampler_view_create(struct pipe_context *pctx, struct pipe_resource *prsc,
       so->texconst3 = 0x00000000;
       break;
    }
+
+   if (ubwc)
+      so->texconst3 |= A5XX_TEX_CONST_3_TILE_ALL | (1u << 28);
 
    return &so->base;
 }

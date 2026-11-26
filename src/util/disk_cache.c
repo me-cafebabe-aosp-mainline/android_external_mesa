@@ -99,7 +99,8 @@ disk_cache_type_create(const char *gpu_name,
                        const char *cache_dir_name,
                        uint64_t driver_flags,
                        enum disk_cache_type cache_type,
-                       uint64_t max_size)
+                       uint64_t max_size,
+                       const char *dir)
 {
    void *local;
    struct disk_cache *cache = NULL;
@@ -120,11 +121,16 @@ disk_cache_type_create(const char *gpu_name,
    cache->path_init_failed = true;
    cache->type = DISK_CACHE_NONE;
 
-   if (!disk_cache_enabled())
+   /* A directory given is a cache asked for also where there is none by
+    * default (Android), but not against MESA_SHADER_CACHE_DISABLE.
+    */
+   if (dir ? debug_get_bool_option("MESA_SHADER_CACHE_DISABLE", false)
+           : !disk_cache_enabled())
       goto path_fail;
 
    const char *path =
-      disk_cache_generate_cache_dir(local, gpu_name, driver_id, cache_dir_name, cache_type, true);
+      disk_cache_generate_cache_dir(local, gpu_name, driver_id, cache_dir_name,
+                                    cache_type, true, dir);
    if (!path)
       goto path_fail;
 
@@ -143,11 +149,17 @@ disk_cache_type_create(const char *gpu_name,
       if (!disk_cache_load_cache_index_foz(local, cache))
          goto path_fail;
    } else if (cache_type == DISK_CACHE_DATABASE) {
+      /* A few parts in the directory of an app: an empty part takes some
+       * room already.
+       */
+      if (dir)
+         cache->cache_db.num_parts = 4;
       if (!disk_cache_db_load_cache_index(local, cache))
          goto path_fail;
    }
 
-   if (!os_get_option("MESA_SHADER_CACHE_DIR") && !os_get_option("MESA_GLSL_CACHE_DIR"))
+   if (!dir && !os_get_option("MESA_SHADER_CACHE_DIR") &&
+       !os_get_option("MESA_GLSL_CACHE_DIR"))
       disk_cache_touch_cache_user_marker(cache->path);
 
    cache->type = cache_type;
@@ -214,30 +226,14 @@ disk_cache_type_create(const char *gpu_name,
    return NULL;
 }
 
-struct disk_cache *
-disk_cache_create(const char *gpu_name, const char *driver_id,
-                  uint64_t driver_flags)
+/* The maximum size of a cache that MESA_SHADER_CACHE_MAX_SIZE gives, else
+ * default_size.
+ */
+static uint64_t
+disk_cache_max_size(uint64_t default_size)
 {
-   enum disk_cache_type cache_type;
-   struct disk_cache *cache;
    uint64_t max_size = 0;
    const char *max_size_str;
-
-   if (debug_get_bool_option("MESA_DISK_CACHE_SINGLE_FILE", false)) {
-      cache_type = DISK_CACHE_SINGLE_FILE;
-   } else if (debug_get_bool_option("MESA_DISK_CACHE_DATABASE", false)) {
-      cache_type = DISK_CACHE_DATABASE;
-      /* Since switching the default cache to <mesa_shader_cache_db>, remove the
-       * old cache folder if it hasn't been modified for more than 7 days.
-       */
-      if (!os_get_option("MESA_SHADER_CACHE_DIR") && !os_get_option("MESA_GLSL_CACHE_DIR") &&
-          disk_cache_enabled())
-         disk_cache_delete_old_cache();
-   } else if (debug_get_bool_option("MESA_DISK_CACHE_MULTI_FILE", true)) {
-      cache_type = DISK_CACHE_MULTI_FILE;
-   } else {
-      return NULL;
-   }
 
    max_size_str = os_get_option("MESA_SHADER_CACHE_MAX_SIZE");
 
@@ -280,14 +276,42 @@ disk_cache_create(const char *gpu_name, const char *driver_id,
       }
    }
 
-   /* Default to 1GB for maximum cache size. */
-   if (max_size == 0) {
-      max_size = 1024*1024*1024;
+   if (max_size == 0)
+      max_size = default_size;
+
+   return max_size;
+
+}
+
+struct disk_cache *
+disk_cache_create(const char *gpu_name, const char *driver_id,
+                  uint64_t driver_flags)
+{
+   enum disk_cache_type cache_type;
+   struct disk_cache *cache;
+   uint64_t max_size;
+
+   if (debug_get_bool_option("MESA_DISK_CACHE_SINGLE_FILE", false)) {
+      cache_type = DISK_CACHE_SINGLE_FILE;
+   } else if (debug_get_bool_option("MESA_DISK_CACHE_DATABASE", false)) {
+      cache_type = DISK_CACHE_DATABASE;
+      /* Since switching the default cache to <mesa_shader_cache_db>, remove the
+       * old cache folder if it hasn't been modified for more than 7 days.
+       */
+      if (!os_get_option("MESA_SHADER_CACHE_DIR") && !os_get_option("MESA_GLSL_CACHE_DIR") &&
+          disk_cache_enabled())
+         disk_cache_delete_old_cache();
+   } else if (debug_get_bool_option("MESA_DISK_CACHE_MULTI_FILE", true)) {
+      cache_type = DISK_CACHE_MULTI_FILE;
+   } else {
+      return NULL;
    }
+
+   max_size = disk_cache_max_size(1024*1024*1024);
 
    /* Create main writable cache. */
    cache = disk_cache_type_create(gpu_name, driver_id, NULL, driver_flags,
-                                  cache_type, max_size);
+                                  cache_type, max_size, NULL);
    if (!cache)
       return NULL;
 
@@ -306,7 +330,7 @@ disk_cache_create(const char *gpu_name, const char *driver_id,
       cache->foz_ro_cache = disk_cache_type_create(gpu_name, driver_id, NULL,
                                                    driver_flags,
                                                    DISK_CACHE_SINGLE_FILE,
-                                                   max_size);
+                                                   max_size, NULL);
    }
 
    return cache;
@@ -318,7 +342,17 @@ disk_cache_create_custom(const char *gpu_name, const char *driver_id,
                          uint32_t max_size)
 {
    return disk_cache_type_create(gpu_name, driver_id, cache_dir_name, 0,
-                                 DISK_CACHE_DATABASE, max_size);
+                                 DISK_CACHE_DATABASE, max_size, NULL);
+}
+
+struct disk_cache *
+disk_cache_create_in_dir(const char *gpu_name, const char *driver_id,
+                         uint64_t driver_flags, const char *dir)
+{
+   /* at most 32 MB in the directory of an app */
+   return disk_cache_type_create(gpu_name, driver_id, NULL, driver_flags,
+                                 DISK_CACHE_DATABASE,
+                                 disk_cache_max_size(32*1024*1024), dir);
 }
 
 void

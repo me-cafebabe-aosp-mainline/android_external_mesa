@@ -622,6 +622,36 @@ struct tu_cmd_state
    struct tu_draw_state lrz_and_depth_plane_state;
 
    struct tu_vs_params last_vs_params;
+
+   /* Adreno 5xx: the shaders whose program state the draw stream has last,
+    * NULL when something else may have changed it since, see tu5_draw_state()
+    */
+   const struct tu_shader *a5xx_vs, *a5xx_fs;
+   unsigned a5xx_max_loc;
+   /* The viewport the draws last wrote, see tu5_emit_viewport_scissor(): it
+    * holds while a5xx_vs does
+    */
+   float a5xx_viewport[7];
+   /* RB_RENDER_CNTL of the colour targets of the subpass, see tu5_emit_mrt() */
+   uint32_t a5xx_render_cntl;
+   /* What groups of the state of the draws they last wrote, see
+    * tu5_draw_state()
+    */
+#define TU5_DRAW_GROUPS 10
+#define TU5_DRAW_GROUP_DWORDS 512
+   uint32_t a5xx_group_dwords[TU5_DRAW_GROUPS];
+
+   /* Adreno 5xx: whether the render pass draws to GMEM, tile by tile, see
+    * tu5_use_gmem()
+    */
+   bool a5xx_gmem;
+   /* and with a binning pass first, the draws also in a5xx_binning_cs */
+   bool a5xx_binning;
+
+   /* Adreno 5xx: the graphics pipeline vkCmdBindPipeline() bound last, to
+    * bind it again for nothing (Skia binds it before each draw)
+    */
+   const struct tu_pipeline *a5xx_gfx_pipeline;
    bool last_draw_indexed;
 
    struct tu_tess_params tess_params;
@@ -653,6 +683,15 @@ struct tu_cb_control_point {
    uint32_t *patchpoint;
    uint32_t patch_value;
    uint32_t original_value;
+};
+
+/* Adreno 5xx: what each group of the state of the draws last wrote, and
+ * where a group is written first (see tu5_draw_state())
+ */
+struct tu5_cmd_groups
+{
+   uint32_t group[TU5_DRAW_GROUPS][TU5_DRAW_GROUP_DWORDS];
+   uint32_t scratch[4096];
 };
 
 struct tu_cmd_buffer
@@ -711,6 +750,16 @@ struct tu_cmd_buffer
    struct tu_cs tile_store_cs;
    struct tu_cs draw_epilogue_cs;
    struct tu_cs sub_cs;
+
+   /* Adreno 5xx only, NULL otherwise: the groups of the state of the draws,
+    * allocated after the command buffer, see tu5_draw_state()
+    */
+   struct tu5_cmd_groups *a5xx_groups;
+
+   /* Adreno 5xx: the draws of the render pass for the binning pass, see
+    * tu5_cmd_render_gmem()
+    */
+   struct tu_cs a5xx_binning_cs;
 
    /* If the first render pass in the command buffer is resuming, then it is
     * part of a suspend/resume chain that starts before the current command

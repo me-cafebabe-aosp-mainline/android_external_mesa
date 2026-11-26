@@ -762,16 +762,24 @@ tu_render_pass_gmem_config(struct tu_render_pass *pass,
          struct tu_render_pass_attachment *att = &pass->attachments[i];
          bool cpp1 = (att->cpp == 1);
          if (att->gmem) {
+            /* Adreno 5xx stores the attachments of a tile at the end of the
+             * render pass, all of them (see tu5_cmd_render_gmem()): none
+             * shares its GMEM with another one
+             */
+            const bool a5xx = phys_dev->info->chip == 5;
+            const uint32_t first = a5xx ? 0 : att->first_subpass_idx;
+            const uint32_t last = a5xx ? UINT32_MAX : att->last_subpass_idx;
+
             att_gmem_alloc[i * 2] =
                tu_gmem_alloc(gmem_alloc, &num_gmem_alloc, att->cpp,
-                           att->first_subpass_idx, att->last_subpass_idx);
+                           first, last);
 
             /* take into account the separate stencil: */
             if (att->format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
                cpp1 = (att->samples == 1);
                att_gmem_alloc[i * 2 + 1] =
                   tu_gmem_alloc(gmem_alloc, &num_gmem_alloc, att->samples,
-                              att->first_subpass_idx, att->last_subpass_idx);
+                              first, last);
             }
 
             /* texture pitch must be aligned to 64, use a tile_align_w that is

@@ -3917,6 +3917,13 @@ static void
 tu_pipeline_builder_emit_state(struct tu_pipeline_builder *builder,
                                struct tu_pipeline *pipeline)
 {
+   /* The static state is not precompiled into draw states on a5xx: it stays
+    * in the pipeline's dynamic state, and goes to the command buffer's with
+    * the bind.
+    */
+   if (tu_is_a5xx(builder->device))
+      return;
+
    struct tu_cs cs;
    BITSET_DECLARE(keep, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX) = {};
    BITSET_DECLARE(remove, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX) = {};
@@ -4617,6 +4624,11 @@ tu_pipeline_builder_build(struct tu_pipeline_builder *builder,
          tu_pipeline_to_graphics(*pipeline);
       gfx_pipeline->dynamic_state.ms.sample_locations =
          &gfx_pipeline->sample_locations;
+      /* Adreno 5xx emits the vertex input from the dynamic state, see
+       * tu5_draw_state()
+       */
+      if (tu_is_a5xx(builder->device))
+         gfx_pipeline->dynamic_state.vi = &gfx_pipeline->vertex_input;
       vk_dynamic_graphics_state_fill(&gfx_pipeline->dynamic_state,
                                      &builder->graphics_state);
       gfx_pipeline->feedback_loops =
@@ -4966,6 +4978,12 @@ tu_compute_pipeline_create(VkDevice device,
    tu_shader_key_subgroup_size(&key, allow_varying_subgroup_size,
                                require_full_subgroups, subgroup_info,
                                dev);
+
+   /* Adreno 5xx: the subgroups are of one invocation, the threadsize is not
+    * seen. The compiler picks it, see ir3_should_double_threadsize().
+    */
+   if (tu_is_a5xx(dev))
+      key.api_wavesize = key.real_wavesize = IR3_SINGLE_OR_DOUBLE;
 
    struct vk_pipeline_robustness_state rs;
    vk_pipeline_robustness_state_fill(&dev->vk.robustness_state, &rs, pCreateInfo->pNext, stage_info->pNext);

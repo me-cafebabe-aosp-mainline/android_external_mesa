@@ -9,6 +9,8 @@
 
 #include "tu_cmd_buffer.h"
 
+#include "tu5.h"
+
 #include "vk_common_entrypoints.h"
 #include "vk_log.h"
 #include "vk_render_pass.h"
@@ -356,6 +358,11 @@ tu6_emit_flushes(struct tu_cmd_buffer *cmd_buffer,
 {
    BITMASK_ENUM(tu_cmd_flush_bits) flushes = cache->flush_bits;
    cache->flush_bits = 0;
+
+   if (tu_is_a5xx(cmd_buffer->device)) {
+      tu5_emit_flushes(cmd_buffer, cs, flushes);
+      return;
+   }
 
    if (TU_DEBUG(FLUSHALL))
       flushes |= TU_CMD_FLAG_ALL_CLEAN | TU_CMD_FLAG_ALL_INVALIDATE;
@@ -1880,14 +1887,22 @@ tu6_emit_sysmem_resolves(struct tu_cmd_buffer *cmd,
        * resolve case. However, a flush afterwards isn't needed because of the
        * last sentence and the fact that we're in sysmem mode.
        */
-      tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_CLEAN_COLOR);
-      if (subpass->resolve_depth_stencil)
-         tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_CLEAN_DEPTH);
+      if (tu_is_a5xx(cmd->device)) {
+         tu5_emit_flushes(cmd, cs,
+                          TU_CMD_FLAG_CCU_CLEAN_COLOR |
+                          TU_CMD_FLAG_CCU_CLEAN_DEPTH |
+                          TU_CMD_FLAG_CACHE_INVALIDATE |
+                          TU_CMD_FLAG_WAIT_FOR_IDLE);
+      } else {
+         tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_CLEAN_COLOR);
+         if (subpass->resolve_depth_stencil)
+            tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_CLEAN_DEPTH);
 
-      tu_emit_event_write<CHIP>(cmd, cs, FD_CACHE_INVALIDATE);
+         tu_emit_event_write<CHIP>(cmd, cs, FD_CACHE_INVALIDATE);
 
-      /* Wait for the flushes to land before using the 2D engine */
-      tu_cs_emit_wfi(cs);
+         /* Wait for the flushes to land before using the 2D engine */
+         tu_cs_emit_wfi(cs);
+      }
 
       for (unsigned i = 0; i < subpass->resolve_count; i++) {
          uint32_t a = subpass->resolve_attachments[i].attachment;
@@ -2407,6 +2422,11 @@ tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
 {
    struct tu_device *dev = cmd->device;
    const struct tu_physical_device *phys_dev = dev->physical_device;
+
+   if (tu_is_a5xx(dev)) {
+      tu5_init_hw(cmd, cs);
+      return;
+   }
 
    if (CHIP == A6XX) {
       tu_emit_event_write<CHIP>(cmd, cs, FD_CACHE_INVALIDATE);
@@ -2939,6 +2959,10 @@ static void
 tu_set_input_attachments(struct tu_cmd_buffer *cmd, const struct tu_subpass *subpass)
 {
    struct tu_cs *cs = &cmd->draw_cs;
+
+   /* TODO: input attachments on a5xx */
+   if (tu_is_a5xx(cmd->device))
+      return;
 
    tu_cs_emit_pkt7(cs, CP_SET_DRAW_STATE, 6);
    tu_cs_emit_draw_state(cs, TU_DRAW_STATE_INPUT_ATTACHMENTS_GMEM,
@@ -4052,6 +4076,12 @@ void
 tu_cmd_render(struct tu_cmd_buffer *cmd_buffer,
               const VkOffset2D *fdm_offsets)
 {
+   if (tu_is_a5xx(cmd_buffer->device)) {
+      tu5_cmd_render(cmd_buffer);
+      tu_disable_draw_states(cmd_buffer, &cmd_buffer->cs);
+      return;
+   }
+
    if (cmd_buffer->state.rp.has_tess)
       tu6_lazy_emit_tessfactor_addr<CHIP>(cmd_buffer);
 
@@ -4072,6 +4102,8 @@ static void tu_reset_render_pass(struct tu_cmd_buffer *cmd_buffer)
    tu_cs_begin(&cmd_buffer->draw_cs);
    tu_cs_discard_entries(&cmd_buffer->draw_epilogue_cs);
    tu_cs_begin(&cmd_buffer->draw_epilogue_cs);
+   tu_cs_discard_entries(&cmd_buffer->a5xx_binning_cs);
+   tu_cs_begin(&cmd_buffer->a5xx_binning_cs);
 
    cmd_buffer->state.pass = NULL;
    cmd_buffer->state.subpass = NULL;
@@ -4108,12 +4140,18 @@ tu_create_cmd_buffer(struct vk_command_pool *pool,
       container_of(pool->base.device, struct tu_device, vk);
    struct tu_cmd_buffer *cmd_buffer;
 
+   /* Adreno 5xx: its groups of draw state after the command buffer */
+   const size_t a5xx_size =
+      tu_is_a5xx(device) ? sizeof(struct tu5_cmd_groups) : 0;
    cmd_buffer = (struct tu_cmd_buffer *) vk_zalloc(
-      &pool->alloc, sizeof(*cmd_buffer), 8,
+      &pool->alloc, sizeof(*cmd_buffer) + a5xx_size, 8,
       VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
 
    if (cmd_buffer == NULL)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   if (a5xx_size)
+      cmd_buffer->a5xx_groups = (struct tu5_cmd_groups *) (cmd_buffer + 1);
 
    VkResult result = vk_command_buffer_init(pool, &cmd_buffer->vk,
                                             &tu_cmd_buffer_ops, level);
@@ -4143,6 +4181,7 @@ tu_create_cmd_buffer(struct vk_command_pool *pool,
    tu_cs_init(&cmd_buffer->draw_cs, device, TU_CS_MODE_GROW, 4096, "draw cs");
    tu_cs_init(&cmd_buffer->tile_store_cs, device, TU_CS_MODE_GROW, 2048, "tile store cs");
    tu_cs_init(&cmd_buffer->draw_epilogue_cs, device, TU_CS_MODE_GROW, 4096, "draw epilogue cs");
+   tu_cs_init(&cmd_buffer->a5xx_binning_cs, device, TU_CS_MODE_GROW, 4096, "a5xx binning cs");
    tu_cs_init(&cmd_buffer->sub_cs, device, TU_CS_MODE_SUB_STREAM, 2048, "draw sub cs");
    tu_cs_init(&cmd_buffer->pre_chain.draw_cs, device, TU_CS_MODE_GROW, 4096, "prechain draw cs");
    tu_cs_init(&cmd_buffer->pre_chain.draw_epilogue_cs, device, TU_CS_MODE_GROW, 4096, "prechain draw epiligoue cs");
@@ -4165,6 +4204,7 @@ tu_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
    tu_cs_finish(&cmd_buffer->draw_cs);
    tu_cs_finish(&cmd_buffer->tile_store_cs);
    tu_cs_finish(&cmd_buffer->draw_epilogue_cs);
+   tu_cs_finish(&cmd_buffer->a5xx_binning_cs);
    tu_cs_finish(&cmd_buffer->sub_cs);
    tu_cs_finish(&cmd_buffer->pre_chain.draw_cs);
    tu_cs_finish(&cmd_buffer->pre_chain.draw_epilogue_cs);
@@ -4252,6 +4292,7 @@ tu_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
    tu_cs_reset(&cmd_buffer->draw_cs);
    tu_cs_reset(&cmd_buffer->tile_store_cs);
    tu_cs_reset(&cmd_buffer->draw_epilogue_cs);
+   tu_cs_reset(&cmd_buffer->a5xx_binning_cs);
    tu_cs_reset(&cmd_buffer->sub_cs);
    tu_cs_reset(&cmd_buffer->pre_chain.draw_cs);
    tu_cs_reset(&cmd_buffer->pre_chain.draw_epilogue_cs);
@@ -4366,6 +4407,7 @@ tu_cmd_buffer_begin(struct tu_cmd_buffer *cmd_buffer,
    tu_cs_begin(&cmd_buffer->cs);
    tu_cs_begin(&cmd_buffer->draw_cs);
    tu_cs_begin(&cmd_buffer->draw_epilogue_cs);
+   tu_cs_begin(&cmd_buffer->a5xx_binning_cs);
 
    if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
       if (u_trace_enabled(&cmd_buffer->device->trace_context)) {
@@ -4737,6 +4779,30 @@ tu_bind_descriptor_sets(struct tu_cmd_buffer *cmd,
    struct tu_descriptor_state *descriptors_state =
       tu_get_descriptors_state(cmd, bind_point);
 
+   /* Adreno 5xx: Skia binds the same sets before each draw. What they hold
+    * is written out with the draw, again only if they are other sets, or
+    * the same with other dynamic offsets.
+    */
+   const bool a5xx_gfx = tu_is_a5xx(cmd->device) &&
+                         bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS;
+   bool a5xx_same = a5xx_gfx &&
+                    info->firstSet + info->descriptorSetCount <=
+                    descriptors_state->max_sets_bound;
+   uint32_t a5xx_old_dyn[MAX_DYNAMIC_BUFFERS_SIZE];
+   if (a5xx_same) {
+      for (unsigned i = 0; i < info->descriptorSetCount; i++) {
+         struct tu_descriptor_set *set =
+            tu_descriptor_set_from_handle(info->pDescriptorSets[i]);
+         /* the push set is the same set with what was pushed last */
+         if (descriptors_state->sets[info->firstSet + i] != set ||
+             set == &descriptors_state->push_set)
+            a5xx_same = false;
+      }
+      if (a5xx_same)
+         memcpy(a5xx_old_dyn, descriptors_state->dynamic_descriptors,
+                sizeof(a5xx_old_dyn));
+   }
+
    descriptors_state->max_sets_bound =
       MAX2(descriptors_state->max_sets_bound,
            info->firstSet + info->descriptorSetCount);
@@ -4853,7 +4919,13 @@ tu_bind_descriptor_sets(struct tu_cmd_buffer *cmd,
    if (dynamic_offset_offset) {
       descriptors_state->max_dynamic_offset_size =
          MAX2(descriptors_state->max_dynamic_offset_size, dynamic_offset_offset);
+   }
 
+   /* Adreno 5xx reads the dynamic descriptors from dynamic_descriptors with
+    * each draw, it has no reserved set for them (reserved_set_idx is -1: the
+    * set_iova[] written below would be the end of dynamic_descriptors).
+    */
+   if (dynamic_offset_offset && !tu_is_a5xx(cmd->device)) {
       /* allocate and fill out dynamic descriptor set */
       struct tu_cs_memory dynamic_desc_set;
       int reserved_set_idx = cmd->device->physical_device->reserved_set_idx;
@@ -4872,6 +4944,11 @@ tu_bind_descriptor_sets(struct tu_cmd_buffer *cmd,
       assert(reserved_set_idx >= 0); /* reserved set must be bound */
       descriptors_state->set_iova[reserved_set_idx] = dynamic_desc_set.iova | BINDLESS_DESCRIPTOR_64B;
    }
+
+   if (a5xx_same &&
+       !memcmp(a5xx_old_dyn, descriptors_state->dynamic_descriptors,
+               sizeof(a5xx_old_dyn)))
+      return;
 
    tu_dirty_desc_sets(cmd, bind_point);
 }
@@ -5364,6 +5441,7 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
    tu_cs_end(&cmd_buffer->cs);
    tu_cs_end(&cmd_buffer->draw_cs);
    tu_cs_end(&cmd_buffer->draw_epilogue_cs);
+   tu_cs_end(&cmd_buffer->a5xx_binning_cs);
 
    for (struct tu_cs *cs : { &cmd_buffer->cs, &cmd_buffer->draw_cs, &cmd_buffer->draw_epilogue_cs,
                              &cmd_buffer->tile_store_cs, &cmd_buffer->sub_cs }) {
@@ -5489,13 +5567,33 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
    if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
       cmd->state.shaders[MESA_SHADER_COMPUTE] =
          pipeline->shaders[MESA_SHADER_COMPUTE];
-      tu_cs_emit_state_ib(&cmd->cs,
-                          pipeline->shaders[MESA_SHADER_COMPUTE]->state);
+      /* Adreno 5xx: written out with the dispatch, see tu5_dispatch() */
+      if (!tu_is_a5xx(cmd->device)) {
+         tu_cs_emit_state_ib(&cmd->cs,
+                             pipeline->shaders[MESA_SHADER_COMPUTE]->state);
+      }
       cmd->state.compute_load_state = pipeline->load_state;
       return;
    }
 
    assert(pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS);
+
+   /* Binding the pipeline that is bound changes nothing, unless a state it
+    * has static was set since: binding it again restores that (such a set
+    * is dirty, as a draw may not come between: VUID-vkCmdDraw-None-02859).
+    * Copying all of its dynamic state again is the most of what recording a
+    * draw costs where each is bound before.
+    */
+   if (tu_is_a5xx(cmd->device)) {
+      if (cmd->state.a5xx_gfx_pipeline == pipeline) {
+         BITSET_DECLARE(touched, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX);
+         BITSET_AND(touched, cmd->vk.dynamic_graphics_state.dirty,
+                    tu_pipeline_to_graphics(pipeline)->dynamic_state.set);
+         if (BITSET_IS_EMPTY(touched))
+            return;
+      }
+      cmd->state.a5xx_gfx_pipeline = pipeline;
+   }
 
    struct tu_graphics_pipeline *gfx_pipeline = tu_pipeline_to_graphics(pipeline);
    cmd->state.dirty |= TU_CMD_DIRTY_DESC_SETS | TU_CMD_DIRTY_SHADER_CONSTS |
@@ -5567,7 +5665,8 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
    /* note: this also avoids emitting draw states before renderpass clears,
     * which may use the 3D clear path (for MSAA cases)
     */
-   if (!(cmd->state.dirty & TU_CMD_DIRTY_DRAW_STATE)) {
+   if (!(cmd->state.dirty & TU_CMD_DIRTY_DRAW_STATE) &&
+       !tu_is_a5xx(cmd->device)) {
       struct tu_cs *cs = &cmd->draw_cs;
 
       tu_cs_emit_pkt7(cs, CP_SET_DRAW_STATE, 3 * (10 + util_bitcount(set_state_mask)));
@@ -6350,6 +6449,13 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
 
          tu_lrz_flush_valid_at_secondary_rp_boundary(
             cmd, secondary->state.lrz, &cmd->draw_cs);
+         if (tu_is_a5xx(cmd->device)) {
+            tu5_write_view_bases(cmd, &cmd->draw_cs);
+            /* what the secondary command buffer leaves is not known */
+            cmd->state.a5xx_vs = cmd->state.a5xx_fs = NULL;
+            /* nor are its draws in the binning pass: every tile draws all */
+            cmd->state.a5xx_binning = false;
+         }
 
          result = tu_cs_add_entries(&cmd->draw_cs, &secondary->draw_cs);
          if (result != VK_SUCCESS) {
@@ -6918,6 +7024,14 @@ tu_emit_subpass_begin(struct tu_cmd_buffer *cmd)
 {
    struct tu_resolve_group resolve_group = {};
 
+   if (tu_is_a5xx(cmd->device)) {
+      tu5_emit_subpass_begin(cmd);
+      tu_set_input_attachments<CHIP>(cmd, cmd->state.subpass);
+      vk_cmd_set_cb_attachment_count(&cmd->vk, cmd->state.subpass->color_count);
+      cmd->state.dirty |= TU_CMD_DIRTY_SUBPASS;
+      return;
+   }
+
    tu_emit_subpass_custom_resolve<CHIP>(cmd);
    tu_emit_subpass_begin_gmem<CHIP>(cmd, &resolve_group);
    tu_emit_subpass_begin_sysmem<CHIP>(cmd);
@@ -7046,6 +7160,11 @@ tu_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
    }
 
    tu_choose_gmem_layout(cmd);
+   if (tu_is_a5xx(cmd->device)) {
+      cmd->state.a5xx_gmem = tu5_use_gmem(cmd);
+      cmd->state.a5xx_binning =
+         cmd->state.a5xx_gmem && tu5_use_binning(cmd);
+   }
 
    /* Note: because this is external, any flushes will happen before draw_cs
     * gets called. However deferred flushes could have to happen later as part
@@ -7255,6 +7374,9 @@ tu_CmdBeginRendering(VkCommandBuffer commandBuffer,
    }
 
    tu_choose_gmem_layout(cmd);
+   /* Adreno 5xx: the dynamic render passes are drawn in memory */
+   cmd->state.a5xx_gmem = false;
+   cmd->state.a5xx_binning = false;
 
    cmd->state.renderpass_cache.pending_flush_bits =
       cmd->state.cache.pending_flush_bits;
@@ -7462,7 +7584,11 @@ tu_CmdNextSubpass2(VkCommandBuffer commandBuffer,
 
    tu_next_subpass_lrz(cmd, subpass, new_subpass);
 
-   if (cmd->state.tiling->possible) {
+   /* Adreno 5xx: the render passes go to the images themselves, for now */
+   const bool tiling_possible =
+      cmd->state.tiling->possible && !tu_is_a5xx(cmd->device);
+
+   if (tiling_possible) {
       if (cmd->state.pass->has_fdm)
          tu_cs_set_writeable(cs, true);
 
@@ -7484,7 +7610,7 @@ tu_CmdNextSubpass2(VkCommandBuffer commandBuffer,
 
    tu6_emit_sysmem_resolves<CHIP>(cmd, cs, subpass);
 
-   if (cmd->state.tiling->possible)
+   if (tiling_possible)
       tu_cond_exec_end(cs);
 
    /* Handle dependencies for the next subpass */
@@ -8411,6 +8537,14 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
                 /* note: draw_count is 0 for indirect */
                 uint32_t draw_count)
 {
+   if (tu_is_a5xx(cmd->device)) {
+      /* what the barriers between the subpasses left to be flushed, for an
+       * attachment written by one to be read by the next
+       */
+      tu_emit_cache_flush_renderpass<CHIP>(cmd);
+      return tu5_draw_state(cmd, cs, indexed);
+   }
+
    const struct tu_program_state *program = &cmd->state.program;
    struct tu_render_pass_state *rp = &cmd->state.rp;
 
@@ -8803,6 +8937,14 @@ tu6_emit_vs_params(struct tu_cmd_buffer *cmd,
                    uint32_t vertex_offset,
                    uint32_t first_instance)
 {
+   if (tu_is_a5xx(cmd->device)) {
+      /* Written out with the rest of the state of the draw */
+      cmd->state.last_vs_params.vertex_offset = vertex_offset;
+      cmd->state.last_vs_params.first_instance = first_instance;
+      cmd->state.last_vs_params.draw_id = draw_id;
+      return;
+   }
+
    uint32_t offset = vs_params_offset(cmd);
 
    /* Beside re-emitting params when they are changed, we should re-emit
@@ -8871,6 +9013,47 @@ tu6_emit_vs_params(struct tu_cmd_buffer *cmd,
    cmd->state.dirty |= TU_CMD_DIRTY_VS_PARAMS;
 }
 
+/* A draw, of the given id among those of a multi draw */
+template <chip CHIP>
+static void
+tu_draw(struct tu_cmd_buffer *cmd, uint32_t draw_id, uint32_t vertexCount,
+        uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance)
+{
+   struct tu_cs *cs = &cmd->draw_cs;
+
+   tu6_emit_vs_params(cmd, draw_id, firstVertex, firstInstance);
+
+   tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);
+
+   /* Adreno 5xx draws the views of multiview one after the other */
+   const bool a5xx = tu_is_a5xx(cmd->device);
+
+   u_foreach_bit (view, a5xx ? tu5_views(cmd) : 1) {
+      if (a5xx)
+         tu5_bind_view(cmd, cs, view);
+
+      tu_cs_emit_pkt7(cs, CP_DRAW_INDX_OFFSET, 3);
+      tu_cs_emit(cs, tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_INDEX));
+      tu_cs_emit(cs, instanceCount);
+      tu_cs_emit(cs, vertexCount);
+   }
+
+   trace_end_draw(&cmd->rp_trace, cs);
+   /* Adreno 5xx: the draw again for the binning pass, which sees all */
+   if (a5xx && cmd->state.a5xx_binning) {
+      struct tu_cs *bcs = &cmd->a5xx_binning_cs;
+
+      u_foreach_bit (view, tu5_views(cmd)) {
+         tu5_bind_view(cmd, bcs, view);
+         tu_cs_emit_pkt7(bcs, CP_DRAW_INDX_OFFSET, 3);
+         tu_cs_emit(bcs, tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_INDEX) &
+                            ~CP_DRAW_INDX_OFFSET_0_VIS_CULL__MASK);
+         tu_cs_emit(bcs, instanceCount);
+         tu_cs_emit(bcs, vertexCount);
+      }
+   }
+}
+
 template <chip CHIP>
 VKAPI_ATTR void VKAPI_CALL
 tu_CmdDraw(VkCommandBuffer commandBuffer,
@@ -8880,18 +9063,9 @@ tu_CmdDraw(VkCommandBuffer commandBuffer,
            uint32_t firstInstance)
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
-   struct tu_cs *cs = &cmd->draw_cs;
 
-   tu6_emit_vs_params(cmd, 0, firstVertex, firstInstance);
-
-   tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);
-
-   tu_cs_emit_pkt7(cs, CP_DRAW_INDX_OFFSET, 3);
-   tu_cs_emit(cs, tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_INDEX));
-   tu_cs_emit(cs, instanceCount);
-   tu_cs_emit(cs, vertexCount);
-
-   trace_end_draw(&cmd->rp_trace, cs);
+   tu_draw<CHIP>(cmd, 0, vertexCount, instanceCount, firstVertex,
+                 firstInstance);
 }
 TU_GENX(tu_CmdDraw);
 
@@ -8909,6 +9083,19 @@ tu_CmdDrawMultiEXT(VkCommandBuffer commandBuffer,
 
    if (!drawCount)
       return;
+
+   /* Adreno 5xx writes the parameters of a draw (its id, its offsets) with
+    * its state, and draws the views one after the other: the draws one by
+    * one
+    */
+   if (tu_is_a5xx(cmd->device)) {
+      uint32_t i = 0;
+      vk_foreach_multi_draw(draw, i, pVertexInfo, drawCount, stride) {
+         tu_draw<CHIP>(cmd, i, draw->vertexCount, instanceCount,
+                       draw->firstVertex, firstInstance);
+      }
+      return;
+   }
 
    bool has_tess = cmd->state.shaders[MESA_SHADER_TESS_CTRL]->variant;
 
@@ -8944,6 +9131,54 @@ tu_CmdDrawMultiEXT(VkCommandBuffer commandBuffer,
 }
 TU_GENX(tu_CmdDrawMultiEXT);
 
+/* An indexed draw, of the given id among those of a multi draw */
+template <chip CHIP>
+static void
+tu_draw_indexed(struct tu_cmd_buffer *cmd, uint32_t draw_id,
+                uint32_t indexCount, uint32_t instanceCount,
+                uint32_t firstIndex, int32_t vertexOffset,
+                uint32_t firstInstance)
+{
+   struct tu_cs *cs = &cmd->draw_cs;
+
+   tu6_emit_vs_params(cmd, draw_id, vertexOffset, firstInstance);
+
+   tu6_draw_common<CHIP>(cmd, cs, true, indexCount);
+
+   const bool a5xx = tu_is_a5xx(cmd->device);
+
+   u_foreach_bit (view, a5xx ? tu5_views(cmd) : 1) {
+      if (a5xx)
+         tu5_bind_view(cmd, cs, view);
+
+      tu_cs_emit_pkt7(cs, CP_DRAW_INDX_OFFSET, 7);
+      tu_cs_emit(cs, tu_draw_initiator(cmd, DI_SRC_SEL_DMA));
+      tu_cs_emit(cs, instanceCount);
+      tu_cs_emit(cs, indexCount);
+      tu_cs_emit(cs, firstIndex);
+      tu_cs_emit_qw(cs, cmd->state.index_va);
+      tu_cs_emit(cs, cmd->state.max_index_count);
+   }
+
+   trace_end_draw(&cmd->rp_trace, cs);
+   /* Adreno 5xx: the draw again for the binning pass, which sees all */
+   if (a5xx && cmd->state.a5xx_binning) {
+      struct tu_cs *bcs = &cmd->a5xx_binning_cs;
+
+      u_foreach_bit (view, tu5_views(cmd)) {
+         tu5_bind_view(cmd, bcs, view);
+         tu_cs_emit_pkt7(bcs, CP_DRAW_INDX_OFFSET, 7);
+         tu_cs_emit(bcs, tu_draw_initiator(cmd, DI_SRC_SEL_DMA) &
+                            ~CP_DRAW_INDX_OFFSET_0_VIS_CULL__MASK);
+         tu_cs_emit(bcs, instanceCount);
+         tu_cs_emit(bcs, indexCount);
+         tu_cs_emit(bcs, firstIndex);
+         tu_cs_emit_qw(bcs, cmd->state.index_va);
+         tu_cs_emit(bcs, cmd->state.max_index_count);
+      }
+   }
+}
+
 template <chip CHIP>
 VKAPI_ATTR void VKAPI_CALL
 tu_CmdDrawIndexed(VkCommandBuffer commandBuffer,
@@ -8954,21 +9189,9 @@ tu_CmdDrawIndexed(VkCommandBuffer commandBuffer,
                   uint32_t firstInstance)
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
-   struct tu_cs *cs = &cmd->draw_cs;
 
-   tu6_emit_vs_params(cmd, 0, vertexOffset, firstInstance);
-
-   tu6_draw_common<CHIP>(cmd, cs, true, indexCount);
-
-   tu_cs_emit_pkt7(cs, CP_DRAW_INDX_OFFSET, 7);
-   tu_cs_emit(cs, tu_draw_initiator(cmd, DI_SRC_SEL_DMA));
-   tu_cs_emit(cs, instanceCount);
-   tu_cs_emit(cs, indexCount);
-   tu_cs_emit(cs, firstIndex);
-   tu_cs_emit_qw(cs, cmd->state.index_va);
-   tu_cs_emit(cs, cmd->state.max_index_count);
-
-   trace_end_draw(&cmd->rp_trace, cs);
+   tu_draw_indexed<CHIP>(cmd, 0, indexCount, instanceCount, firstIndex,
+                         vertexOffset, firstInstance);
 }
 TU_GENX(tu_CmdDrawIndexed);
 
@@ -8987,6 +9210,19 @@ tu_CmdDrawMultiIndexedEXT(VkCommandBuffer commandBuffer,
 
    if (!drawCount)
       return;
+
+   /* Adreno 5xx: the draws one by one, see tu_CmdDrawMultiEXT() */
+   if (tu_is_a5xx(cmd->device)) {
+      uint32_t i = 0;
+      vk_foreach_multi_draw_indexed(draw, i, pIndexInfo, drawCount, stride) {
+         tu_draw_indexed<CHIP>(cmd, i, draw->indexCount, instanceCount,
+                               draw->firstIndex,
+                               pVertexOffset ? *pVertexOffset
+                                             : draw->vertexOffset,
+                               firstInstance);
+      }
+      return;
+   }
 
    bool has_tess = cmd->state.shaders[MESA_SHADER_TESS_CTRL]->variant;
 
@@ -9059,6 +9295,26 @@ tu_CmdDrawIndirect(VkCommandBuffer commandBuffer,
 
    tu6_draw_common<CHIP>(cmd, cs, false, 0);
 
+   if (tu_is_a5xx(cmd->device)) {
+      u_foreach_bit (view, tu5_views(cmd)) {
+         tu5_bind_view(cmd, cs, view);
+         tu5_draw_indirect(cmd, cs,
+                           tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_INDEX), false,
+                           vk_buffer_address(&buf->vk, offset), drawCount, stride);
+      }
+      /* again for the binning pass, which sees all */
+      if (cmd->state.a5xx_binning) {
+         u_foreach_bit (view, tu5_views(cmd)) {
+            tu5_bind_view(cmd, &cmd->a5xx_binning_cs, view);
+            tu5_draw_indirect(cmd, &cmd->a5xx_binning_cs,
+                              tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_INDEX) &
+                                 ~CP_DRAW_INDX_OFFSET_0_VIS_CULL__MASK,
+                              false, vk_buffer_address(&buf->vk, offset), drawCount, stride);
+         }
+      }
+      return;
+   }
+
    tu_cs_emit_pkt7(cs, CP_DRAW_INDIRECT_MULTI, 6);
    tu_cs_emit(cs, tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_INDEX));
    tu_cs_emit(cs, A6XX_CP_DRAW_INDIRECT_MULTI_1_OPCODE(INDIRECT_OP_NORMAL) |
@@ -9089,6 +9345,25 @@ tu_CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer,
       draw_wfm(cmd);
 
    tu6_draw_common<CHIP>(cmd, cs, true, 0);
+
+   if (tu_is_a5xx(cmd->device)) {
+      u_foreach_bit (view, tu5_views(cmd)) {
+         tu5_bind_view(cmd, cs, view);
+         tu5_draw_indirect(cmd, cs, tu_draw_initiator(cmd, DI_SRC_SEL_DMA),
+                           true, vk_buffer_address(&buf->vk, offset), drawCount, stride);
+      }
+      /* again for the binning pass, which sees all */
+      if (cmd->state.a5xx_binning) {
+         u_foreach_bit (view, tu5_views(cmd)) {
+            tu5_bind_view(cmd, &cmd->a5xx_binning_cs, view);
+            tu5_draw_indirect(cmd, &cmd->a5xx_binning_cs,
+                              tu_draw_initiator(cmd, DI_SRC_SEL_DMA) &
+                                 ~CP_DRAW_INDX_OFFSET_0_VIS_CULL__MASK,
+                              true, vk_buffer_address(&buf->vk, offset), drawCount, stride);
+         }
+      }
+      return;
+   }
 
    tu_cs_emit_pkt7(cs, CP_DRAW_INDIRECT_MULTI, 9);
    tu_cs_emit(cs, tu_draw_initiator(cmd, DI_SRC_SEL_DMA));
@@ -9472,6 +9747,13 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
       shader->variant->instrlen >
       cmd->device->physical_device->info->props.instr_cache_size;
 
+   if (tu_is_a5xx(cmd->device)) {
+      tu_emit_cache_flush<CHIP>(cmd);
+      tu5_dispatch(cmd, info->blocks, info->offsets, info->indirect);
+      cmd->state.dirty &= ~TU_CMD_DIRTY_COMPUTE_DESC_SETS;
+      return;
+   }
+
    /* We don't use draw states for dispatches, so the bound pipeline
     * could be overwritten by reg stomping in a renderpass or blit.
     */
@@ -9842,6 +10124,7 @@ tu_CmdEndRenderPass2(VkCommandBuffer commandBuffer,
 
    tu_cs_end(&cmd_buffer->draw_cs);
    tu_cs_end(&cmd_buffer->draw_epilogue_cs);
+   tu_cs_end(&cmd_buffer->a5xx_binning_cs);
    TU_CALLX(cmd_buffer->device, tu_cmd_render)(cmd_buffer, fdm_offsets);
 
    cmd_buffer->state.cache.pending_flush_bits |=
@@ -10340,6 +10623,12 @@ tu_CmdWriteBufferMarker2AMD(VkCommandBuffer commandBuffer,
    if (cache->flush_bits && is_top_of_pipe) {
       cache->flush_bits |= TU_CMD_FLAG_WAIT_FOR_IDLE;
    }
+   /* Adreno 5xx: what the shaders of the draws before wrote may still be in
+    * UCHE, the barrier before notwithstanding, when the marker is written
+    * from a render pass: the CP writes after it is out.
+    */
+   if (tu_is_a5xx(cmd->device))
+      cache->flush_bits |= TU_CMD_FLAG_CACHE_CLEAN | TU_CMD_FLAG_WAIT_FOR_IDLE;
 
    if (cmd->state.pass) {
       tu_emit_cache_flush_renderpass<CHIP>(cmd);

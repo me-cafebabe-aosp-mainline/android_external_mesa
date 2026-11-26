@@ -35,6 +35,12 @@ struct tu_image
       struct tu_sparse_vma vma;
    };
 
+   /* Adreno 5xx, the planes of a disjoint image being bound one by one:
+    * where the offsets of the layout of each are from, see
+    * tu_image_plane_iova()
+    */
+   uint64_t plane_base[3];
+
    /* For fragment density map */
    void *map;
 
@@ -65,6 +71,13 @@ struct tu_image_view
    struct fdl6_view *view_stencil;
 
    unsigned char swizzle[4];
+
+   /* Adreno 5xx, which has no multi-planar formats: the descriptors of the
+    * other planes of a view of one, that the shaders sample one by one (see
+    * TU5_YCBCR_PLANE_SLOT)
+    */
+   uint32_t a5xx_plane_descriptor[2][FDL6_TEX_CONST_DWORDS];
+   uint8_t a5xx_planes;
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(tu_image_view, vk.base, VkImageView,
                                VK_OBJECT_TYPE_IMAGE_VIEW);
@@ -82,6 +95,20 @@ void
 tu_image_view_init(struct tu_device *device,
                    struct tu_image_view *iview,
                    const VkImageViewCreateInfo *pCreateInfo);
+/* The address the offsets of the layout of a plane are from */
+static inline uint64_t
+tu_image_plane_iova(const struct tu_image *image, unsigned plane)
+{
+   return (image->vk.create_flags & VK_IMAGE_CREATE_DISJOINT_BIT)
+             ? image->plane_base[plane] : image->iova;
+}
+
+/* Where a plane of an image begins in it, and its size */
+static inline uint64_t
+tu_image_plane_start(const struct tu_image *image, unsigned plane)
+{
+   return plane ? image->layout[plane].slices[0].offset : 0;
+}
 
 uint32_t tu6_plane_count(VkFormat format);
 

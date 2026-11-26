@@ -1548,6 +1548,14 @@ emit_intrinsic_atomic_shared(struct ir3_context *ctx, nir_intrinsic_instr *intr)
    atomic->barrier_class = IR3_BARRIER_SHARED_W;
    atomic->barrier_conflict = IR3_BARRIER_SHARED_R | IR3_BARRIER_SHARED_W;
 
+   /* a5xx returns the old value in the register of the new one, as the
+    * blob has it: with another register, workgroups of more than 256
+    * invocations that wait at a barrier after it fault.
+    */
+   if (ctx->compiler->gen == 5 &&
+       nir_intrinsic_atomic_op(intr) != nir_atomic_op_cmpxchg)
+      ir3_reg_tie(atomic->dsts[0], atomic->srcs[1]);
+
    /* even if nothing consume the result, we can't DCE the instruction: */
    array_insert(ctx->block, ctx->block->keeps, atomic);
 
@@ -2177,6 +2185,38 @@ emit_intrinsic_barrier(struct ir3_context *ctx, nir_intrinsic_instr *intr)
          barrier->barrier_class |= IR3_BARRIER_IMAGE_W;
          barrier->barrier_conflict |=
             IR3_BARRIER_IMAGE_W | IR3_BARRIER_IMAGE_R;
+      }
+
+      /* a5xx: fence.g.l is not a fence of the shared memory, what was
+       * stored there was not always what the loads after it read. As the
+       * blob has them: fence.l for the shared memory, then fence.g for
+       * the buffers and the images.
+       */
+      if (ctx->compiler->gen == 5) {
+         bool shared = modes & nir_var_mem_shared;
+         bool global = modes & (nir_var_mem_ssbo | nir_var_image |
+                                nir_var_mem_global);
+
+         barrier->cat7.l = shared;
+         barrier->cat7.g = global && !shared;
+
+         if (shared && global) {
+            struct ir3_instruction *fence_g;
+
+            array_insert(ctx->block, ctx->block->keeps, barrier);
+
+            /* Both are barriers to all that the one fence was: what is
+             * stored to the shared memory before them stays before what is
+             * stored to the buffers and the images after them.
+             */
+            fence_g = ir3_FENCE(b);
+            fence_g->cat7.r = true;
+            fence_g->cat7.w = true;
+            fence_g->cat7.g = true;
+            fence_g->barrier_class = barrier->barrier_class;
+            fence_g->barrier_conflict = barrier->barrier_conflict;
+            barrier = fence_g;
+         }
       }
 
       /* make sure barrier doesn't get DCE'd */
@@ -2941,6 +2981,21 @@ emit_intrinsic(struct ir3_context *ctx, nir_intrinsic_instr *intr)
       struct ir3_instruction *offset =
          ir3_RGETPOS(b, ir3_get_src(ctx, &intr->src[0])[0], 0);
       offset->dsts[0]->wrmask = 0x3;
+
+      if (ctx->compiler->gen == 5) {
+         /* a5xx gets no f32 positions (every sample at the same one): get
+          * the f16 ones and convert them, as the blob does
+          */
+         struct ir3_instruction *pos[2];
+
+         offset->cat5.type = TYPE_F16;
+         offset->dsts[0]->flags |= IR3_REG_HALF;
+         ir3_split_dest(b, pos, offset, 0, 2);
+         for (unsigned i = 0; i < 2; i++)
+            dst[i] = ir3_COV(b, pos[i], TYPE_F16, TYPE_F32);
+         break;
+      }
+
       offset->cat5.type = TYPE_F32;
 
       ir3_split_dest(b, dst, offset, 0, 2);
@@ -2948,6 +3003,19 @@ emit_intrinsic(struct ir3_context *ctx, nir_intrinsic_instr *intr)
       break;
    }
    case nir_intrinsic_load_persp_center_rhw_ir3:
+      /* a5xx has no such input (nor GRAS_CNTL bit for it): what is read is
+       * the 1/w of the center, gl_FragCoord.w
+       * (dEQP-VK.pipeline.*.multisample_interpolation.
+       * sample_interpolate_at_*, without gl_FragCoord in the shader).
+       */
+      if (ctx->compiler->gen == 5) {
+         struct ir3_instruction *coord[4];
+
+         ir3_split_dest(b, coord, get_frag_coord(ctx, intr), 0, 4);
+         ctx->so->fragcoord_compmask |= 0x8;
+         dst[0] = coord[3];
+         break;
+      }
       if (!ctx->ij[IJ_PERSP_CENTER_RHW]) {
          ctx->ij[IJ_PERSP_CENTER_RHW] =
             create_sysval_input(ctx, SYSTEM_VALUE_BARYCENTRIC_PERSP_CENTER_RHW, 0x1);
@@ -3079,6 +3147,21 @@ emit_intrinsic(struct ir3_context *ctx, nir_intrinsic_instr *intr)
             create_sysval_input(ctx, SYSTEM_VALUE_SAMPLE_MASK_IN, 0x1);
       }
       dst[0] = ctx->samp_mask_in;
+
+      /* a5xx gives the coverage of the pixel to the invocations of each
+       * sample too: keep the bit of the sample, as the blob does
+       */
+      if (ctx->compiler->gen == 5 && ctx->so->sample_shading) {
+         if (!ctx->samp_id) {
+            ctx->samp_id = create_sysval_input(ctx, SYSTEM_VALUE_SAMPLE_ID, 0x1);
+            ctx->samp_id->dsts[0]->flags |= IR3_REG_HALF;
+         }
+         struct ir3_instruction *id =
+            ir3_COV(b, ctx->samp_id, TYPE_U16, TYPE_U32);
+         struct ir3_instruction *bit =
+            ir3_SHL_B(b, create_immed(b, 1), 0, id, 0);
+         dst[0] = ir3_AND_B(b, ctx->samp_mask_in, 0, bit, 0);
+      }
       break;
    case nir_intrinsic_load_user_clip_plane:
       idx = nir_intrinsic_ucp_id(intr);

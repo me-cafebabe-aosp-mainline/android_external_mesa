@@ -44,6 +44,81 @@ struct tu_push_constant_range
    enum ir3_push_consts_type type;
 };
 
+/* Adreno 5xx has no bindless descriptors: a shader numbers the textures,
+ * the samplers and the uniform buffers it uses, and these are where the
+ * descriptor of each number is, to be written out with the draws.
+ */
+#define TU5_MAX_TEXTURES 128
+#define TU5_MAX_SAMPLERS 16
+#define TU5_MAX_UBOS     32
+#define TU5_MAX_SSBOS    24
+#define TU5_MAX_IMAGES   8
+/* The slots of the storage state of the graphics shaders (buffers and
+ * images), which the vertex and the fragment shader share: the first ones
+ * for the fragment shader, the last ones for the vertex shader (see
+ * tu5_desc_map::vs_ibo_base). The hardware has at least that many.
+ */
+#define TU5_GFX_IBO_SLOTS 32
+
+enum tu5_desc_kind {
+   TU5_DESC_TEXTURE,
+   TU5_DESC_SAMPLER,
+   TU5_DESC_UBO,
+   TU5_DESC_SSBO,
+   TU5_DESC_IMAGE,
+   TU5_DESC_KINDS,
+};
+
+struct tu5_desc_ref
+{
+   uint8_t set;
+   /* in the dynamic descriptors of the command buffer, not in the set */
+   bool dynamic;
+   /* a storage buffer read as a uniform buffer */
+   bool storage;
+   /* a storage image of no format in the shader: the format of the view */
+   bool real_format;
+   /* of the descriptor, in dwords */
+   uint32_t offset;
+};
+
+struct tu5_desc_map
+{
+   uint8_t count[TU5_DESC_KINDS];
+   struct tu5_desc_ref tex[TU5_MAX_TEXTURES];
+   struct tu5_desc_ref samp[TU5_MAX_SAMPLERS];
+   struct tu5_desc_ref ubo[TU5_MAX_UBOS];
+   struct tu5_desc_ref ssbo[TU5_MAX_SSBOS];
+   struct tu5_desc_ref image[TU5_MAX_IMAGES];
+
+   /* The texture each sampler samples, as its number + 1: 0 when it is not
+    * known (indexed dynamically), 0xff when it samples several. For the
+    * built-in border colors of some formats, see TU5_TEX_FLAG_ALPHA_LOW.
+    */
+   uint8_t samp_tex[TU5_MAX_SAMPLERS];
+
+   /* Where the index of the view is among the constants, in dwords, or ~0:
+    * the views are drawn one after the other, each with its own.
+    */
+   uint32_t view_loc;
+
+   /* The vertex shader goes through the storage state it shares with the
+    * fragment shader, in the last of its slots from vs_ibo_base (those of
+    * the fragment shader being the first); it reads its storage buffers as
+    * uniform buffers otherwise.
+    */
+   bool vs_ibo;
+   uint8_t vs_ibo_base;
+
+   /* The numbers the bindings were given */
+   uint8_t num_bindings;
+   struct {
+      uint8_t set, kind, base;
+      uint32_t binding;
+   } bindings[TU5_MAX_TEXTURES + TU5_MAX_SAMPLERS + TU5_MAX_UBOS +
+              TU5_MAX_SSBOS + TU5_MAX_IMAGES];
+};
+
 struct tu_const_state
 {
    struct tu_push_constant_range push_consts;
@@ -70,12 +145,29 @@ struct tu_shader
    struct tu_cs cs;
    struct tu_bo *pvtmem_bo;
 
+   /* Where the instructions and the private memory of the variant are, for
+    * the Adrenos that have these written out with each draw (a5xx).
+    */
+   uint64_t binary_iova;
+   /* and of its binning variant, the vertex shader of the binning pass */
+   uint64_t binning_iova;
+   struct {
+      uint64_t iova;
+      uint32_t per_fiber_size;
+      uint32_t per_sp_size;
+   } pvtmem;
+
    struct tu_draw_state state;
    struct tu_draw_state safe_const_state;
    struct tu_draw_state binning_state;
    struct tu_draw_state safe_const_binning_state;
 
    struct tu_const_state const_state;
+
+   /* Adreno 5xx only, NULL otherwise: what the shader numbers, allocated
+    * with it (see tu5_desc_base())
+    */
+   struct tu5_desc_map *a5xx;
    uint32_t view_mask;
    uint8_t active_desc_sets;
 

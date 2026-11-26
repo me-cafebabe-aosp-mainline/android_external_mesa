@@ -9,6 +9,8 @@
 
 #include "tu_device.h"
 
+#include "tu5.h"
+
 #include "drm-uapi/drm_fourcc.h"
 #include "git_sha1.h"
 #include "perfcntrs/freedreno_perfcntr.h"
@@ -184,7 +186,8 @@ static bool tu_has_multiview(const struct tu_physical_device *device)
 /* We are generally VK 1.1 except A702, which has no multiview */
 static bool tu_is_vk_1_1(const struct tu_physical_device *device)
 {
-   return tu_has_multiview(device);
+   /* Adreno 5xx draws the views one after the other, see tu5_views() */
+   return tu_has_multiview(device) || device->info->chip == 5;
 }
 
 static void
@@ -413,6 +416,146 @@ get_device_extensions(const struct tu_physical_device *device,
       .VALVE_fragment_density_map_layered = tu_is_vk_1_1(device),
       .VALVE_mutable_descriptor_type = true,
    } };
+
+   /* Adreno 5xx: those that were made to work */
+   if (device->info->chip == 5) {
+      const struct vk_device_extension_table all = *ext;
+
+      *ext = (struct vk_device_extension_table) { .table = {
+         .KHR_bind_memory2 = true,
+         .KHR_create_renderpass2 = true,
+         .KHR_dedicated_allocation = true,
+         .KHR_depth_stencil_resolve = true,
+         .KHR_descriptor_update_template = true,
+         .KHR_driver_properties = true,
+         .KHR_external_fence = true,
+         .KHR_external_fence_fd = true,
+         .KHR_external_memory = true,
+         .KHR_external_memory_fd = true,
+         .KHR_external_semaphore = true,
+         .KHR_external_semaphore_fd = true,
+         .KHR_get_memory_requirements2 = true,
+         .KHR_image_format_list = true,
+         .KHR_imageless_framebuffer = true,
+         .KHR_incremental_present = all.KHR_incremental_present,
+         .KHR_maintenance1 = true,
+         .KHR_maintenance2 = true,
+         .KHR_maintenance3 = true,
+         .KHR_multiview = true,
+         .KHR_relaxed_block_layout = true,
+         .KHR_sampler_mirror_clamp_to_edge = true,
+         .KHR_sampler_ycbcr_conversion = true,
+         .EXT_device_memory_report = true,
+         .KHR_separate_depth_stencil_layouts = true,
+         .KHR_shader_draw_parameters = true,
+         .KHR_shader_float_controls = true,
+         .KHR_shader_subgroup_extended_types = true,
+         .KHR_spirv_1_4 = true,
+         .KHR_storage_buffer_storage_class = true,
+         .KHR_timeline_semaphore = true,
+         .KHR_uniform_buffer_standard_layout = true,
+         .EXT_host_query_reset = true,
+         .EXT_separate_stencil_usage = true,
+         .KHR_swapchain = all.KHR_swapchain,
+         .EXT_queue_family_foreign = true,
+         /* also in the stock driver */
+         .KHR_device_group = true,
+         .EXT_index_type_uint8 = true,
+         /* rectangular lines (the stock driver has no line mode) */
+         .EXT_line_rasterization = true,
+         .KHR_line_rasterization = true,
+         /* STORE_OP_NONE: not stored, see tu_render_pass_attachment */
+         .QCOM_render_pass_store_ops = true,
+         .EXT_pipeline_creation_cache_control = true,
+         .EXT_pipeline_creation_feedback = true,
+         .KHR_push_descriptor = true,
+         .EXT_sampler_filter_minmax = true,
+         .KHR_variable_pointers = true,
+         .EXT_global_priority = all.EXT_global_priority,
+         .KHR_global_priority = all.KHR_global_priority,
+         .EXT_global_priority_query = all.EXT_global_priority_query,
+         .ANDROID_external_memory_android_hardware_buffer =
+            all.ANDROID_external_memory_android_hardware_buffer,
+         .ANDROID_native_buffer = all.ANDROID_native_buffer,
+      } };
+
+      /* What does not depend on the hardware: the runtime, the API, the
+       * compiler
+       */
+      ext->EXT_tooling_info = all.EXT_tooling_info;
+      ext->EXT_private_data = all.EXT_private_data;
+      ext->KHR_copy_commands2 = all.KHR_copy_commands2;
+      ext->KHR_synchronization2 = all.KHR_synchronization2;
+      ext->KHR_format_feature_flags2 = all.KHR_format_feature_flags2;
+      ext->KHR_map_memory2 = all.KHR_map_memory2;
+      ext->GOOGLE_decorate_string = all.GOOGLE_decorate_string;
+      ext->GOOGLE_hlsl_functionality1 = all.GOOGLE_hlsl_functionality1;
+      ext->GOOGLE_user_type = all.GOOGLE_user_type;
+      ext->KHR_shader_non_semantic_info = all.KHR_shader_non_semantic_info;
+      ext->KHR_shader_terminate_invocation = all.KHR_shader_terminate_invocation;
+      ext->KHR_shader_expect_assume = all.KHR_shader_expect_assume;
+      ext->KHR_shader_relaxed_extended_instruction = all.KHR_shader_relaxed_extended_instruction;
+      ext->EXT_memory_budget = all.EXT_memory_budget;
+      ext->EXT_physical_device_drm = all.EXT_physical_device_drm;
+      ext->EXT_device_address_binding_report = all.EXT_device_address_binding_report;
+      ext->EXT_texel_buffer_alignment = all.EXT_texel_buffer_alignment;
+      ext->EXT_shader_module_identifier = all.EXT_shader_module_identifier;
+      ext->EXT_external_memory_dma_buf = all.EXT_external_memory_dma_buf;
+      ext->AMD_buffer_marker = all.AMD_buffer_marker;
+      ext->EXT_scalar_block_layout = all.EXT_scalar_block_layout;
+      ext->EXT_shader_demote_to_helper_invocation = all.EXT_shader_demote_to_helper_invocation;
+      ext->EXT_multi_draw = all.EXT_multi_draw;
+      ext->EXT_map_memory_placed = all.EXT_map_memory_placed;
+      ext->KHR_index_type_uint8 = all.KHR_index_type_uint8;
+      ext->KHR_pipeline_executable_properties = all.KHR_pipeline_executable_properties;
+      ext->KHR_shader_integer_dot_product = all.KHR_shader_integer_dot_product;
+      ext->KHR_shader_subgroup_rotate = all.KHR_shader_subgroup_rotate;
+      /* no VK_KHR_shader_subgroup_uniform_control_flow: with an invocation a
+       * subgroup there is nothing for it to guarantee, and its tests count
+       * on subgroups of more than one invocation
+       */
+      ext->EXT_subgroup_size_control = all.EXT_subgroup_size_control;
+      ext->EXT_shader_replicated_composites = all.EXT_shader_replicated_composites;
+
+      /* What the state of each draw is made from (tu5_draw_state() emits
+       * it all from the dynamic state)
+       */
+      ext->EXT_extended_dynamic_state = all.EXT_extended_dynamic_state;
+      ext->EXT_extended_dynamic_state2 = all.EXT_extended_dynamic_state2;
+      ext->EXT_extended_dynamic_state3 = all.EXT_extended_dynamic_state3;
+      ext->EXT_vertex_input_dynamic_state = all.EXT_vertex_input_dynamic_state;
+      ext->EXT_color_write_enable = all.EXT_color_write_enable;
+      ext->EXT_provoking_vertex = all.EXT_provoking_vertex;
+      ext->EXT_depth_clip_enable = all.EXT_depth_clip_enable;
+      ext->EXT_depth_clip_control = all.EXT_depth_clip_control;
+      ext->EXT_depth_clamp_zero_one = all.EXT_depth_clamp_zero_one;
+      ext->EXT_primitive_topology_list_restart = all.EXT_primitive_topology_list_restart;
+      ext->EXT_vertex_attribute_divisor = all.EXT_vertex_attribute_divisor;
+      ext->KHR_vertex_attribute_divisor = all.KHR_vertex_attribute_divisor;
+      ext->EXT_non_seamless_cube_map = all.EXT_non_seamless_cube_map;
+      ext->EXT_custom_border_color = all.EXT_custom_border_color;
+
+      /* dynamic rendering makes render passes */
+      ext->KHR_dynamic_rendering = all.KHR_dynamic_rendering;
+      ext->KHR_maintenance5 = all.KHR_maintenance5;
+      ext->KHR_maintenance6 = all.KHR_maintenance6;
+      ext->KHR_maintenance4 = all.KHR_maintenance4;
+
+      /* the compute workgroups that fit in the registers, the shared memory
+       * fenced apart from the rest (see ir3_ra.c, ir3_compiler_nir.c)
+       */
+      ext->KHR_zero_initialize_workgroup_memory = all.KHR_zero_initialize_workgroup_memory;
+      ext->KHR_vulkan_memory_model = all.KHR_vulkan_memory_model;
+      /* the inline uniform blocks loaded to the constants with the others
+       * (tu5_emit_user_consts()), the border colors swizzled as the image
+       */
+      ext->EXT_inline_uniform_block = all.EXT_inline_uniform_block;
+      ext->EXT_border_color_swizzle = all.EXT_border_color_swizzle;
+      /* the 3D texel fetches checked in the shader, see
+       * tu5_lower_txf_3d_bounds()
+       */
+      ext->EXT_image_robustness = all.EXT_image_robustness;
+   }
 }
 
 static void
@@ -921,6 +1064,140 @@ tu_get_features(struct tu_physical_device *pdevice,
    features->presentAtRelativeTime = true;
    features->presentAtAbsoluteTime = true;
 #endif
+
+   /* Adreno 5xx: those that were made to work */
+   if (pdevice->info->chip == 5) {
+      const struct vk_features all = *features;
+      *features = (struct vk_features) { false };
+
+      /* what does not depend on the hardware */
+      features->privateData = all.privateData;
+      features->synchronization2 = all.synchronization2;
+      features->shaderTerminateInvocation = all.shaderTerminateInvocation;
+      features->shaderDemoteToHelperInvocation = all.shaderDemoteToHelperInvocation;
+      features->multiDraw = all.multiDraw;
+      features->scalarBlockLayout = all.scalarBlockLayout;
+      features->pipelineExecutableInfo = all.pipelineExecutableInfo;
+      features->shaderIntegerDotProduct = all.shaderIntegerDotProduct;
+      features->subgroupSizeControl = all.subgroupSizeControl;
+      features->computeFullSubgroups = all.computeFullSubgroups;
+      features->shaderModuleIdentifier = all.shaderModuleIdentifier;
+      features->texelBufferAlignment = all.texelBufferAlignment;
+      features->maintenance4 = all.maintenance4;
+      features->memoryMapPlaced = all.memoryMapPlaced;
+      features->memoryUnmapReserve = all.memoryUnmapReserve;
+      features->shaderExpectAssume = all.shaderExpectAssume;
+      features->shaderRelaxedExtendedInstruction = all.shaderRelaxedExtendedInstruction;
+      features->shaderReplicatedComposites = all.shaderReplicatedComposites;
+      features->reportAddressBinding = all.reportAddressBinding;
+      features->shaderSubgroupRotate = all.shaderSubgroupRotate;
+      features->shaderSubgroupRotateClustered = all.shaderSubgroupRotateClustered;
+      features->indexTypeUint8 = all.indexTypeUint8;
+      /* VK_KHR_line_rasterization is to have one of the line modes: the
+       * rectangular lines are those drawn by default (strictLines), which
+       * the rasterization tests pass
+       */
+      features->rectangularLines = all.rectangularLines;
+
+      /* the state of each draw, see tu5_draw_state() */
+      features->logicOp = all.logicOp;
+      features->extendedDynamicState = all.extendedDynamicState;
+      features->extendedDynamicState2 = all.extendedDynamicState2;
+      features->extendedDynamicState2LogicOp = all.extendedDynamicState2LogicOp;
+      features->extendedDynamicState3DepthClampEnable = all.extendedDynamicState3DepthClampEnable;
+      features->extendedDynamicState3PolygonMode = all.extendedDynamicState3PolygonMode;
+      features->extendedDynamicState3RasterizationSamples = all.extendedDynamicState3RasterizationSamples;
+      features->extendedDynamicState3SampleMask = all.extendedDynamicState3SampleMask;
+      features->extendedDynamicState3AlphaToCoverageEnable = all.extendedDynamicState3AlphaToCoverageEnable;
+      features->extendedDynamicState3AlphaToOneEnable = all.extendedDynamicState3AlphaToOneEnable;
+      features->extendedDynamicState3LogicOpEnable = all.extendedDynamicState3LogicOpEnable;
+      features->extendedDynamicState3ColorBlendEnable = all.extendedDynamicState3ColorBlendEnable;
+      features->extendedDynamicState3ColorBlendEquation = all.extendedDynamicState3ColorBlendEquation;
+      features->extendedDynamicState3ColorWriteMask = all.extendedDynamicState3ColorWriteMask;
+      features->extendedDynamicState3DepthClipEnable = all.extendedDynamicState3DepthClipEnable;
+      features->extendedDynamicState3ProvokingVertexMode = all.extendedDynamicState3ProvokingVertexMode;
+      features->extendedDynamicState3LineRasterizationMode = all.extendedDynamicState3LineRasterizationMode;
+      features->extendedDynamicState3DepthClipNegativeOneToOne = all.extendedDynamicState3DepthClipNegativeOneToOne;
+      features->vertexInputDynamicState = all.vertexInputDynamicState;
+      features->colorWriteEnable = all.colorWriteEnable;
+      features->provokingVertexLast = all.provokingVertexLast;
+      features->depthClipEnable = all.depthClipEnable;
+      features->depthClipControl = all.depthClipControl;
+      features->depthClampZeroOne = all.depthClampZeroOne;
+      features->primitiveTopologyListRestart = all.primitiveTopologyListRestart;
+      features->vertexAttributeInstanceRateDivisor = all.vertexAttributeInstanceRateDivisor;
+      features->nonSeamlessCubeMap = all.nonSeamlessCubeMap;
+      features->customBorderColors = all.customBorderColors;
+
+      /* Not descriptor indexing: a shader has a state of its own for each
+       * element of the arrays it uses, which those of the tests overflow.
+       * Not inline uniform blocks: descriptorset_random fails.
+       */
+      features->dynamicRendering = all.dynamicRendering;
+      features->maintenance5 = all.maintenance5;
+      features->maintenance6 = all.maintenance6;
+      features->shaderZeroInitializeWorkgroupMemory = all.shaderZeroInitializeWorkgroupMemory;
+      features->vulkanMemoryModel = all.vulkanMemoryModel;
+      features->vulkanMemoryModelDeviceScope = all.vulkanMemoryModelDeviceScope;
+      features->vulkanMemoryModelAvailabilityVisibilityChains = all.vulkanMemoryModelAvailabilityVisibilityChains;
+      features->inlineUniformBlock = all.inlineUniformBlock;
+      features->borderColorSwizzle = all.borderColorSwizzle;
+      features->borderColorSwizzleFromImage = all.borderColorSwizzleFromImage;
+      features->robustImageAccess = all.robustImageAccess;
+
+
+      features->robustBufferAccess = true;
+      features->fullDrawIndexUint32 = true;
+      features->imageCubeArray = true;
+      features->independentBlend = true;
+      features->depthBiasClamp = true;
+      features->fillModeNonSolid = true;
+      features->largePoints = true;
+      features->samplerAnisotropy = true;
+      features->textureCompressionETC2 = true;
+      features->textureCompressionASTC_LDR = true;
+      features->textureCompressionBC = true;
+      features->samplerMirrorClampToEdge = true;
+      features->fragmentStoresAndAtomics = true;
+      features->multiDrawIndirect = true;
+      features->occlusionQueryPrecise = true;
+      features->multiview = true;
+      features->shaderDrawParameters = true;
+
+      /* what Vulkan 1.2 requires */
+      features->imagelessFramebuffer = true;
+      features->uniformBufferStandardLayout = true;
+      features->shaderSubgroupExtendedTypes = true;
+      features->separateDepthStencilLayouts = true;
+      features->hostQueryReset = true;
+      features->timelineSemaphore = true;
+      features->subgroupBroadcastDynamicId = true;
+
+      /* also in the stock driver */
+      features->inheritedQueries = true;
+      features->pipelineCreationCacheControl = true;
+      features->indexTypeUint8 = true;
+      features->depthClamp = true;
+      features->shaderClipDistance = true;
+      features->shaderCullDistance = true;
+      features->sampleRateShading = true;
+      features->dualSrcBlend = true;
+      features->alphaToOne = true;
+      features->shaderUniformBufferArrayDynamicIndexing = true;
+      features->shaderSampledImageArrayDynamicIndexing = true;
+      features->shaderStorageBufferArrayDynamicIndexing = true;
+      features->shaderStorageImageArrayDynamicIndexing = true;
+      features->shaderInt16 = true;
+      features->shaderImageGatherExtended = true;
+      features->shaderStorageImageWriteWithoutFormat = true;
+      features->variablePointersStorageBuffer = true;
+      features->variablePointers = true;
+      features->globalPriorityQuery = true;
+      features->samplerFilterMinmax = true;
+      features->vertexPipelineStoresAndAtomics = true;
+      features->samplerYcbcrConversion = true;
+      features->deviceMemoryReport = true;
+   }
 }
 
 static void
@@ -952,9 +1229,24 @@ tu_get_physical_device_properties_1_1(struct tu_physical_device *pdevice,
 
    p->subgroupQuadOperationsInAllStages = false;
 
+   /* Adreno 5xx: each invocation is a subgroup of its own, see
+    * ir3_nir_lower_subgroups_of_one()
+    */
+   if (pdevice->info->chip == 5) {
+      p->subgroupSize = 1;
+      p->subgroupSupportedStages = VK_SHADER_STAGE_COMPUTE_BIT |
+                                   VK_SHADER_STAGE_FRAGMENT_BIT |
+                                   VK_SHADER_STAGE_VERTEX_BIT;
+      p->subgroupSupportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT |
+                                       VK_SUBGROUP_FEATURE_VOTE_BIT;
+   }
+
    p->pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_ALL_CLIP_PLANES;
    p->maxMultiviewViewCount =
       tu_has_multiview(pdevice) ? MAX_VIEWS : 1;
+   /* Adreno 5xx draws the views one after the other */
+   if (pdevice->info->chip == 5)
+      p->maxMultiviewViewCount = MAX_VIEWPORTS;
    p->maxMultiviewInstanceIndex = INT_MAX;
    p->protectedNoFault = false;
    /* Our largest descriptors are 2 texture descriptors, or a texture and
@@ -999,6 +1291,19 @@ tu_get_physical_device_properties_1_2(struct tu_physical_device *pdevice,
          .patch = 1,
       };
    }
+
+   /* Adreno 5xx: the version of the conformance tests it is run with (that
+    * of Android 14), not one it was submitted with. It is to be a known
+    * one, of no older a version than that of the API (1.2): there are only
+    * those of 1.3 in that list.
+    */
+   if (pdevice->info->chip == 5)
+      p->conformanceVersion = (VkConformanceVersion) {
+         .major = 1,
+         .minor = 3,
+         .subminor = 8,
+         .patch = 0,
+      };
 
    p->denormBehaviorIndependence =
       VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL;
@@ -1066,6 +1371,12 @@ tu_get_physical_device_properties_1_2(struct tu_physical_device *pdevice,
    p->supportedStencilResolveModes  =
       VK_RESOLVE_MODE_SAMPLE_ZERO_BIT |
       VK_RESOLVE_MODE_CUSTOM_BIT_EXT;
+   /* Adreno 5xx: no custom resolves, no update after bind */
+   if (pdevice->info->chip == 5) {
+      p->supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+      p->supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+      p->robustBufferAccessUpdateAfterBind = false;
+   }
    p->independentResolveNone  = false;
    p->independentResolve      = false;
 
@@ -1094,6 +1405,12 @@ tu_get_physical_device_properties_1_3(struct tu_physical_device *pdevice,
       p->minSubgroupSize == p->maxSubgroupSize
          ? VK_SHADER_STAGE_ALL
          : (VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
+
+   /* Adreno 5xx: each invocation is a subgroup of its own */
+   if (pdevice->info->chip == 5) {
+      p->minSubgroupSize = p->maxSubgroupSize = 1;
+      p->maxComputeWorkgroupSubgroups = 512;
+   }
 
    p->maxInlineUniformBlockSize = MAX_INLINE_UBO_RANGE;
    p->maxPerStageDescriptorInlineUniformBlocks = MAX_INLINE_UBOS;
@@ -1143,6 +1460,13 @@ tu_get_physical_device_properties_1_3(struct tu_physical_device *pdevice,
    p->storageTexelBufferOffsetSingleTexelAlignment = true;
    p->uniformTexelBufferOffsetAlignmentBytes = 64;
    p->uniformTexelBufferOffsetSingleTexelAlignment = true;
+   /* Adreno 5xx: the base of a buffer view is where the texture starts,
+    * which needs the 64 bytes
+    */
+   if (pdevice->info->chip == 5) {
+      p->storageTexelBufferOffsetSingleTexelAlignment = false;
+      p->uniformTexelBufferOffsetSingleTexelAlignment = false;
+   }
 
    /* The address space is 4GB for current kernels, so there's no point
     * allowing a larger buffer. Our buffer sizes are 64-bit though, so
@@ -1168,11 +1492,16 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->maxTexelBufferElements = pdevice->enable_texel_buffer_emulation
                                       ? TU_D3D12_MAX_TEXEL_BUFFER_ELEMENTS
                                       : pdevice->info->props.max_texel_buffer_range_elements;
+   /* a5xx has no props of a6xx in its device info */
+   if (pdevice->info->chip == 5)
+      props->maxTexelBufferElements = 1 << 27;
    props->maxUniformBufferRange = MAX_UNIFORM_BUFFER_RANGE;
    props->maxStorageBufferRange =
       pdevice->enable_ssbo_emulation
          ? TU_D3D12_MAX_STORAGE_BUFFER_RANGE_BYTES
          : pdevice->info->props.max_storage_buffer_range_bytes;
+   if (pdevice->info->chip == 5)
+      props->maxStorageBufferRange = 1 << 27;
    props->maxPushConstantsSize = MAX_PUSH_CONSTANTS_SIZE;
    props->maxMemoryAllocationCount = UINT32_MAX;
    props->maxSamplerAllocationCount = 64 * 1024;
@@ -1298,6 +1627,59 @@ tu_get_properties(struct tu_physical_device *pdevice,
          ((pdevice->info->chip >= 7) ? TU_API_VERSION :
             VK_MAKE_VERSION(1, 3, VK_HEADER_VERSION))
          : VK_MAKE_VERSION(1, 0, VK_HEADER_VERSION);
+   /* Adreno 5xx: what was made to work, see tu_get_features() */
+   if (pdevice->info->chip == 5)
+      props->apiVersion = VK_MAKE_VERSION(1, 2, VK_HEADER_VERSION);
+   /* Adreno 5xx: a shader numbers what it uses, see struct tu5_desc_map.
+    * TODO: storage buffers and storage images
+    */
+   if (pdevice->info->chip == 5) {
+      /* As in the stock driver: the 31 vec4 inputs of 124 components the
+       * fragment shader reads hang the GPU
+       * (dEQP-VK.pipeline.*.max_varyings.test_*_io_between_vertex_fragment).
+       */
+      props->maxFragmentInputComponents = 112;
+      props->maxPerStageDescriptorSamplers = TU5_MAX_SAMPLERS;
+      props->maxPerStageDescriptorSampledImages = TU5_MAX_TEXTURES;
+      props->maxPerStageDescriptorUniformBuffers = TU5_MAX_UBOS - 2;
+      props->maxPerStageDescriptorStorageBuffers = TU5_MAX_SSBOS;
+      props->maxPerStageDescriptorStorageImages = TU5_MAX_IMAGES;
+      /* The limits of a stage hold for each shader; those of a pipeline
+       * layout can be as the specification would have them.
+       */
+      /* As in the stock driver. The sampled images, the input attachments
+       * and the storage images read as textures share the 128 textures of
+       * the hardware, which a shader using them all at their limits would
+       * overflow (see tu5_desc_base()).
+       */
+      props->maxPerStageResources = 158;
+      props->maxDescriptorSetSamplers = 96;
+      /* as in the stock driver */
+      props->maxDescriptorSetSampledImages = 6 * TU5_MAX_TEXTURES;
+      props->maxDescriptorSetUniformBuffers = 84;
+      props->maxDescriptorSetUniformBuffersDynamic =
+         MIN2(MAX_DYNAMIC_UNIFORM_BUFFERS, TU5_MAX_UBOS - 2);
+      props->maxDescriptorSetStorageBuffers = 2 * TU5_MAX_SSBOS;
+      props->maxDescriptorSetStorageBuffersDynamic =
+         MIN2(MAX_DYNAMIC_STORAGE_BUFFERS, TU5_MAX_SSBOS);
+      props->maxDescriptorSetStorageImages = 24;
+      /* as in the stock driver: more do not fit (vt28) */
+      props->maxComputeWorkGroupInvocations = 512;
+      props->maxComputeWorkGroupSize[0] = 512;
+      props->maxComputeWorkGroupSize[1] = 512;
+      props->maxComputeWorkGroupSize[2] = 64;
+      props->maxVertexInputAttributes = 32;
+      props->maxVertexInputBindings = 32;
+      props->maxViewports = 1;
+      props->maxFragmentDualSrcAttachments = 1;
+      props->lineWidthRange[0] = props->lineWidthRange[1] = 1.0;
+      /* as in the stock driver: the layers are cleared, loaded and stored
+       * one by one
+       */
+      props->maxFramebufferLayers = 2048;
+      props->lineWidthGranularity = 0.0;
+   }
+
    props->driverVersion = vk_get_driver_version();
    props->vendorID = pdevice->instance->drirc.debug.force_vk_vendor != 0 ?
                      pdevice->instance->drirc.debug.force_vk_vendor : 0x5143;
@@ -1314,6 +1696,12 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->sparseResidencyStandard3DBlockShape = false;
    props->sparseResidencyAlignedMipSize = false;
    props->sparseResidencyNonResidentStrict = true;
+   /* Adreno 5xx: no sparse resources */
+   if (pdevice->info->chip == 5) {
+      props->sparseResidencyStandard2DBlockShape = false;
+      props->sparseResidencyStandard2DMultisampleBlockShape = false;
+      props->sparseResidencyNonResidentStrict = false;
+   }
 
    snprintf(props->deviceName, sizeof(props->deviceName), "%s",
             (strlen(pdevice->instance->drirc.debug.force_vk_devicename) > 0) ?
@@ -1732,6 +2120,16 @@ tu_physical_device_init(struct tu_physical_device *device,
       }
       break;
    }
+   case 5:
+      /* No bindless descriptors, no CCUs, no LRZ, no UBWC, and geometry and
+       * tessellation shaders are left out.
+       */
+      device->dev_info = info;
+      device->info = &device->dev_info;
+      device->usable_gmem_size_gmem = device->gmem_size;
+      device->usable_sets = 4;
+      device->reserved_set_idx = -1;
+      break;
    default:
       result = vk_startup_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
                                  "device %s is unsupported", device->name);
@@ -1875,6 +2273,20 @@ tu_physical_device_init(struct tu_physical_device *device,
     */
    char buf[VK_UUID_SIZE * 2 + 1];
    mesa_bytes_to_hex(buf, device->cache_uuid, VK_UUID_SIZE);
+#if DETECT_OS_ANDROID
+   /* Android keeps what the GL drivers compile with EGL_ANDROID_blob_cache,
+    * and Mesa makes no cache of its own there (disk_cache_create() gives a
+    * disabled one), but nothing keeps the pipelines of a Vulkan driver: HWUI
+    * stores the VkPipelineCache of an app only after its first frames, so the
+    * app compiles the pipelines it makes later again each time it starts.
+    * Keep them in the cache directory of the app, which ActivityThread gives
+    * as TMPDIR. Adreno 5xx only, where it was measured.
+    */
+   if (device->info->chip == 5 && getenv("TMPDIR"))
+      device->vk.disk_cache =
+         disk_cache_create_in_dir(device->name, buf, 0, getenv("TMPDIR"));
+   else
+#endif
    device->vk.disk_cache = disk_cache_create(device->name, buf, 0);
 
    device->vk.pipeline_cache_import_ops = cache_import_ops;
@@ -2071,6 +2483,13 @@ tu_GetPhysicalDeviceQueueFamilyProperties2(
          p->queueFamilyProperties = *family->properties;
 
          if (pdevice->emulate_second_queue == (int) i)
+            p->queueFamilyProperties.queueCount = 2;
+
+         /* Adreno 5xx: the UI of Android 14 asks for two queues, each being
+          * a submit queue of its own of the kernel
+          */
+         if (pdevice->info->chip == 5 &&
+             (family->properties->queueFlags & VK_QUEUE_GRAPHICS_BIT))
             p->queueFamilyProperties.queueCount = 2;
 
          vk_foreach_struct(ext, p->pNext) {
@@ -2835,6 +3254,8 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       &dispatch_table, &tu_device_entrypoints, override_initial_entrypoints);
 
    switch (fd_dev_gen(&physical_device->dev_id)) {
+   case 5:
+      /* The a5xx paths branch off inside the A6XX variants. */
    case 6:
       vk_device_dispatch_table_from_entrypoints(
          &dispatch_table, &tu_device_entrypoints_a6xx, false);
@@ -3018,6 +3439,19 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
    if (device->vk.enabled_features.customBorderColors)
       global_size += TU_BORDER_COLOR_COUNT * sizeof(struct bcolor_entry);
 
+   /* Adreno 5xx: the built-in border colors again, for the 4444 formats with
+    * alpha in the low bits, after the custom ones
+    */
+   if (tu_is_a5xx(device)) {
+      device->a5xx_bcolor_alpha_low =
+         TU_BORDER_COLOR_BUILTIN +
+         (device->vk.enabled_features.customBorderColors ? TU_BORDER_COLOR_COUNT : 0);
+      global_size += TU_BORDER_COLOR_BUILTIN * sizeof(struct bcolor_entry);
+      global_size = align(global_size, 64);
+      device->a5xx_view_bases_offset = global_size;
+      global_size += TU5_VIEW_BASES * sizeof(uint64_t);
+   }
+
    tu_bo_suballocator_init(
       &device->pipeline_suballoc, device, 128 * 1024,
       (enum tu_bo_alloc_flags) (TU_BO_ALLOC_GPU_READ_ONLY |
@@ -3050,6 +3484,13 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       vk_startup_errorf(device->instance, result, "BO init");
       goto fail_global_bo;
    }
+
+   /* Adreno 5xx: without it, no binning (tu5_use_binning()) */
+   if (tu_is_a5xx(device) &&
+       tu_bo_init_new(device, NULL, &device->a5xx_vsc_bo,
+                      TU5_VSC_PIPES * TU5_VSC_PIPE_SIZE + 4096,
+                      TU_BO_ALLOC_INTERNAL_RESOURCE, "a5xx vsc") != VK_SUCCESS)
+      device->a5xx_vsc_bo = NULL;
 
    result = tu_bo_map(device, device->global_bo, NULL);
    if (result != VK_SUCCESS) {
@@ -3090,6 +3531,14 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       VkClearColorValue border_color = vk_border_color_value((VkBorderColor) i);
       tu6_pack_border_color(&global->bcolor_builtin[i], &border_color,
                             vk_border_color_is_int((VkBorderColor) i));
+      if (tu_is_a5xx(device)) {
+         tu5_pack_border_color(&global->bcolor_builtin[i], &border_color,
+                               vk_border_color_is_int((VkBorderColor) i));
+         tu5_pack_border_color_format(
+            &global->bcolor_builtin[device->a5xx_bcolor_alpha_low + i],
+            &border_color, vk_border_color_is_int((VkBorderColor) i),
+            VK_FORMAT_R4G4B4A4_UNORM_PACK16);
+      }
    }
 
    /* initialize to ones so ffs can be used to find unused slots */
@@ -3194,7 +3643,8 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       physical_device->info->props.has_z24uint_s8uint &&
       (!border_color_without_format ||
        !physical_device->instance->drirc.misc.enable_d24s8_border_color_workaround);
-   device->use_lrz = !TU_DEBUG_START(NOLRZ);
+   /* TODO: LRZ on a5xx */
+   device->use_lrz = !TU_DEBUG_START(NOLRZ) && !tu_is_a5xx(device);
 
    tu_gpu_tracepoint_config_variable();
 
@@ -3265,6 +3715,8 @@ fail_empty_shaders:
 fail_null_accel_struct:
    tu_destroy_clear_blit_shaders(device);
 fail_global_bo_map:
+   if (device->a5xx_vsc_bo)
+      tu_bo_finish(device, device->a5xx_vsc_bo);
    TU_RMV(resource_destroy, device, device->global_bo);
    tu_bo_finish(device, device->global_bo);
    vk_free(&device->vk.alloc, device->submit_bo_list);
@@ -3361,6 +3813,8 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    tu_bo_suballocator_finish(&device->event_suballoc);
    tu_bo_suballocator_finish(&device->vis_stream_suballocator);
 
+   if (device->a5xx_vsc_bo)
+      tu_bo_finish(device, device->a5xx_vsc_bo);
    tu_bo_finish(device, device->global_bo);
 
    if (device->vm_bind_fence_fd != -1)

@@ -708,6 +708,68 @@ ir3_nir_min_lod_workaround(nir_shader *shader)
       nir_metadata_control_flow, NULL);
 }
 
+static bool
+lower_subgroup_of_one(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   nir_def *def;
+
+   b->cursor = nir_before_instr(&intr->instr);
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_subgroup_invocation:
+   case nir_intrinsic_first_invocation:
+      def = nir_imm_int(b, 0);
+      break;
+   case nir_intrinsic_elect:
+      def = nir_imm_true(b);
+      break;
+   case nir_intrinsic_load_subgroup_id: {
+      /* this runs after the system values of compute have been lowered:
+       * the index of the invocation in the workgroup, from its id
+       */
+      const uint16_t *size = b->shader->info.workgroup_size;
+
+      if ((b->shader->info.stage != MESA_SHADER_COMPUTE &&
+           b->shader->info.stage != MESA_SHADER_KERNEL) ||
+          b->shader->info.workgroup_size_variable)
+         return false;
+
+      nir_def *id = nir_load_local_invocation_id(b);
+      def = nir_iadd(b, nir_channel(b, id, 0),
+                     nir_imul_imm(b,
+                                  nir_iadd(b, nir_channel(b, id, 1),
+                                           nir_imul_imm(b, nir_channel(b, id, 2),
+                                                        size[1])),
+                                  size[0]));
+      break;
+   }
+   case nir_intrinsic_load_num_subgroups: {
+      const uint16_t *size = b->shader->info.workgroup_size;
+
+      if ((b->shader->info.stage != MESA_SHADER_COMPUTE &&
+           b->shader->info.stage != MESA_SHADER_KERNEL) ||
+          b->shader->info.workgroup_size_variable)
+         return false;
+
+      def = nir_imm_int(b, size[0] * size[1] * size[2]);
+      break;
+   }
+   default:
+      return false;
+   }
+
+   nir_def_replace(&intr->def, def);
+   return true;
+}
+
+/* Each invocation a subgroup of its own */
+bool
+ir3_nir_lower_subgroups_of_one(nir_shader *s)
+{
+   return nir_shader_intrinsics_pass(s, lower_subgroup_of_one,
+                                     nir_metadata_control_flow, NULL);
+}
+
 void
 ir3_finalize_nir(struct ir3_compiler *compiler,
                  const struct ir3_shader_nir_options *options,
@@ -1071,12 +1133,21 @@ ir3_nir_post_finalize(struct ir3_shader *shader)
       };
 
       if (!(mesa_shader_stage_is_compute(s->info.stage) ||
-            compiler->info->props.has_getfiberid)) {
+            compiler->info->props.has_getfiberid) ||
+          compiler->gen == 5) {
          options.subgroup_size = 1;
+         if (compiler->gen == 5)
+            options.ballot_components = 1;
          options.lower_vote_trivial = true;
       }
 
       OPT(s, nir_opt_uniform_subgroup, &options);
+      /* Adreno 5xx has no way to tell the invocations of a wave apart: each
+       * is a subgroup of its own.
+       */
+      if (compiler->gen == 5)
+         OPT(s, ir3_nir_lower_subgroups_of_one);
+
       OPT(s, nir_lower_subgroups, &options);
       OPT(s, ir3_nir_lower_shuffle, shader);
    }

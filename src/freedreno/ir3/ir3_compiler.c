@@ -249,8 +249,14 @@ ir3_compiler_create(struct fd_device *dev, const struct fd_dev_id *dev_id,
    compiler->delay_slots.non_alu = 6;
    compiler->delay_slots.cat3_src2_read = 2;
 
-   if (compiler->gen >= 6) {
+   /* a5xx too: samgq outside the fragment shader samples at the wrong lod
+    * (dEQP-VK.texture.subgroup_lod.texturegrad, textureGrad in a vertex
+    * shader)
+    */
+   if (compiler->gen >= 5)
       compiler->samgq_workaround = true;
+
+   if (compiler->gen >= 6) {
       /* a6xx split the pipeline state into geometry and fragment state, in
        * order to let the VS run ahead of the FS. As a result there are now
        * separate const files for the the fragment shader and everything
@@ -325,6 +331,12 @@ ir3_compiler_create(struct fd_device *dev, const struct fd_dev_id *dev_id,
       compiler->max_const_frag = 512;
       compiler->max_const_compute = 512;
 
+      /* On Adreno 505 a compute shader of more than 256 vec4 of constants
+       * computes nothing.
+       */
+      if (compiler->gen == 5)
+         compiler->max_const_compute = 256;
+
       /* Note: this will have to change if/when we support tess+GS on
        * earlier gen's.
        */
@@ -380,6 +392,12 @@ ir3_compiler_create(struct fd_device *dev, const struct fd_dev_id *dev_id,
    /* Set up nir shader compiler options, using device-specific overrides of our base settings. */
    compiler->nir_options = ir3_base_options;
    compiler->nir_options.has_iadd3 = dev_info->props.has_sad;
+
+   /* one device: gl_DeviceIndex is 0 (there is no system value for it,
+    * nir_lower_system_values() asserted on it for a5xx)
+    */
+   if (compiler->gen >= 5)
+      compiler->nir_options.lower_device_index_to_zero = true;
 
    if (compiler->gen >= 6) {
       compiler->nir_options.force_indirect_unrolling = nir_var_all,

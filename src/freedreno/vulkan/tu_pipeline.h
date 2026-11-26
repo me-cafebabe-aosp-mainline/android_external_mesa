@@ -257,6 +257,11 @@ struct tu_graphics_pipeline {
 
    struct vk_dynamic_graphics_state dynamic_state;
 
+   /* The vertex input state when it is not precompiled into a draw state:
+    * on a5xx all the state is written out when drawing.
+    */
+   struct vk_vertex_input_state vertex_input;
+
    /* Only used if the sample locations are static but the enable is dynamic.
     * Otherwise we should be able to precompile the draw state.
     */
