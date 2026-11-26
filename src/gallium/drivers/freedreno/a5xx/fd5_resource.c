@@ -66,37 +66,27 @@ ok_ubwc_format(enum pipe_format format)
    }
 }
 
-static int
-fd5_layout_resource_for_modifier(struct fd_resource *rsc, uint64_t modifier)
+static bool
+fd5_layout_resource_for_handle(struct fd_resource *rsc,
+                               struct winsys_handle *handle)
 {
    struct pipe_resource *prsc = &rsc->b.b;
 
-   switch (modifier) {
-   case DRM_FORMAT_MOD_QCOM_COMPRESSED: {
-      uint32_t pitch = rsc->layout.pitch0;
+   if (handle->modifier != DRM_FORMAT_MOD_QCOM_COMPRESSED)
+      return fd_layout_resource_for_handle(rsc, handle);
 
-      if (!ok_ubwc_format(prsc->format) || prsc->target != PIPE_TEXTURE_2D ||
-          prsc->last_level || prsc->array_size > 1 || prsc->nr_samples > 1)
-         return -1;
+   if (!ok_ubwc_format(prsc->format) || prsc->target != PIPE_TEXTURE_2D ||
+       prsc->last_level || prsc->array_size > 1 || prsc->nr_samples > 1 ||
+       handle->offset)
+      return false;
 
-      rsc->layout.ubwc = true;
-      rsc->layout.tile_mode = TILE5_3;
-      rsc->layout.tile_all = true;
-      rsc->layout.size = 0;
-      fdl5_layout(&rsc->layout, prsc->format, 1, prsc->width0, prsc->height0,
-                  1, 1, 1, false);
+   struct fdl_image_params params =
+      fd_image_params(prsc, true, TILE5_3, handle->plane);
+   params.tile_all = true;
+   fdl5_layout_image(&rsc->layout, &params);
 
-      if (fdl_pitch(&rsc->layout, 0) != pitch ||
-          rsc->layout.size > fd_bo_size(rsc->bo))
-         return -1;
-      return 0;
-   }
-   case DRM_FORMAT_MOD_LINEAR:
-   case DRM_FORMAT_MOD_INVALID:
-      return 0;
-   default:
-      return -1;
-   }
+   return fdl_pitch(&rsc->layout, 0) == handle->stride &&
+          rsc->layout.size <= fd_bo_size(rsc->bo);
 }
 
 static bool
@@ -118,6 +108,6 @@ fd5_resource_screen_init(struct pipe_screen *pscreen)
 {
    struct fd_screen *screen = fd_screen(pscreen);
 
-   screen->layout_resource_for_modifier = fd5_layout_resource_for_modifier;
+   screen->layout_resource_for_handle = fd5_layout_resource_for_handle;
    screen->is_format_supported = fd5_is_format_supported;
 }

@@ -284,7 +284,7 @@ tu_image_view_init(struct tu_device *device,
    TU_CALLX(device, fdl6_view_init)(&iview->view, layouts, &args, device->use_z24uint_s8uint);
 
    if (tu_is_a5xx(device) && aspect_mask == VK_IMAGE_ASPECT_COLOR_BIT &&
-       vk_format_get_plane_count(vk_format) > 1) {
+       vk_format_get_plane_count(iview->vk.format) > 1) {
       /* One descriptor for each plane, in its own format: the shader puts
        * the components together and converts them (nir_vk_lower_ycbcr_tex),
        * the swizzles of the conversion included.
@@ -293,11 +293,11 @@ tu_image_view_init(struct tu_device *device,
          PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y, PIPE_SWIZZLE_Z, PIPE_SWIZZLE_W,
       };
 
-      iview->a5xx_planes = vk_format_get_plane_count(vk_format);
+      iview->a5xx_planes = vk_format_get_plane_count(iview->vk.format);
       for (unsigned p = 0; p < iview->a5xx_planes; p++) {
          tu5_image_view_descriptor(
             p ? iview->a5xx_plane_descriptor[p - 1] : iview->view.descriptor,
-            image, p, tu6_plane_format(vk_format, p), range,
+            image, p, tu6_plane_format(iview->vk.format, p), range,
             pCreateInfo->viewType, identity);
       }
    } else if (tu_is_a5xx(device)) {
@@ -561,6 +561,29 @@ format_list_ubwc_possible(struct tu_device *dev,
    return true;
 }
 
+/* Adreno 5xx: whether a mutable image is viewed in nothing but its format
+ * and its sRGB (or UNORM) twin, as the mutable swapchains of Android are,
+ * which tiling (and UBWC) do not mind
+ */
+static bool
+tu5_srgb_views_only(const VkImageCreateInfo *pCreateInfo)
+{
+   const VkImageFormatListCreateInfo *fmt_list =
+      vk_find_struct_const(pCreateInfo->pNext, IMAGE_FORMAT_LIST_CREATE_INFO);
+   enum pipe_format f =
+      util_format_linear(vk_format_to_pipe_format(pCreateInfo->format));
+
+   if (!fmt_list || !fmt_list->viewFormatCount)
+      return false;
+
+   for (uint32_t i = 0; i < fmt_list->viewFormatCount; i++) {
+      if (util_format_linear(vk_format_to_pipe_format(
+             fmt_list->pViewFormats[i])) != f)
+         return false;
+   }
+   return true;
+}
+
 template <chip CHIP>
 VkResult
 tu_image_init(struct tu_device *device, struct tu_image *image,
@@ -582,6 +605,17 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
    if (!tiling_possible(image->vk.format)) {
       force_linear_tile = true;
    }
+
+   /* Adreno 5xx: the shaders find the texels of the storage images by
+    * themselves, row after row. And not all the formats can be tiled, nor
+    * can those the image may be viewed as when its format is mutable.
+    */
+   if (tu_is_a5xx(device) &&
+       ((pCreateInfo->usage & VK_IMAGE_USAGE_STORAGE_BIT) ||
+        ((pCreateInfo->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
+         !tu5_srgb_views_only(pCreateInfo)) ||
+        !tu5_format_tileable(vk_format_to_pipe_format(image->vk.format))))
+      force_linear_tile = true;
 
    /* No sense in tiling a 1D image, you'd just waste space and cache locality.
     * But Adreno 5xx renders depth and stencil tiled.
@@ -742,7 +776,7 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
       enum pipe_format f = vk_format_to_pipe_format(image->vk.format);
       /* what UBWC of a5xx is for, see fdl5_layout() */
       const bool ubwc_layout =
-         tile_mode == TILE6_3 && !image->force_linear_tile &&
+         tile_mode == TILE6_3 && !force_linear_tile &&
          image->vk.image_type == VK_IMAGE_TYPE_2D &&
          image->vk.mip_levels == 1 && image->vk.array_layers == 1 &&
          image->vk.samples == VK_SAMPLE_COUNT_1_BIT &&
@@ -761,11 +795,11 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
       if (modifier == DRM_FORMAT_MOD_QCOM_COMPRESSED) {
          if (!ubwc_layout)
             return vk_error(device, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
-         image->ubwc_enabled = true;
+         ubwc_enabled = true;
       } else
-      image->ubwc_enabled =
-         image->ubwc_enabled && !TU_DEBUG(NOUBWC) &&
-         tile_mode == TILE6_3 && !image->force_linear_tile &&
+      ubwc_enabled =
+         ubwc_enabled && !TU_DEBUG(NOUBWC) &&
+         tile_mode == TILE6_3 && !force_linear_tile &&
          image->vk.image_type == VK_IMAGE_TYPE_2D &&
          image->vk.mip_levels == 1 && image->vk.array_layers == 1 &&
          image->vk.samples == VK_SAMPLE_COUNT_1_BIT &&
@@ -872,22 +906,16 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
       };
 
       if (a5xx) {
-
          /* The depth buffers have no tile mode: these are tiled at every
           * level, which the textures are to be told.
           */
-         layout->tile_all = layout->tile_mode &&
-                            (util_format_is_depth_or_stencil(format) ||
-                             /* UBWC is of the tiles, as small as it is */
-                             layout->ubwc);
+         params.tile_all = util_format_is_depth_or_stencil(format) ||
+                           /* UBWC is of the tiles, as small as it is */
+                           params.ubwc;
+         fdl5_layout_image(layout, &params);
 
          /* the images begin on a page, as the Gallium driver has them */
          layout->base_align = 4096;
-
-         fdl5_layout(layout, format, image->vk.samples, width0, height0,
-                     image->vk.extent.depth, image->vk.mip_levels,
-                     image->vk.array_layers,
-                     image->vk.image_type == VK_IMAGE_TYPE_3D);
 
          /* The layout an imported buffer has, as gralloc made it: linear, of
           * one level and one layer, with the pitch and the offset given.
@@ -991,29 +1019,6 @@ TU_GENX(tu_image_init);
 
 /* Deferred ANB image support for ANB v8+ aliased images. */
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
-/* Adreno 5xx: whether a mutable image is viewed in nothing but its format
- * and its sRGB (or UNORM) twin, as the mutable swapchains of Android are,
- * which tiling (and UBWC) do not mind
- */
-static bool
-tu5_srgb_views_only(const VkImageCreateInfo *pCreateInfo)
-{
-   const VkImageFormatListCreateInfo *fmt_list =
-      vk_find_struct_const(pCreateInfo->pNext, IMAGE_FORMAT_LIST_CREATE_INFO);
-   enum pipe_format f =
-      util_format_linear(vk_format_to_pipe_format(pCreateInfo->format));
-
-   if (!fmt_list || !fmt_list->viewFormatCount)
-      return false;
-
-   for (uint32_t i = 0; i < fmt_list->viewFormatCount; i++) {
-      if (util_format_linear(vk_format_to_pipe_format(
-             fmt_list->pViewFormats[i])) != f)
-         return false;
-   }
-   return true;
-}
-
 static VkResult
 tu_android_get_wsi_memory(struct tu_device *dev,
                           const VkBindImageMemoryInfo *bind_info,
@@ -1021,17 +1026,6 @@ tu_android_get_wsi_memory(struct tu_device *dev,
 {
    VK_FROM_HANDLE(tu_image, img, bind_info->image);
    VkResult result;
-
-   /* Adreno 5xx: the shaders find the texels of the storage images by
-    * themselves, row after row. And not all the formats can be tiled, nor
-    * can those the image may be viewed as when its format is mutable.
-    */
-   if (tu_is_a5xx(device) &&
-       ((pCreateInfo->usage & VK_IMAGE_USAGE_STORAGE_BIT) ||
-        ((pCreateInfo->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
-         !tu5_srgb_views_only(pCreateInfo)) ||
-        !tu5_format_tileable(vk_format_to_pipe_format(image->vk.format))))
-      image->force_linear_tile = true;
 
    assert(img->vk.android_deferred_create_info);
 

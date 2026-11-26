@@ -390,7 +390,21 @@ end:
          VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
          VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT |
          VK_FORMAT_FEATURE_2_FRAGMENT_DENSITY_MAP_BIT_EXT |
-         VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_CUBIC_BIT_EXT;
+         VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_CUBIC_BIT_EXT |
+         /* no acceleration structures, no fragment shading rate */
+         VK_FORMAT_FEATURE_2_ACCELERATION_STRUCTURE_VERTEX_BUFFER_BIT_KHR |
+         VK_FORMAT_FEATURE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+
+      linear &= ~no;
+      optimal &= ~no;
+      buffer &= ~no;
+
+      /* atomics on floats would be VK_EXT_shader_atomic_float */
+      if (vk_format == VK_FORMAT_R32_SFLOAT) {
+         optimal &= ~VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;
+         linear &= ~VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;
+         buffer &= ~VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT;
+      }
 
       linear &= ~no;
       optimal &= ~no;

@@ -228,7 +228,11 @@ enum ir3_const_alloc_type {
    IR3_CONST_ALLOC_PRIMITIVE_MAP = 11,
    /* For SSBO emulation */
    IR3_CONST_ALLOC_BINDLESS_BASE_ADDRS = 12,
-   IR3_CONST_ALLOC_MAX = 13,
+   /* turnip on a5xx: the index of the view, the views being drawn one
+    * after the other
+    */
+   IR3_CONST_ALLOC_VIEW_INDEX = 13,
+   IR3_CONST_ALLOC_MAX = 14,
 };
 
 struct ir3_const_allocation {

@@ -186,7 +186,8 @@ static bool tu_has_multiview(const struct tu_physical_device *device)
 /* We are generally VK 1.1 except A702, which has no multiview */
 static bool tu_is_vk_1_1(const struct tu_physical_device *device)
 {
-   return tu_has_multiview(device);
+   /* Adreno 5xx draws the views one after the other, see tu5_views() */
+   return tu_has_multiview(device) || device->info->chip == 5;
 }
 
 static void
@@ -444,6 +445,7 @@ get_device_extensions(const struct tu_physical_device *device,
          .KHR_relaxed_block_layout = true,
          .KHR_sampler_mirror_clamp_to_edge = true,
          .KHR_sampler_ycbcr_conversion = true,
+         .EXT_device_memory_report = true,
          .KHR_separate_depth_stencil_layouts = true,
          .KHR_shader_draw_parameters = true,
          .KHR_shader_float_controls = true,
@@ -472,6 +474,9 @@ get_device_extensions(const struct tu_physical_device *device,
          .EXT_global_priority = all.EXT_global_priority,
          .KHR_global_priority = all.KHR_global_priority,
          .EXT_global_priority_query = all.EXT_global_priority_query,
+         .ANDROID_external_memory_android_hardware_buffer =
+            all.ANDROID_external_memory_android_hardware_buffer,
+         .ANDROID_native_buffer = all.ANDROID_native_buffer,
       } };
 
       /* What does not depend on the hardware: the runtime, the API, the
@@ -1191,6 +1196,7 @@ tu_get_features(struct tu_physical_device *pdevice,
       features->samplerFilterMinmax = true;
       features->vertexPipelineStoresAndAtomics = true;
       features->samplerYcbcrConversion = true;
+      features->deviceMemoryReport = true;
    }
 }
 
@@ -1365,6 +1371,12 @@ tu_get_physical_device_properties_1_2(struct tu_physical_device *pdevice,
    p->supportedStencilResolveModes  =
       VK_RESOLVE_MODE_SAMPLE_ZERO_BIT |
       VK_RESOLVE_MODE_CUSTOM_BIT_EXT;
+   /* Adreno 5xx: no custom resolves, no update after bind */
+   if (pdevice->info->chip == 5) {
+      p->supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+      p->supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+      p->robustBufferAccessUpdateAfterBind = false;
+   }
    p->independentResolveNone  = false;
    p->independentResolve      = false;
 
@@ -1480,11 +1492,16 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->maxTexelBufferElements = pdevice->enable_texel_buffer_emulation
                                       ? TU_D3D12_MAX_TEXEL_BUFFER_ELEMENTS
                                       : pdevice->info->props.max_texel_buffer_range_elements;
+   /* a5xx has no props of a6xx in its device info */
+   if (pdevice->info->chip == 5)
+      props->maxTexelBufferElements = 1 << 27;
    props->maxUniformBufferRange = MAX_UNIFORM_BUFFER_RANGE;
    props->maxStorageBufferRange =
       pdevice->enable_ssbo_emulation
          ? TU_D3D12_MAX_STORAGE_BUFFER_RANGE_BYTES
          : pdevice->info->props.max_storage_buffer_range_bytes;
+   if (pdevice->info->chip == 5)
+      props->maxStorageBufferRange = 1 << 27;
    props->maxPushConstantsSize = MAX_PUSH_CONSTANTS_SIZE;
    props->maxMemoryAllocationCount = UINT32_MAX;
    props->maxSamplerAllocationCount = 64 * 1024;
@@ -1679,6 +1696,12 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->sparseResidencyStandard3DBlockShape = false;
    props->sparseResidencyAlignedMipSize = false;
    props->sparseResidencyNonResidentStrict = true;
+   /* Adreno 5xx: no sparse resources */
+   if (pdevice->info->chip == 5) {
+      props->sparseResidencyStandard2DBlockShape = false;
+      props->sparseResidencyStandard2DMultisampleBlockShape = false;
+      props->sparseResidencyNonResidentStrict = false;
+   }
 
    snprintf(props->deviceName, sizeof(props->deviceName), "%s",
             (strlen(pdevice->instance->drirc.debug.force_vk_devicename) > 0) ?

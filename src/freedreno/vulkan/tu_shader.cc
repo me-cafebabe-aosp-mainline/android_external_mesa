@@ -413,7 +413,7 @@ tu5_desc_base(struct tu_shader *shader,
     */
    if (kind == TU5_DESC_SAMPLER &&
        binding_layout->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
-      offset += A6XX_TEX_CONST_DWORDS * 4;
+      offset += FDL6_TEX_CONST_DWORDS * 4;
 
    for (unsigned i = 0; i < count; i++) {
       refs[base + i] = (struct tu5_desc_ref) {
@@ -421,7 +421,7 @@ tu5_desc_base(struct tu_shader *shader,
          .dynamic = dynamic,
          .storage = storage,
          .offset = (offset + (i / planes) * binding_layout->size) / 4 +
-                   TU5_YCBCR_PLANE_SLOT(i % planes) * A6XX_TEX_CONST_DWORDS,
+                   TU5_YCBCR_PLANE_SLOT(i % planes) * FDL6_TEX_CONST_DWORDS,
       };
    }
    map->count[kind] += count;
@@ -725,6 +725,7 @@ build_bindless(struct tu_device *dev, nir_builder *b,
       /* The number of the texture or of the sampler in the shader. The input
        * attachments are textures like the others, there being no tiles.
        */
+      const bool is_sampler = combined_descriptor_offset == 1;
       unsigned first =
          tu5_desc_base(shader, layout, set, binding,
                        is_sampler ? TU5_DESC_SAMPLER : TU5_DESC_TEXTURE);
@@ -884,6 +885,9 @@ lower_texel_buffers_to_image(nir_builder *b,
    }
    default:
       break;
+   }
+}
+
 /* Adreno 5xx: the loads and stores of storage images (and texel buffers)
  * of a format LDIB reads wrong are of an unsigned integer format of as many
  * bits, see tu5_storage_format(): pack the texels stored, unpack those
@@ -948,7 +952,7 @@ tu5_lower_storage_format(nir_builder *b, nir_intrinsic_instr *instr)
             comps[c] = nir_imm_int(b, c == 3 ? 1 : 0);
       }
       nir_def *value = nir_vec(b, comps, instr->def.num_components);
-      nir_def_rewrite_uses_after(&instr->def, value, value->parent_instr);
+      nir_def_rewrite_uses_after(&instr->def, value);
    } else {
       if (nir_src_bit_size(instr->src[3]) != 32)
          return;
@@ -1044,7 +1048,7 @@ lower_image_deref(struct tu_device *dev, nir_builder *b,
          index = nir_iadd(b, index, tu5_ibo_base(b, shader));
 
       shader->active_desc_sets |= 1u << var->data.descriptor_set;
-      nir_rewrite_image_intrinsic(instr, index, false);
+      nir_rewrite_image_intrinsic(instr, index, nir_image_intrinsic_type_default);
       tu5_lower_storage_format(b, instr);
       return;
    }
@@ -1415,11 +1419,13 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct tu_device *dev,
    }
 
    /* Adreno 5xx: which texture the sampler samples, when both are known */
+   const int sampler_src_idx =
+      nir_tex_instr_src_index(tex, nir_tex_src_sampler_offset);
+   const int tex_src_idx =
+      nir_tex_instr_src_index(tex, nir_tex_src_texture_offset);
    if (tu_is_a5xx(dev) && sampler_src_idx >= 0 && tex_src_idx >= 0) {
-      nir_src *samp = &tex->src[nir_tex_instr_src_index(
-         tex, nir_tex_src_sampler_offset)].src;
-      nir_src *texture = &tex->src[nir_tex_instr_src_index(
-         tex, nir_tex_src_texture_offset)].src;
+      nir_src *samp = &tex->src[sampler_src_idx].src;
+      nir_src *texture = &tex->src[tex_src_idx].src;
 
       if (nir_src_is_const(*samp) && nir_src_is_const(*texture)) {
          unsigned s = nir_src_as_uint(*samp);
@@ -1460,7 +1466,7 @@ tu5_lower_frag_coord_sample(nir_builder *b, nir_intrinsic_instr *intr,
    nir_def *res = nir_vec4(b, nir_channel(b, xy, 0), nir_channel(b, xy, 1),
                            nir_channel(b, &intr->def, 2),
                            nir_channel(b, &intr->def, 3));
-   nir_def_rewrite_uses_after(&intr->def, res, res->parent_instr);
+   nir_def_rewrite_uses_after(&intr->def, res);
    return true;
 }
 
@@ -1504,7 +1510,7 @@ tu5_lower_txf_3d_bounds(nir_builder *b, nir_instr *instr, void *data)
    nir_def *res = nir_bcsel(b, in, &tex->def,
                             nir_imm_zero(b, tex->def.num_components,
                                          tex->def.bit_size));
-   nir_def_rewrite_uses_after(&tex->def, res, res->parent_instr);
+   nir_def_rewrite_uses_after(&tex->def, res);
    return true;
 }
 
@@ -1906,8 +1912,10 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
 
    const_state->a5xx.view_loc = ~0u;
    if (tu_is_a5xx(dev) && tu5_uses_view_index(shader)) {
-      const_state->a5xx.view_loc = reserved_consts_vec4 * 4;
-      reserved_consts_vec4 += dev->compiler->const_upload_unit;
+      ir3_const_alloc(const_allocs, IR3_CONST_ALLOC_VIEW_INDEX,
+                      dev->compiler->const_upload_unit, 1);
+      const_state->a5xx.view_loc =
+         const_allocs->consts[IR3_CONST_ALLOC_VIEW_INDEX].offset_vec4 * 4;
       nir_shader_intrinsics_pass(shader, tu5_lower_view_index,
                                  nir_metadata_control_flow,
                                  &const_state->a5xx.view_loc);
@@ -3900,7 +3908,8 @@ tu_lower_nir(struct tu_device *dev,
       const nir_lower_sysvals_to_varyings_options sysval_options = {
          .point_coord = true,
          .layer_id = true,
-         .view_index = true,
+         /* Adreno 5xx: a constant, see tu5_lower_view_index() */
+         .view_index = !tu_is_a5xx(dev),
       };
       NIR_PASS(_, nir, nir_lower_sysvals_to_varyings, &sysval_options);
    }
@@ -3975,15 +3984,15 @@ tu_lower_nir(struct tu_device *dev,
                                            VARYING_SLOT_POS,
                                            glsl_vec4_type());
       nir_store_var(&b, pos, nir_imm_vec4(&b, 0, 0, 0, 0), 0xf);
-      nir_metadata_preserve(impl, nir_metadata_control_flow);
+      nir_progress(true, impl, nir_metadata_control_flow);
    }
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT && tu_is_a5xx(dev)) {
       nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
       if (key->force_sample_interp || nir->info.fs.uses_sample_shading)
-         NIR_PASS_V(nir, nir_shader_intrinsics_pass,
-                    tu5_lower_frag_coord_sample, nir_metadata_control_flow,
-                    NULL);
+         NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+                  tu5_lower_frag_coord_sample, nir_metadata_control_flow,
+                  NULL);
    }
 
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,

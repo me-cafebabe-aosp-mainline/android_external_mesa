@@ -37,7 +37,7 @@ tu_CreateBufferView(VkDevice _device,
    if (tu_is_a5xx(device)) {
       tu5_buffer_view_descriptor(view->descriptor,
                                  vk_format_to_pipe_format(view->vk.format),
-                                 buffer->iova + view->vk.offset,
+                                 vk_buffer_address(&buffer->vk, view->vk.offset),
                                  view->vk.range);
    }
 

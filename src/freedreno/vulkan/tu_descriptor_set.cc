@@ -59,7 +59,7 @@ descriptor_size(struct tu_device *dev,
             VK_FROM_HANDLE(tu_sampler, sampler,
                            binding->pImmutableSamplers[i]);
             if (sampler->vk.ycbcr_conversion)
-               return A6XX_TEX_CONST_DWORDS * 4 * TU5_YCBCR_SLOTS;
+               return FDL6_TEX_CONST_DWORDS * 4 * TU5_YCBCR_SLOTS;
          }
       }
 
@@ -477,10 +477,10 @@ blake3_update_ycbcr_sampler(blake3_hasher *ctx,
    /* Adreno 5xx puts the planes together in the shader, the swizzles and
     * the chroma reconstruction of the conversion included
     */
-   SHA1_UPDATE_VALUE(ctx, sampler->mapping);
-   SHA1_UPDATE_VALUE(ctx, sampler->chroma_offsets);
-   SHA1_UPDATE_VALUE(ctx, sampler->chroma_filter);
-   SHA1_UPDATE_VALUE(ctx, sampler->chroma_reconstruction);
+   BLAKE3_UPDATE_VALUE(ctx, sampler->mapping);
+   BLAKE3_UPDATE_VALUE(ctx, sampler->chroma_offsets);
+   BLAKE3_UPDATE_VALUE(ctx, sampler->chroma_filter);
+   BLAKE3_UPDATE_VALUE(ctx, sampler->chroma_reconstruction);
 }
 
 static void
@@ -1276,7 +1276,7 @@ write_combined_image_sampler_descriptor(uint32_t *dst,
       VK_FROM_HANDLE(tu_image_view, iview, image_info->imageView);
 
       for (unsigned p = 1; p < iview->a5xx_planes; p++) {
-         memcpy(dst + TU5_YCBCR_PLANE_SLOT(p) * A6XX_TEX_CONST_DWORDS,
+         memcpy(dst + TU5_YCBCR_PLANE_SLOT(p) * FDL6_TEX_CONST_DWORDS,
                 iview->a5xx_plane_descriptor[p - 1],
                 sizeof(iview->a5xx_plane_descriptor[p - 1]));
       }

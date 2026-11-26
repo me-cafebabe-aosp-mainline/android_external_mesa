@@ -734,7 +734,7 @@ fd_gmem_render_tiles(struct fd_batch *batch)
     */
    if (is_a5xx(ctx->screen) && (batch->cleared || batch->num_draws)) {
       for (unsigned i = 0; i < pfb->nr_cbufs; i++) {
-         if (pfb->cbufs[i] && fd_resource(pfb->cbufs[i]->texture)->layout.ubwc)
+         if (pfb->cbufs[i].texture && fd_resource(pfb->cbufs[i].texture)->layout.ubwc)
             sysmem = false;
       }
    }

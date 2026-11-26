@@ -7020,7 +7020,7 @@ tu_emit_subpass_begin(struct tu_cmd_buffer *cmd)
 
    if (tu_is_a5xx(cmd->device)) {
       tu5_emit_subpass_begin(cmd);
-      tu_set_input_attachments(cmd, cmd->state.subpass);
+      tu_set_input_attachments<CHIP>(cmd, cmd->state.subpass);
       vk_cmd_set_cb_attachment_count(&cmd->vk, cmd->state.subpass->color_count);
       cmd->state.dirty |= TU_CMD_DIRTY_SUBPASS;
       return;
@@ -9294,7 +9294,7 @@ tu_CmdDrawIndirect(VkCommandBuffer commandBuffer,
          tu5_bind_view(cmd, cs, view);
          tu5_draw_indirect(cmd, cs,
                            tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_INDEX), false,
-                           buf->iova + offset, drawCount, stride);
+                           vk_buffer_address(&buf->vk, offset), drawCount, stride);
       }
       /* again for the binning pass, which sees all */
       if (cmd->state.a5xx_binning) {
@@ -9303,7 +9303,7 @@ tu_CmdDrawIndirect(VkCommandBuffer commandBuffer,
             tu5_draw_indirect(cmd, &cmd->a5xx_binning_cs,
                               tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_INDEX) &
                                  ~CP_DRAW_INDX_OFFSET_0_VIS_CULL__MASK,
-                              false, buf->iova + offset, drawCount, stride);
+                              false, vk_buffer_address(&buf->vk, offset), drawCount, stride);
          }
       }
       return;
@@ -9344,7 +9344,7 @@ tu_CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer,
       u_foreach_bit (view, tu5_views(cmd)) {
          tu5_bind_view(cmd, cs, view);
          tu5_draw_indirect(cmd, cs, tu_draw_initiator(cmd, DI_SRC_SEL_DMA),
-                           true, buf->iova + offset, drawCount, stride);
+                           true, vk_buffer_address(&buf->vk, offset), drawCount, stride);
       }
       /* again for the binning pass, which sees all */
       if (cmd->state.a5xx_binning) {
@@ -9353,7 +9353,7 @@ tu_CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer,
             tu5_draw_indirect(cmd, &cmd->a5xx_binning_cs,
                               tu_draw_initiator(cmd, DI_SRC_SEL_DMA) &
                                  ~CP_DRAW_INDX_OFFSET_0_VIS_CULL__MASK,
-                              true, buf->iova + offset, drawCount, stride);
+                              true, vk_buffer_address(&buf->vk, offset), drawCount, stride);
          }
       }
       return;
@@ -9743,9 +9743,7 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
 
    if (tu_is_a5xx(cmd->device)) {
       tu_emit_cache_flush<CHIP>(cmd);
-      tu5_dispatch(cmd, info->blocks, info->offsets,
-                   info->indirect
-                      ? info->indirect->iova + info->indirect_offset : 0);
+      tu5_dispatch(cmd, info->blocks, info->offsets, info->indirect);
       cmd->state.dirty &= ~TU_CMD_DIRTY_COMPUTE_DESC_SETS;
       return;
    }

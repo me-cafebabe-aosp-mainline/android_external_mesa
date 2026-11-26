@@ -112,6 +112,9 @@ struct fdl_image_params {
 
    bool force_disable_linear_fallback;
 
+   /* a5xx: every level tiled, of the tile mode (see fdl_level_linear()) */
+   bool tile_all;
+
    uint32_t plane;
 };
 

@@ -110,7 +110,7 @@ tu5_set_render_mode(struct tu_cs *cs, enum render_mode_cmd mode)
 static void
 tu5_cache_flush(struct tu_cs *cs)
 {
-   OUT_PKT4(cs, REG_A5XX_UCHE_CACHE_INVALIDATE_MIN_LO, 5);
+   OUT_PKT4(cs, REG_A5XX_UCHE_CACHE_INVALIDATE_MIN, 5);
    OUT_RING(cs, 0x00000000); /* UCHE_CACHE_INVALIDATE_MIN_LO */
    OUT_RING(cs, 0x00000000); /* UCHE_CACHE_INVALIDATE_MIN_HI */
    OUT_RING(cs, 0x00000000); /* UCHE_CACHE_INVALIDATE_MAX_LO */
@@ -125,14 +125,14 @@ tu5_emit_lrz_flush(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
    OUT_PKT4(cs, REG_A5XX_GRAS_LRZ_CNTL, 1);
    OUT_RING(cs, A5XX_GRAS_LRZ_CNTL_ENABLE);
 
-   tu5_event_write(cmd, cs, LRZ_FLUSH, false);
+   tu5_event_write(cmd, cs, LRZ_FLUSH_INVALIDATE, false);
 
    OUT_PKT4(cs, REG_A5XX_GRAS_LRZ_CNTL, 1);
    OUT_RING(cs, 0x0);
 }
 
 static enum a4xx_state_block
-tu5_stage2shadersb(gl_shader_stage type)
+tu5_stage2shadersb(mesa_shader_stage type)
 {
    switch (type) {
    case MESA_SHADER_VERTEX:
@@ -143,7 +143,7 @@ tu5_stage2shadersb(gl_shader_stage type)
    case MESA_SHADER_KERNEL:
       return SB4_CS_SHADER;
    default:
-      unreachable("bad shader type");
+      UNREACHABLE("bad shader type");
    }
 }
 
@@ -230,12 +230,21 @@ tu5_emit_const(struct tu_cs *cs, const struct ir3_shader_variant *v,
    tu_cs_emit_array(cs, dwords, sizedwords);
 }
 
+/* The vec4 the constants of type start at, ~0 when the shader has none */
+static uint32_t
+tu5_const_offset(const struct ir3_const_state *const_state,
+                 enum ir3_const_alloc_type type)
+{
+   const struct ir3_const_allocation *alloc = &const_state->allocs.consts[type];
+   return alloc->size_vec4 ? alloc->offset_vec4 : ~0u;
+}
+
 static void
 tu5_emit_immediates(struct tu_cs *cs, const struct ir3_shader_variant *v)
 {
    const struct ir3_const_state *const_state = ir3_const_state(v);
-   uint32_t base = const_state->offsets.immediate;
-   int size = DIV_ROUND_UP(const_state->immediates_count, 4);
+   uint32_t base = const_state->allocs.max_const_offset_vec4;
+   int size = DIV_ROUND_UP(v->imm_state.count, 4);
 
    /* truncate size to avoid writing constants that shader
     * does not use:
@@ -247,7 +256,7 @@ tu5_emit_immediates(struct tu_cs *cs, const struct ir3_shader_variant *v)
    size *= 4;
 
    if (size > 0)
-      tu5_emit_const(cs, v, base, size, const_state->immediates);
+      tu5_emit_const(cs, v, base, size, v->imm_state.values);
 }
 
 /* The draw parameters the vertex shader reads as constants */
@@ -256,7 +265,7 @@ tu5_emit_vs_params(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                    const struct ir3_shader_variant *v)
 {
    const struct ir3_const_state *const_state = ir3_const_state(v);
-   uint32_t offset = const_state->offsets.driver_param;
+   uint32_t offset = tu5_const_offset(const_state, IR3_CONST_ALLOC_DRIVER_PARAMS);
 
    if (offset >= v->constlen)
       return;
@@ -301,8 +310,8 @@ tu5_ubo_address(struct tu_cmd_buffer *cmd, const struct tu_shader *shader,
    if (ref->storage) {
       /* see write_buffer_descriptor_addr() */
       uint64_t base = desc[4] | ((uint64_t)(desc[5] & 0x1ffff) << 32);
-      uint32_t offset = ((desc[2] & A6XX_TEX_CONST_2_STARTOFFSETTEXELS__MASK) >>
-                         A6XX_TEX_CONST_2_STARTOFFSETTEXELS__SHIFT) * 4;
+      uint32_t offset = ((desc[2] & A6XX_TEX_MEMOBJ_2_STARTOFFSETTEXELS__MASK) >>
+                         A6XX_TEX_MEMOBJ_2_STARTOFFSETTEXELS__SHIFT) * 4;
 
       return base ? base + offset : 0;
    }
@@ -322,7 +331,7 @@ tu5_ubo_address(struct tu_cmd_buffer *cmd, const struct tu_shader *shader,
  */
 static bool
 tu5_emit_tex_tables(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
-                    gl_shader_stage stage, uint32_t num_samp, uint32_t num_tex,
+                    mesa_shader_stage stage, uint32_t num_samp, uint32_t num_tex,
                     uint32_t **samp_map, uint32_t **tex_map)
 {
    struct tu_cs_memory samp_mem, tex_mem;
@@ -340,12 +349,12 @@ tu5_emit_tex_tables(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    const bool vs = stage == MESA_SHADER_VERTEX;
    const bool fs = stage == MESA_SHADER_FRAGMENT;
 
-   OUT_PKT4(cs, vs ? REG_A5XX_TPL1_VS_TEX_SAMP_LO :
-                fs ? REG_A5XX_TPL1_FS_TEX_SAMP_LO : REG_A5XX_TPL1_CS_TEX_SAMP_LO,
+   OUT_PKT4(cs, vs ? REG_A5XX_TPL1_VS_TEX_SAMP :
+                fs ? REG_A5XX_TPL1_FS_TEX_SAMP : REG_A5XX_TPL1_CS_TEX_SAMP,
             2);
    tu_cs_emit_qw(cs, samp_mem.iova);
-   OUT_PKT4(cs, vs ? REG_A5XX_TPL1_VS_TEX_CONST_LO :
-                fs ? REG_A5XX_TPL1_FS_TEX_CONST_LO : REG_A5XX_TPL1_CS_TEX_CONST_LO,
+   OUT_PKT4(cs, vs ? REG_A5XX_TPL1_VS_TEX_CONST :
+                fs ? REG_A5XX_TPL1_FS_TEX_CONST : REG_A5XX_TPL1_CS_TEX_CONST,
             2);
    tu_cs_emit_qw(cs, tex_mem.iova);
 
@@ -388,7 +397,7 @@ tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    const unsigned ibase = tu5_ibo_slot_base(shader);
 
    for (unsigned i = 0; i < map->count[TU5_DESC_IMAGE]; i++) {
-      if (m->image_to_tex[ibase + i] != IBO_INVALID)
+      if (m->image_to_tex[ibase + i] != UAV_INVALID)
          num_slots = MAX2(num_slots, m->tex_base + m->image_to_tex[ibase + i] + 1);
    }
 
@@ -397,7 +406,7 @@ tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       return;
 
    for (unsigned i = 0; i < map->count[TU5_DESC_IMAGE]; i++) {
-      if (m->image_to_tex[ibase + i] == IBO_INVALID)
+      if (m->image_to_tex[ibase + i] == UAV_INVALID)
          continue;
 
       const uint32_t *desc = tu5_descriptor(cmd, shader, &map->image[i]);
@@ -437,7 +446,7 @@ tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
          for (unsigned t = 0; t < num_tex; t++) {
             const struct tu5_desc_ref *tref = &map->tex[t];
             if (tref->set != ref->set || tref->dynamic != ref->dynamic ||
-                tref->offset + A6XX_TEX_CONST_DWORDS != ref->offset)
+                tref->offset + FDL6_TEX_CONST_DWORDS != ref->offset)
                continue;
             const uint32_t *tdesc = tu5_descriptor(cmd, shader, tref);
             if (tdesc && (tdesc[TU5_TEX_FLAGS] & TU5_TEX_FLAG_ALPHA_LOW))
@@ -505,8 +514,8 @@ tu5_emit_ssbos(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 
       /* see write_buffer_descriptor_addr() */
       uint64_t base = desc[4] | ((uint64_t)(desc[5] & 0x1ffff) << 32);
-      uint32_t offset = ((desc[2] & A6XX_TEX_CONST_2_STARTOFFSETTEXELS__MASK) >>
-                         A6XX_TEX_CONST_2_STARTOFFSETTEXELS__SHIFT) * 4;
+      uint32_t offset = ((desc[2] & A6XX_TEX_MEMOBJ_2_STARTOFFSETTEXELS__MASK) >>
+                         A6XX_TEX_MEMOBJ_2_STARTOFFSETTEXELS__SHIFT) * 4;
 
       if (!base)
          continue;
@@ -578,7 +587,7 @@ tu5_emit_images(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    memset(dims, 0, sizeof(dims));
 
    for (unsigned i = 0; i < count; i++) {
-      static const uint32_t none[A6XX_TEX_CONST_DWORDS] = {};
+      static const uint32_t none[FDL6_TEX_CONST_DWORDS] = {};
       const uint32_t *desc = tu5_descriptor(cmd, shader, &map->image[i]);
 
       /* see tu5_image_view_storage_descriptor() */
@@ -623,7 +632,7 @@ tu5_emit_images(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    }
 
 
-   uint32_t offset = const_state->offsets.image_dims;
+   uint32_t offset = tu5_const_offset(const_state, IR3_CONST_ALLOC_IMAGE_DIMS);
 
    if (const_state->image_dims.count && offset < v->constlen) {
       uint32_t dwords = MIN2((uint32_t)ARRAY_SIZE(dims),
@@ -646,8 +655,8 @@ tu5_emit_vs_ibos(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 
    const struct tu_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
    if ((fs && fs->variant &&
-        fs->variant->num_ibos > vs->const_state.a5xx.vs_ibo_base) ||
-       vs->const_state.a5xx.vs_ibo_base + vs->variant->num_ibos >
+        fs->variant->num_uavs > vs->const_state.a5xx.vs_ibo_base) ||
+       vs->const_state.a5xx.vs_ibo_base + vs->variant->num_uavs >
           TU5_GFX_IBO_SLOTS)
       mesa_loge("a5xx: too many storage buffers and images in the vertex "
                 "and fragment shaders");
@@ -668,11 +677,15 @@ tu5_emit_user_consts(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    const struct tu5_desc_map *map = &shader->const_state.a5xx;
    const struct tu_push_constant_range *push = &shader->const_state.push_consts;
 
+   /* the dwords from lo_dwords on, at where the compiler put them */
+   const uint32_t push_base =
+      tu5_const_offset(const_state, IR3_CONST_ALLOC_PUSH_CONSTS) * 4;
    if (push->type == IR3_PUSH_CONSTS_PER_STAGE && push->dwords &&
-       push->lo < v->constlen * 4) {
-      uint32_t dwords = MIN2(push->dwords, v->constlen * 4 - push->lo);
+       push_base < v->constlen * 4) {
+      uint32_t dwords = MIN2(push->dwords, v->constlen * 4 - push_base);
 
-      tu5_emit_const(cs, v, push->lo, dwords, &cmd->push_constants[push->lo]);
+      tu5_emit_const(cs, v, push_base, dwords,
+                     &cmd->push_constants[push->lo_dwords]);
    }
 
    /* The inline uniform blocks, from the memory of their descriptor sets to
@@ -749,7 +762,7 @@ tu5_emit_user_consts(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    /* The addresses of the uniform buffers, and of the constant data of the
     * shader, which is read the same way.
     */
-   uint32_t ptrs = const_state->offsets.ubo;
+   uint32_t ptrs = tu5_const_offset(const_state, IR3_CONST_ALLOC_UBO_PTRS);
 
    if (const_state->num_ubos && ptrs < v->constlen) {
       uint32_t num = const_state->num_ubos;
@@ -897,7 +910,7 @@ tu5_emit_sample_count_addr(struct tu_cs *cs, uint64_t iova)
    OUT_PKT4(cs, REG_A5XX_RB_SAMPLE_COUNT_CONTROL, 1);
    OUT_RING(cs, A5XX_RB_SAMPLE_COUNT_CONTROL_COPY);
 
-   OUT_PKT4(cs, REG_A5XX_RB_SAMPLE_COUNT_ADDR_LO, 2);
+   OUT_PKT4(cs, REG_A5XX_RB_SAMPLE_COUNT_ADDR, 2);
    tu_cs_emit_qw(cs, iova);
 }
 
@@ -1050,7 +1063,7 @@ tu5_bind_view(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t view)
          if (subpass->color_attachments[i].attachment == VK_ATTACHMENT_UNUSED)
             continue;
          OUT_PKT7(cs, CP_MEM_TO_REG, 3);
-         OUT_RING(cs, CP_MEM_TO_REG_0_REG(REG_A5XX_RB_MRT_BASE_LO(i)) |
+         OUT_RING(cs, CP_MEM_TO_REG_0_REG(REG_A5XX_RB_MRT_BASE(i)) |
                          CP_MEM_TO_REG_0_CNT(2));
          tu_cs_emit_qw(cs, bases + i * sizeof(uint64_t));
       }
@@ -1059,14 +1072,14 @@ tu5_bind_view(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t view)
 
       if (a != VK_ATTACHMENT_UNUSED) {
          OUT_PKT7(cs, CP_MEM_TO_REG, 3);
-         OUT_RING(cs, CP_MEM_TO_REG_0_REG(REG_A5XX_RB_DEPTH_BUFFER_BASE_LO) |
+         OUT_RING(cs, CP_MEM_TO_REG_0_REG(REG_A5XX_RB_DEPTH_BUFFER_BASE) |
                          CP_MEM_TO_REG_0_CNT(2));
          tu_cs_emit_qw(cs, bases + 8 * sizeof(uint64_t));
 
          if (cmd->state.pass->attachments[a].format ==
              VK_FORMAT_D32_SFLOAT_S8_UINT) {
             OUT_PKT7(cs, CP_MEM_TO_REG, 3);
-            OUT_RING(cs, CP_MEM_TO_REG_0_REG(REG_A5XX_RB_STENCIL_BASE_LO) |
+            OUT_RING(cs, CP_MEM_TO_REG_0_REG(REG_A5XX_RB_STENCIL_BASE) |
                             CP_MEM_TO_REG_0_CNT(2));
             tu_cs_emit_qw(cs, bases + 9 * sizeof(uint64_t));
          }
@@ -1096,7 +1109,7 @@ tu5_draw_indirect(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 {
    const struct ir3_shader_variant *vs =
       cmd->state.shaders[MESA_SHADER_VERTEX]->variant;
-   uint32_t param = ir3_const_state(vs)->offsets.driver_param;
+   uint32_t param = tu5_const_offset(ir3_const_state(vs), IR3_CONST_ALLOC_DRIVER_PARAMS);
    uint64_t tmp = global_iova_arr(cmd, cs_indirect_xyz, 0);
 
    for (uint32_t i = 0; i < count; i++, iova += stride) {
@@ -1235,7 +1248,7 @@ tu5_dispatch(struct tu_cmd_buffer *cmd, const uint32_t *blocks,
    OUT_RING(cs, v->constlen / 4); /* HLSQ_CS_CONSTLEN */
    OUT_RING(cs, instrlen);        /* HLSQ_CS_INSTRLEN */
 
-   tu5_emit_shader_obj(cs, &so, REG_A5XX_SP_CS_OBJ_START_LO);
+   tu5_emit_shader_obj(cs, &so, REG_A5XX_SP_CS_OBJ_START);
 
    OUT_PKT4(cs, REG_A5XX_HLSQ_UPDATE_CNTL, 1);
    OUT_RING(cs, 0x1f00000);
@@ -1266,7 +1279,7 @@ tu5_dispatch(struct tu_cmd_buffer *cmd, const uint32_t *blocks,
    tu5_emit_images(cmd, cs, shader);
 
    /* The parameters of the dispatch the shader reads as constants */
-   uint32_t offset = const_state->offsets.driver_param;
+   uint32_t offset = tu5_const_offset(const_state, IR3_CONST_ALLOC_DRIVER_PARAMS);
 
    if (offset < v->constlen) {
       uint32_t params[dword_sizeof(struct ir3_driver_params_cs)] = {};
@@ -1405,7 +1418,7 @@ tu5_image_view_descriptor(uint32_t *descriptor, const struct tu_image *image,
       break;
    }
 
-   memset(descriptor, 0, A6XX_TEX_CONST_DWORDS * sizeof(uint32_t));
+   memset(descriptor, 0, FDL6_TEX_CONST_DWORDS * sizeof(uint32_t));
    if (format == PIPE_FORMAT_A4B4G4R4_UNORM ||
        format == PIPE_FORMAT_A4R4G4B4_UNORM)
       descriptor[TU5_TEX_FLAGS] = TU5_TEX_FLAG_ALPHA_LOW;
@@ -1498,7 +1511,7 @@ tu5_buffer_view_descriptor(uint32_t *descriptor, enum pipe_format format,
    uint32_t cpp = util_format_get_blocksize(format);
    uint32_t elements = range / cpp;
 
-   memset(descriptor, 0, A6XX_TEX_CONST_DWORDS * sizeof(uint32_t));
+   memset(descriptor, 0, FDL6_TEX_CONST_DWORDS * sizeof(uint32_t));
 
    descriptor[0] = A5XX_TEX_CONST_0_FMT(fd5_pipe2tex(format)) |
                    fd5_tex_swiz(format, PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y,
@@ -1953,7 +1966,7 @@ tu5_program_emit(struct tu_cs *ring, struct tu5_program *emit)
       OUT_RING(ring, reg);
    }
 
-   tu5_emit_shader_obj(ring, &emit->vs_shader, REG_A5XX_SP_VS_OBJ_START_LO);
+   tu5_emit_shader_obj(ring, &emit->vs_shader, REG_A5XX_SP_VS_OBJ_START);
 
    if (s[VS].instrlen)
       tu5_emit_shader(ring, s[VS].v, emit->vs_shader.iova);
@@ -1973,11 +1986,11 @@ tu5_program_emit(struct tu_cs *ring, struct tu5_program *emit)
    emit->max_loc = l.max_loc;
 
    if (emit->binning_pass) {
-      OUT_PKT4(ring, REG_A5XX_SP_FS_OBJ_START_LO, 2);
+      OUT_PKT4(ring, REG_A5XX_SP_FS_OBJ_START, 2);
       OUT_RING(ring, 0x00000000); /* SP_FS_OBJ_START_LO */
       OUT_RING(ring, 0x00000000); /* SP_FS_OBJ_START_HI */
    } else {
-      tu5_emit_shader_obj(ring, &emit->fs_shader, REG_A5XX_SP_FS_OBJ_START_LO);
+      tu5_emit_shader_obj(ring, &emit->fs_shader, REG_A5XX_SP_FS_OBJ_START);
    }
 
    OUT_PKT4(ring, REG_A5XX_HLSQ_CONTROL_0_REG, 5);
@@ -2035,7 +2048,7 @@ tu5_program_emit(struct tu_cs *ring, struct tu5_program *emit)
     * once a sample only with the barycentrics at the samples enabled, used
     * or not.
     */
-   const bool per_samp = s[FS].v->per_samp || s[FS].v->key.sample_shading;
+   const bool per_samp = s[FS].v->sample_shading;
 
    OUT_PKT4(ring, REG_A5XX_GRAS_CNTL, 1);
    OUT_RING(ring,
@@ -2358,12 +2371,12 @@ tu5_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *ring)
    OUT_PKT4(ring, REG_A5XX_VPC_SO_OVERRIDE, 1);
    OUT_RING(ring, A5XX_VPC_SO_OVERRIDE_SO_DISABLE);
 
-   OUT_PKT4(ring, REG_A5XX_VPC_SO_BUFFER_BASE_LO(0), 3);
+   OUT_PKT4(ring, REG_A5XX_VPC_SO_BUFFER_BASE(0), 3);
    OUT_RING(ring, 0x00000000); /* VPC_SO_BUFFER_BASE_LO_0 */
    OUT_RING(ring, 0x00000000); /* VPC_SO_BUFFER_BASE_HI_0 */
    OUT_RING(ring, 0x00000000); /* VPC_SO_BUFFER_SIZE_0 */
 
-   OUT_PKT4(ring, REG_A5XX_VPC_SO_FLUSH_BASE_LO(0), 2);
+   OUT_PKT4(ring, REG_A5XX_VPC_SO_FLUSH_BASE(0), 2);
    OUT_RING(ring, 0x00000000); /* VPC_SO_FLUSH_BASE_LO_0 */
    OUT_RING(ring, 0x00000000); /* VPC_SO_FLUSH_BASE_HI_0 */
 
@@ -2397,7 +2410,7 @@ tu5_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *ring)
    OUT_PKT4(ring, REG_A5XX_UNKNOWN_E5C2, 1);
    OUT_RING(ring, 0x00000000); /* UNKNOWN_E5C2 */
 
-   OUT_PKT4(ring, REG_A5XX_VPC_SO_BUFFER_BASE_LO(1), 3);
+   OUT_PKT4(ring, REG_A5XX_VPC_SO_BUFFER_BASE(1), 3);
    OUT_RING(ring, 0x00000000);
    OUT_RING(ring, 0x00000000);
    OUT_RING(ring, 0x00000000);
@@ -2754,17 +2767,17 @@ tu5_emit_zs_gmem(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t a)
    OUT_PKT4(cs, REG_A5XX_GRAS_SU_DEPTH_BUFFER_INFO, 1);
    OUT_RING(cs, A5XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(fmt));
 
-   OUT_PKT4(cs, REG_A5XX_RB_DEPTH_FLAG_BUFFER_BASE_LO, 3);
+   OUT_PKT4(cs, REG_A5XX_RB_DEPTH_FLAG_BUFFER_BASE, 3);
    OUT_RING(cs, 0x00000000);
    OUT_RING(cs, 0x00000000);
    OUT_RING(cs, 0x00000000);
 
-   OUT_PKT4(cs, REG_A5XX_GRAS_LRZ_BUFFER_BASE_LO, 3);
+   OUT_PKT4(cs, REG_A5XX_GRAS_LRZ_BUFFER_BASE, 3);
    OUT_RING(cs, 0x00000000);
    OUT_RING(cs, 0x00000000);
    OUT_RING(cs, 0x00000000);
 
-   OUT_PKT4(cs, REG_A5XX_GRAS_LRZ_FAST_CLEAR_BUFFER_BASE_LO, 2);
+   OUT_PKT4(cs, REG_A5XX_GRAS_LRZ_FAST_CLEAR_BUFFER_BASE, 2);
    OUT_RING(cs, 0x00000000);
    OUT_RING(cs, 0x00000000);
 
@@ -2841,18 +2854,18 @@ tu5_emit_zs_surface(struct tu_cs *cs, const struct tu_image *image,
       OUT_PKT4(cs, REG_A5XX_GRAS_SU_DEPTH_BUFFER_INFO, 1);
       OUT_RING(cs, A5XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(fmt));
 
-      OUT_PKT4(cs, REG_A5XX_RB_DEPTH_FLAG_BUFFER_BASE_LO, 3);
+      OUT_PKT4(cs, REG_A5XX_RB_DEPTH_FLAG_BUFFER_BASE, 3);
       OUT_RING(cs, 0x00000000); /* RB_DEPTH_FLAG_BUFFER_BASE_LO */
       OUT_RING(cs, 0x00000000); /* RB_DEPTH_FLAG_BUFFER_BASE_HI */
       OUT_RING(cs, 0x00000000); /* RB_DEPTH_FLAG_BUFFER_PITCH */
 
       /* no LRZ */
-      OUT_PKT4(cs, REG_A5XX_GRAS_LRZ_BUFFER_BASE_LO, 3);
+      OUT_PKT4(cs, REG_A5XX_GRAS_LRZ_BUFFER_BASE, 3);
       OUT_RING(cs, 0x00000000);
       OUT_RING(cs, 0x00000000);
       OUT_RING(cs, 0x00000000); /* GRAS_LRZ_BUFFER_PITCH */
 
-      OUT_PKT4(cs, REG_A5XX_GRAS_LRZ_FAST_CLEAR_BUFFER_BASE_LO, 2);
+      OUT_PKT4(cs, REG_A5XX_GRAS_LRZ_FAST_CLEAR_BUFFER_BASE, 2);
       OUT_RING(cs, 0x00000000);
       OUT_RING(cs, 0x00000000);
 
@@ -2881,7 +2894,7 @@ tu5_emit_zs_surface(struct tu_cs *cs, const struct tu_image *image,
       OUT_PKT4(cs, REG_A5XX_GRAS_SU_DEPTH_BUFFER_INFO, 1);
       OUT_RING(cs, A5XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH5_NONE));
 
-      OUT_PKT4(cs, REG_A5XX_RB_DEPTH_FLAG_BUFFER_BASE_LO, 3);
+      OUT_PKT4(cs, REG_A5XX_RB_DEPTH_FLAG_BUFFER_BASE, 3);
       OUT_RING(cs, 0x00000000); /* RB_DEPTH_FLAG_BUFFER_BASE_LO */
       OUT_RING(cs, 0x00000000); /* RB_DEPTH_FLAG_BUFFER_BASE_HI */
       OUT_RING(cs, 0x00000000); /* RB_DEPTH_FLAG_BUFFER_PITCH */
@@ -3249,14 +3262,14 @@ tu5_emit_load_clears(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
       }
 
       /* the layers of the framebuffer, or those of the views */
-      uint32_t layers = pass->num_views ? att->clear_views
+      uint32_t layers = pass->num_views ? att->used_views
                                         : BITFIELD_MASK(fb->layers);
 
       u_foreach_bit (layer, layers) {
          tu5_bind_target(cs, iview->image, format, iview->vk.base_mip_level,
                          iview->vk.base_array_layer + layer);
          tu5_clear_rect(cmd, cs, zs ? -1 : 0, aspects,
-                        &cmd->state.clear_values[a], cmd->state.render_area,
+                        &cmd->state.clear_values[a], cmd->state.render_areas[0],
                         iview->vk.extent.width, iview->vk.extent.height);
       }
    }
@@ -3670,7 +3683,7 @@ tu5_copy_buffer_image(struct tu_cmd_buffer *cmd, struct tu_buffer *buffer,
 
       tu5_copy_buffer_rect(cmd, cs, &surf, info->imageOffset.x / bw,
                            info->imageOffset.y / bh,
-                           buffer->iova + info->bufferOffset + layer_size * i,
+                           vk_buffer_address(&buffer->vk, info->bufferOffset + layer_size * i),
                            pitch, DIV_ROUND_UP(info->imageExtent.width, bw),
                            DIV_ROUND_UP(info->imageExtent.height, bh),
                            to_buffer, keep_mask, buf_format, swiz);
@@ -4053,19 +4066,19 @@ tu5_bind_layer(struct tu_cmd_buffer *cmd, struct tu_cs *cs, int rt,
    tu_cs_emit_wfi(cs);
    if (rt >= 0) {
       OUT_PKT7(cs, CP_MEM_TO_REG, 3);
-      OUT_RING(cs, CP_MEM_TO_REG_0_REG(REG_A5XX_RB_MRT_BASE_LO(rt)) |
+      OUT_RING(cs, CP_MEM_TO_REG_0_REG(REG_A5XX_RB_MRT_BASE(rt)) |
                       CP_MEM_TO_REG_0_CNT(2));
       tu_cs_emit_qw(cs, bases + rt * sizeof(uint64_t));
       return;
    }
 
    OUT_PKT7(cs, CP_MEM_TO_REG, 3);
-   OUT_RING(cs, CP_MEM_TO_REG_0_REG(REG_A5XX_RB_DEPTH_BUFFER_BASE_LO) |
+   OUT_RING(cs, CP_MEM_TO_REG_0_REG(REG_A5XX_RB_DEPTH_BUFFER_BASE) |
                    CP_MEM_TO_REG_0_CNT(2));
    tu_cs_emit_qw(cs, bases + 8 * sizeof(uint64_t));
    if (cmd->state.pass->attachments[a].format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
       OUT_PKT7(cs, CP_MEM_TO_REG, 3);
-      OUT_RING(cs, CP_MEM_TO_REG_0_REG(REG_A5XX_RB_STENCIL_BASE_LO) |
+      OUT_RING(cs, CP_MEM_TO_REG_0_REG(REG_A5XX_RB_STENCIL_BASE) |
                       CP_MEM_TO_REG_0_CNT(2));
       tu_cs_emit_qw(cs, bases + 9 * sizeof(uint64_t));
    }
@@ -4200,7 +4213,7 @@ tu5_emit_gmem_clears(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
          if (aspects & VK_IMAGE_ASPECT_COLOR_BIT)
             aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
          tu5_clear_rect(cmd, cs, -1, aspects, &cmd->state.clear_values[a],
-                        cmd->state.render_area, fb->width, fb->height);
+                        cmd->state.render_areas[0], fb->width, fb->height);
          continue;
       }
 
@@ -4208,7 +4221,7 @@ tu5_emit_gmem_clears(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
          if (subpass->color_attachments[i].attachment != a)
             continue;
          tu5_clear_rect(cmd, cs, i, VK_IMAGE_ASPECT_COLOR_BIT,
-                        &cmd->state.clear_values[a], cmd->state.render_area,
+                        &cmd->state.clear_values[a], cmd->state.render_areas[0],
                         fb->width, fb->height);
       }
    }
@@ -4283,7 +4296,7 @@ tu5_use_gmem(struct tu_cmd_buffer *cmd)
        !cmd->state.tiling->possible)
       return false;
 
-   const VkRect2D *ra = &cmd->state.render_area;
+   const VkRect2D *ra = &cmd->state.render_areas[0];
    const VkExtent2D tile0 = cmd->state.tiling->tile0;
    uint32_t tiles =
       (DIV_ROUND_UP(ra->offset.x + ra->extent.width, tile0.width) -
@@ -4378,7 +4391,7 @@ tu5_gmem_blit(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t a,
       OUT_PKT4(cs, REG_A5XX_RB_RENDER_CNTL, 1);
       OUT_RING(cs, layout->ubwc ? TU5_RENDER_CNTL_FLAG_MRT(0) : 0x00000008);
 
-      OUT_PKT4(cs, REG_A5XX_RB_BLIT_FLAG_DST_LO, 4);
+      OUT_PKT4(cs, REG_A5XX_RB_BLIT_FLAG_DST, 4);
       OUT_RING(cs, 0x00000000);
       OUT_RING(cs, 0x00000000);
       OUT_RING(cs, 0x00000000);
@@ -4408,7 +4421,7 @@ tu5_gmem_blit(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t a,
       }
 
       /* to UBWC: the flags with the texels, as the blob (0xf) */
-      OUT_PKT4(cs, REG_A5XX_RB_BLIT_FLAG_DST_LO, 4);
+      OUT_PKT4(cs, REG_A5XX_RB_BLIT_FLAG_DST, 4);
       tu_cs_emit_qw(cs, layout->ubwc ? flag_mem : 0);
       OUT_RING(cs, A5XX_RB_BLIT_FLAG_DST_PITCH(layout->ubwc ? layout->ubwc_width0 : 0));
       OUT_RING(cs, A5XX_RB_BLIT_FLAG_DST_ARRAY_PITCH(
@@ -4429,7 +4442,7 @@ tu5_gmem_blit(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t a,
    OUT_PKT4(cs, REG_A5XX_RB_BLIT_CNTL, 1);
    OUT_RING(cs, A5XX_RB_BLIT_CNTL_BUF(buf));
 
-   tu5_event_write(cmd, cs, BLIT, true);
+   tu5_event_write(cmd, cs, CCU_RESOLVE, true);
 
    if (!store && layout->ubwc) {
       OUT_PKT4(cs, REG_A5XX_RB_RENDER_CNTL, 1);
@@ -4444,7 +4457,7 @@ tu5_cmd_render_gmem(struct tu_cmd_buffer *cmd)
    const struct tu_framebuffer *fb = cmd->state.framebuffer;
    const struct tu_render_pass *pass = cmd->state.pass;
    const struct tu_tiling_config *tiling = cmd->state.tiling;
-   const VkRect2D *ra = &cmd->state.render_area;
+   const VkRect2D *ra = &cmd->state.render_areas[0];
    const VkExtent2D tile0 = tiling->tile0;
    struct tu_cs *cs = &cmd->cs;
    const struct fd_dev_info *info = cmd->device->physical_device->info;
@@ -4536,7 +4549,7 @@ tu5_cmd_render_gmem(struct tu_cmd_buffer *cmd)
       OUT_PKT4(cs, REG_A5XX_VPC_MODE_CNTL, 1);
       OUT_RING(cs, A5XX_VPC_MODE_CNTL_BINNING_PASS);
 
-      tu5_event_write(cmd, cs, UNK_2C, false);
+      tu5_event_write(cmd, cs, VSC_BINNING_START, false);
 
       OUT_PKT4(cs, REG_A5XX_RB_WINDOW_OFFSET, 1);
       OUT_RING(cs, A5XX_RB_WINDOW_OFFSET_X(0) | A5XX_RB_WINDOW_OFFSET_Y(0));
@@ -4544,7 +4557,7 @@ tu5_cmd_render_gmem(struct tu_cmd_buffer *cmd)
       tu5_disable_draw_states(cs);
       tu_cs_emit_call(cs, &cmd->a5xx_binning_cs);
 
-      tu5_event_write(cmd, cs, UNK_2D, false);
+      tu5_event_write(cmd, cs, VSC_BINNING_END, false);
       tu5_event_write(cmd, cs, CACHE_FLUSH_TS, true);
       tu_cs_emit_wfi(cs);
 
@@ -4760,7 +4773,7 @@ tu5_cmd_render(struct tu_cmd_buffer *cmd)
          tu5_resolve_sysmem(cmd, cs, cmd->state.attachments[src],
                             cmd->state.attachments[a],
                             subpass->multiview_mask, fb->layers,
-                            &cmd->state.render_area);
+                            &cmd->state.render_areas[0]);
       }
    }
 
@@ -4942,13 +4955,13 @@ tu5_emit_rasterizer(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    OUT_RING(cs, A5XX_GRAS_SU_POINT_SIZE(1.0f));
 
    OUT_PKT4(cs, REG_A5XX_GRAS_SU_POLY_OFFSET_SCALE, 3);
-   OUT_RING(cs, A5XX_GRAS_SU_POLY_OFFSET_SCALE(dyn->rs.depth_bias.slope));
+   OUT_RING(cs, A5XX_GRAS_SU_POLY_OFFSET_SCALE(dyn->rs.depth_bias.slope_factor));
    /* A constant bias of 2^16 - 1 units already moves a 16-bit depth across
     * its whole range, past which the clamp saturates it; but the hardware
     * wraps a 16-bit depth around from 2.0 on (the stock driver's too): so
     * it gets no more than that.
     */
-   float bias = dyn->rs.depth_bias.constant;
+   float bias = dyn->rs.depth_bias.constant_factor;
    uint32_t za = cmd->state.subpass->depth_stencil_attachment.attachment;
    if (za != VK_ATTACHMENT_UNUSED &&
        cmd->state.pass->attachments[za].format == VK_FORMAT_D16_UNORM)
@@ -5383,7 +5396,7 @@ tu5_draw_state(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool indexed)
       OUT_RING(gcs, cmd->state.last_vs_params.first_instance);
 
       /* see tu5_pack_border_color() */
-      OUT_PKT4(gcs, REG_A5XX_TPL1_TP_BORDER_COLOR_BASE_ADDR_LO, 2);
+      OUT_PKT4(gcs, REG_A5XX_TPL1_TP_BORDER_COLOR_BASE_ADDR, 2);
       tu_cs_emit_qw(gcs, global_iova(cmd, bcolor_builtin));
 
       OUT_PKT4(gcs, REG_A5XX_TPL1_CS_TEX_COUNT, 1);

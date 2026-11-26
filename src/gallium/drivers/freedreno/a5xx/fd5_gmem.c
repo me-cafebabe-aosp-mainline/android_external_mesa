@@ -572,7 +572,7 @@ fd5_emit_tile_mem2gmem(struct fd_batch *batch, const struct fd_tile *tile)
    /* the loads of the targets with UBWC flags, as the blob */
    uint32_t flags = 0;
    for (unsigned i = 0; i < pfb->nr_cbufs; i++) {
-      if (pfb->cbufs[i] && fd_resource(pfb->cbufs[i]->texture)->layout.ubwc)
+      if (pfb->cbufs[i].texture && fd_resource(pfb->cbufs[i].texture)->layout.ubwc)
          flags |= A5XX_RB_RENDER_CNTL_FLAG_MRTS(1 << i) |
                   A5XX_RB_RENDER_CNTL_FLAG_MRTS2(1 << i);
    }

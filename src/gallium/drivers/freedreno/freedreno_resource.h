@@ -342,6 +342,8 @@ fd_image_params(const struct pipe_resource *prsc, bool ubwc,
 }
 
 void fd_resource_screen_init(struct pipe_screen *pscreen);
+bool fd_layout_resource_for_handle(struct fd_resource *rsc,
+                                   struct winsys_handle *handle);
 void fd_resource_context_init(struct pipe_context *pctx);
 
 uint32_t fd_setup_slices(struct fd_resource *rsc);

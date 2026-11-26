@@ -2203,7 +2203,7 @@ emit_intrinsic_barrier(struct ir3_context *ctx, nir_intrinsic_instr *intr)
          if (shared && global) {
             struct ir3_instruction *fence_g;
 
-            array_insert(b, b->keeps, barrier);
+            array_insert(ctx->block, ctx->block->keeps, barrier);
 
             /* Both are barriers to all that the one fence was: what is
              * stored to the shared memory before them stays before what is
@@ -3151,8 +3151,7 @@ emit_intrinsic(struct ir3_context *ctx, nir_intrinsic_instr *intr)
       /* a5xx gives the coverage of the pixel to the invocations of each
        * sample too: keep the bit of the sample, as the blob does
        */
-      if (ctx->compiler->gen == 5 &&
-          (ctx->so->key.sample_shading || ctx->s->info.fs.uses_sample_shading)) {
+      if (ctx->compiler->gen == 5 && ctx->so->sample_shading) {
          if (!ctx->samp_id) {
             ctx->samp_id = create_sysval_input(ctx, SYSTEM_VALUE_SAMPLE_ID, 0x1);
             ctx->samp_id->dsts[0]->flags |= IR3_REG_HALF;
