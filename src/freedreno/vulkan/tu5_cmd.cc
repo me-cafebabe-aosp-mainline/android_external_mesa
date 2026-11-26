@@ -1901,6 +1901,16 @@ tu5_program_emit(struct tu_cs *ring, struct tu5_program *emit)
    /* Add stream out outputs after computing the VPC_VAR_DISABLE bitmask. */
    ir3_link_stream_out(&l, s[VS].v);
 
+   /* The clip and cull distances the FS reads are of the varyings, which
+    * the position follows (VPC_PACK): from the vec4 after them, or what the
+    * clipper reads of them is not what they are
+    */
+   uint32_t nonpos_vars = s[FS].v->total_in;
+   if (clip0_loc != 0xff || clip1_loc != 0xff) {
+      l.max_loc = align(l.max_loc, 4);
+      nonpos_vars = l.max_loc;
+   }
+
    /* a5xx appends pos/psize to end of the linkage map: */
    if (VALIDREG(pos_regid))
       ir3_link_add(&l, VARYING_SLOT_POS, pos_regid, 0xf, l.max_loc);
@@ -2109,7 +2119,7 @@ tu5_program_emit(struct tu_cs *ring, struct tu5_program *emit)
    }
 
    OUT_PKT4(ring, REG_A5XX_VPC_PACK, 1);
-   OUT_RING(ring, A5XX_VPC_PACK_NUMNONPOSVAR(s[FS].v->total_in) |
+   OUT_RING(ring, A5XX_VPC_PACK_NUMNONPOSVAR(nonpos_vars) |
                      A5XX_VPC_PACK_PSIZELOC(psize_loc));
 
    if (!emit->binning_pass) {
